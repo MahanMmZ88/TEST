@@ -622,4 +622,33 @@ setInterval(() => {
     if (user.is_active === 1 && isUserExpired(user)) {
       user.is_active = 0;
       closeUserConnections(user.id, 'expired');
-      scheduleSaveD
+      scheduleSaveDB(false);
+      log('[User] Expired:', user.remark);
+    }
+  }
+}, 30000);
+
+setInterval(() => {
+  try {
+    const url = 'https://www.google.com';
+    fetch(url, { method: 'HEAD' }).catch(() => {});
+  } catch (_) {}
+}, 4 * 60 * 1000);
+
+process.on('SIGTERM', () => {
+  try { saveDBNow(); } catch (_) {}
+  process.exit(0);
+});
+process.on('SIGINT', () => {
+  try { saveDBNow(); } catch (_) {}
+  process.exit(0);
+});
+process.on('uncaughtException', (err) => log('[ERROR] Uncaught:', err && err.stack ? err.stack : String(err)));
+process.on('unhandledRejection', (err) => log('[ERROR] Unhandled:', err && err.stack ? err.stack : String(err)));
+
+loadDB();
+server.listen(PORT, '0.0.0.0', () => {
+  log('[INFO] Mahan Panel VLESS-WS active on port', String(PORT));
+  log('[INFO] WS path:', WS_PATH);
+  log('[INFO] Default admin:', 'admin / admin');
+});
