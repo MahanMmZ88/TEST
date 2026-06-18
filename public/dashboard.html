@@ -328,46 +328,56 @@
         return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
     }
 
-    // ✅ Chart بدون template literal
+    // Real traffic chart: MB per minute, last 60 minutes
     var trafficChart = null;
     try {
         var ctx = document.getElementById('trafficChart').getContext('2d');
         trafficChart = new Chart(ctx, {
             type: 'line',
             data: {
-                labels: ['1h', '50m', '40m', '30m', '20m', '10m', 'Now'],
+                labels: [],
                 datasets: [{
-                    label: 'Network Activity',
-                    data: [0, 0, 0, 0, 0, 0, 0],
+                    label: 'Traffic / min (MB)',
+                    data: [],
                     borderColor: '#d4af37',
-                    backgroundColor: 'rgba(212, 175, 55, 0.1)',
+                    backgroundColor: 'rgba(212, 175, 55, 0.12)',
                     borderWidth: 2,
                     fill: true,
-                    tension: 0.4,
-                    pointRadius: 0
+                    tension: 0.35,
+                    pointRadius: 0,
+                    pointHitRadius: 12
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { display: false } },
+                interaction: { intersect: false, mode: 'index' },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                var v = Number(context.parsed.y || 0);
+                                return 'Traffic: ' + v.toFixed(3) + ' MB/min';
+                            }
+                        }
+                    }
+                },
                 scales: {
                     y: { display: false, min: 0 },
-                    x: { grid: { display: false, color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#666' } }
+                    x: { grid: { display: false, color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#666', maxTicksLimit: 8 } }
                 }
             }
         });
-
-        setInterval(function() {
-            if (trafficChart) {
-                var data = trafficChart.data.datasets[0].data;
-                data.shift();
-                data.push(Math.floor(Math.random() * 20));
-                trafficChart.update('none');
-            }
-        }, 3000);
     } catch(e) {
         console.log('Chart.js failed:', e);
+    }
+
+    function updateTrafficChart(chartData) {
+        if (!trafficChart || !chartData) return;
+        trafficChart.data.labels = chartData.labels || [];
+        trafficChart.data.datasets[0].data = chartData.values || [];
+        trafficChart.update('none');
     }
 
     async function fetchStats() {
@@ -381,6 +391,7 @@
             document.getElementById('totalTraffic').textContent = ((data.total_traffic || 0) / (1024 ** 3)).toFixed(2);
             document.getElementById('totalUsers').textContent = data.users_count || 0;
             document.getElementById('activeUsers').textContent = data.active_count || 0;
+            updateTrafficChart(data.traffic_chart);
         } catch (e) {}
     }
 
@@ -621,5 +632,5 @@
     // ✅ تصحیح شد: 10 ثانیه به جای 3 ثانیه
     setInterval(function() { fetchStats(); fetchInbounds(); }, 10000);
 </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0dbe4679b917cd3',t:'MTc4MTgwMjQ2Ng=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
