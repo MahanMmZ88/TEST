@@ -66,7 +66,7 @@
         .expiry-badge { display: inline-flex; align-items: center; white-space: nowrap; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); letter-spacing: 1px; }
         .exp-danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border-color: rgba(239, 68, 68, 0.2); }
         .exp-warning { background: rgba(234, 179, 8, 0.1); color: #fde047; border-color: rgba(234, 179, 8, 0.2); }
-        .client-name { font-weight: 700; color: #fff; letter-spacing: 0.5px; font-size: 15px; word-break: break-word; }
+        .client-name { font-weight: 700; color: #fff; letter-spacing: 0.5px; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
         .online-badge { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; margin-top: 7px; padding: 4px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; border: 1px solid rgba(255,255,255,0.08); color: #888; background: rgba(255,255,255,0.04); }
         .online-badge:before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #777; }
         .online-badge.online { color: #4ade80; background: rgba(34,197,94,0.11); border-color: rgba(34,197,94,0.24); }
@@ -142,7 +142,7 @@
             .traffic-text { min-width: 170px; }
             .actions-flex { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
             .action-btn { justify-content: center; padding: 10px 8px; font-size: 10px; letter-spacing: .6px; }
-            .client-name { text-align: right; max-width: 60%; }
+            .client-name { text-align: right; max-width: 58vw; }
             .expiry-badge { font-size: 10px; padding: 5px 9px; }
         }
         @media (max-width: 500px) {
@@ -511,7 +511,7 @@
                 }
 
                 var btnHtml = '<div class="actions-flex">' +
-                    '<button class="action-btn sub" onclick="copyLink(\'' + subUrl + '\')" title="Copy Smart Subscription Link">Smart Sub</button>' +
+                    '<button class="action-btn sub" onclick="openSubLink(\'' + subUrl + '\')" title="Open Smart Subscription Link">Smart Sub</button>' +
                     '<button class="action-btn copy" onclick="copyLink(\'' + xhttpConfigStr.replace(/'/g, "\\'") + '\')" title="Copy XHTTP Config">XHTTP</button>' +
                     '<button class="action-btn copy" onclick="copyLink(\'' + wsConfigStr.replace(/'/g, "\\'") + '\')" title="Copy WS Config">WS</button>' +
                     '<button class="action-btn" onclick="openQrModal(\'' + user.id + '\')" title="Show QR Codes">QR</button>' +
@@ -582,6 +582,10 @@
                 // EventSource reconnects automatically; keep UI as-is.
             };
         } catch(e) {}
+    }
+
+    function openSubLink(url) {
+        window.open(url, '_blank', 'noopener,noreferrer');
     }
 
     function copyLink(str) {
@@ -790,5 +794,5 @@
     fetchInbounds();
     startRealtime();
 </script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0dd73c7b8741da4',t:'MTc4MTgxODgyNA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
