@@ -67,6 +67,15 @@
         .exp-danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border-color: rgba(239, 68, 68, 0.2); }
         .exp-warning { background: rgba(234, 179, 8, 0.1); color: #fde047; border-color: rgba(234, 179, 8, 0.2); }
         .client-name { font-weight: 700; color: #fff; letter-spacing: 0.5px; font-size: 15px; word-break: break-word; }
+        .online-badge { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; margin-top: 7px; padding: 4px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; border: 1px solid rgba(255,255,255,0.08); color: #888; background: rgba(255,255,255,0.04); }
+        .online-badge:before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #777; }
+        .online-badge.online { color: #4ade80; background: rgba(34,197,94,0.11); border-color: rgba(34,197,94,0.24); }
+        .online-badge.online:before { background: #22c55e; box-shadow: 0 0 10px #22c55e; }
+        .qr-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 10px; }
+        .qr-card { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 14px; text-align: center; }
+        .qr-card h4 { color: #d4af37; margin-bottom: 10px; font-size: 13px; letter-spacing: 1px; }
+        .qr-box { background: #fff; border-radius: 12px; padding: 8px; display: inline-flex; }
+        .qr-box img { width: 128px; height: 128px; display: block; }
         .actions-flex { display: flex; gap: 8px; flex-wrap: wrap; }
         .action-btn { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); color: #aaa; padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
         .action-btn:hover { background: rgba(255,255,255,0.1); color: #fff; transform: translateY(-1px); }
@@ -83,6 +92,7 @@
         .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(5px); z-index: 200; justify-content: center; align-items: center; padding: 20px; opacity: 0; transition: opacity 0.3s; }
         .modal.show { opacity: 1; }
         .modal-content { background: rgba(20, 20, 25, 0.95); border: 1px solid rgba(255,255,255,0.1); border-radius: 24px; padding: 40px; width: 100%; max-width: 450px; box-shadow: 0 30px 60px rgba(0,0,0,0.6); transform: scale(0.95) translateY(20px); transition: all 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+        .modal-content.wide { max-width: 720px; }
         .modal.show .modal-content { transform: scale(1) translateY(0); }
         .modal-content h3 { margin-bottom: 25px; font-size: 22px; font-weight: 700; color: #fff; }
         .modal label { display: block; color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 1px; font-weight: 600; }
@@ -139,6 +149,7 @@
             .stats-grid { grid-template-columns: 1fr; }
             .modal-content { padding: 25px; }
             .actions-flex { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            .qr-grid { grid-template-columns: 1fr; }
             .mobile-nav { padding: 0 18px; }
             .main { padding-left: 12px; padding-right: 12px; }
         }
@@ -158,6 +169,7 @@
     </div>
     <div class="nav">
         <a class="nav-item active">Dashboard</a>
+        <a class="nav-item" onclick="openSettingsModal()">Admin Settings</a>
         <a class="nav-item" href="https://github.com/MahanMmZ88" target="_blank">Documentation</a>
     </div>
     <div class="logout">
@@ -178,6 +190,7 @@
             <div class="stat-value">
                 <span id="activeUsers">0</span>
                 <span style="font-size: 16px; color: #555; margin-left: 5px;">/ <span id="totalUsers">0</span></span>
+                <span style="font-size: 13px; color: #4ade80; margin-left: 8px;">● <span id="onlineUsers">0</span></span>
             </div>
         </div>
         <div class="stat-card">
@@ -241,6 +254,36 @@
     </div>
 </div>
 
+<!-- Settings Modal -->
+<div class="modal" id="settingsModal">
+    <div class="modal-content">
+        <h3>Admin Settings</h3>
+        <label>Current Password</label>
+        <input type="password" id="currentPasswordInput" placeholder="Current password">
+        <label>New Password</label>
+        <input type="password" id="newPasswordInput" placeholder="At least 8 characters">
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeSettingsModal()">Cancel</button>
+            <button class="btn-gold" onclick="changeAdminPassword()">Change Password</button>
+        </div>
+    </div>
+</div>
+
+<!-- QR Modal -->
+<div class="modal" id="qrModal">
+    <div class="modal-content wide">
+        <h3 id="qrModalTitle">QR Codes</h3>
+        <div class="qr-grid">
+            <div class="qr-card"><h4>XHTTP</h4><div class="qr-box"><img id="qrXhttpImg" alt="XHTTP QR"></div><button class="action-btn copy" style="width:100%;justify-content:center;margin-top:10px" onclick="copyQrLink('xhttp')">Copy XHTTP</button></div>
+            <div class="qr-card"><h4>WebSocket</h4><div class="qr-box"><img id="qrWsImg" alt="WS QR"></div><button class="action-btn copy" style="width:100%;justify-content:center;margin-top:10px" onclick="copyQrLink('ws')">Copy WS</button></div>
+            <div class="qr-card"><h4>Subscription</h4><div class="qr-box"><img id="qrSubImg" alt="Sub QR"></div><button class="action-btn sub" style="width:100%;justify-content:center;margin-top:10px" onclick="copyQrLink('sub')">Copy Sub</button></div>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeQrModal()">Close</button>
+        </div>
+    </div>
+</div>
+
 <!-- Edit Modal -->
 <div class="modal" id="editModal">
     <div class="modal-content">
@@ -268,6 +311,7 @@
     const vlessPort = isHttps ? '443' : (window.location.port || '80');
     const vlessSecurity = isHttps ? 'tls' : 'none';
     var currentUsers = [];
+    var currentQrUserId = '';
 
     document.getElementById('hostBadge').textContent = 'VLESS WS/XHTTP: ' + host + ':' + vlessPort;
 
@@ -411,6 +455,7 @@
             document.getElementById('totalTraffic').textContent = ((data.total_traffic || 0) / (1024 ** 3)).toFixed(2);
             document.getElementById('totalUsers').textContent = data.users_count || 0;
             document.getElementById('activeUsers').textContent = data.active_count || 0;
+            document.getElementById('onlineUsers').textContent = data.online_users || 0;
             updateTrafficChart(data.traffic_chart);
         } catch (e) {}
     }
@@ -461,6 +506,7 @@
                 var subUrl = window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id;
                 var wsConfigStr = buildWsConfig(user);
                 var xhttpConfigStr = buildXhttpConfig(user);
+                var onlineHtml = '<div class="online-badge ' + (user.online ? 'online' : '') + '">' + (user.online ? ('Online · ' + (user.connections || 0) + ' conn') : 'Offline') + '</div>';
 
                 var platLabel = '';
                 if (user.created_on === 'railway') {
@@ -474,6 +520,7 @@
                     '<button class="action-btn sub" onclick="copyLink(\'' + subUrl + '\')" title="Copy Smart Subscription Link">Smart Sub</button>' +
                     '<button class="action-btn copy" onclick="copyLink(\'' + xhttpConfigStr.replace(/'/g, "\\'") + '\')" title="Copy XHTTP Config">XHTTP</button>' +
                     '<button class="action-btn copy" onclick="copyLink(\'' + wsConfigStr.replace(/'/g, "\\'") + '\')" title="Copy WS Config">WS</button>' +
+                    '<button class="action-btn" onclick="openQrModal(\'' + user.id + '\')" title="Show QR Codes">QR</button>' +
                     '<button class="action-btn" onclick="openEditModal(\'' + user.id + '\')" title="Edit Client">Edit</button>' +
                     '<button class="action-btn" onclick="resetTraffic(\'' + user.id + '\')" title="Reset Traffic">Reset</button>' +
                     '<button class="action-btn delete" onclick="deleteUser(\'' + user.id + '\')" title="Delete">Del</button>' +
@@ -489,7 +536,7 @@
                         '</label>' +
                     '</td>' +
                     '<td data-label="Client">' +
-                        '<div class="client-name">' + user.remark + '</div>' +
+                        '<div><div class="client-name">' + user.remark + '</div>' + onlineHtml + '</div>' +
                         platLabel +
                     '</td>' +
                     '<td data-label="Data Usage" class="traffic-col">' +
@@ -536,6 +583,69 @@
         var m = document.getElementById('addModal');
         m.classList.remove('show');
         setTimeout(function() { m.style.display = 'none'; }, 300);
+    }
+
+    function openSettingsModal() {
+        var m = document.getElementById('settingsModal');
+        document.getElementById('currentPasswordInput').value = '';
+        document.getElementById('newPasswordInput').value = '';
+        m.style.display = 'flex';
+        setTimeout(function() { m.classList.add('show'); }, 10);
+    }
+
+    function closeSettingsModal() {
+        var m = document.getElementById('settingsModal');
+        m.classList.remove('show');
+        setTimeout(function() { m.style.display = 'none'; }, 300);
+    }
+
+    async function changeAdminPassword() {
+        var current_password = document.getElementById('currentPasswordInput').value;
+        var new_password = document.getElementById('newPasswordInput').value;
+        var btn = document.querySelector('#settingsModal .btn-gold');
+        btn.textContent = 'Changing...';
+        try {
+            var res = await fetch('/api/admin/change-password', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ current_password: current_password, new_password: new_password })
+            });
+            var data = await res.json();
+            btn.textContent = 'Change Password';
+            if (data.error) return alert(data.error);
+            alert('Password changed. Please login again.');
+            window.location.href = '/login';
+        } catch (e) {
+            btn.textContent = 'Change Password';
+            alert('Password change failed.');
+        }
+    }
+
+    function openQrModal(id) {
+        var user = currentUsers.find(function(u) { return u.id === id; });
+        if (!user) return alert('User not found. Please refresh the panel.');
+        currentQrUserId = id;
+        document.getElementById('qrModalTitle').textContent = 'QR Codes - ' + (user.remark || 'Client');
+        document.getElementById('qrXhttpImg').src = '/api/users/' + id + '/qr/xhttp?ts=' + Date.now();
+        document.getElementById('qrWsImg').src = '/api/users/' + id + '/qr/ws?ts=' + Date.now();
+        document.getElementById('qrSubImg').src = '/api/users/' + id + '/qr/sub?ts=' + Date.now();
+        var m = document.getElementById('qrModal');
+        m.style.display = 'flex';
+        setTimeout(function() { m.classList.add('show'); }, 10);
+    }
+
+    function closeQrModal() {
+        var m = document.getElementById('qrModal');
+        m.classList.remove('show');
+        setTimeout(function() { m.style.display = 'none'; }, 300);
+    }
+
+    function copyQrLink(type) {
+        var user = currentUsers.find(function(u) { return u.id === currentQrUserId; });
+        if (!user) return;
+        if (type === 'xhttp') return copyLink(buildXhttpConfig(user));
+        if (type === 'ws') return copyLink(buildWsConfig(user));
+        if (type === 'sub') return copyLink(window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id);
     }
 
     function openEditModal(id) {
@@ -652,4 +762,5 @@
     // ✅ تصحیح شد: 10 ثانیه به جای 3 ثانیه
     setInterval(function() { fetchStats(); fetchInbounds(); }, 10000);
 </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0dca4b81a0ad22e',t:'MTc4MTgxMDM0Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/c
+</body>
+</html>

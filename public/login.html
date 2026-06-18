@@ -39,7 +39,7 @@
     <div class="login-card">
         <div class="logo">
             <h1>MAHAN PANEL</h1>
-            <p>Xray Gateway</p>
+            <p>Node WS Gateway</p>
         </div>
         <div class="error" id="errorMsg">Invalid Credentials</div>
         <form id="loginForm">
@@ -76,6 +76,8 @@
                     btn.textContent = 'Access Granted';
                     setTimeout(() => window.location.href = '/panel', 600);
                 } else {
+                    err.textContent = data.error || 'Invalid Credentials';
+                    if (data.retry_after) err.textContent += ' Retry in ' + Math.ceil(data.retry_after / 60) + ' min.';
                     err.style.display = 'block';
                     btn.textContent = 'Authenticate';
                 }
