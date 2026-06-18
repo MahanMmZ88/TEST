@@ -43,6 +43,8 @@ const DB_SAVE_DEBOUNCE_MS = 1500;
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
+let lastCpuUsage = process.cpuUsage();
+let lastCpuCheck = process.hrtime.bigint();
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
@@ -79,6 +81,19 @@ function log(message, extra = '') {
 
 function generateHash(password) {
   return crypto.createHash('sha256').update(String(password) + PASSWORD_SALT).digest('hex');
+}
+
+function getCpuUsagePercent() {
+  const currentUsage = process.cpuUsage();
+  const currentTime = process.hrtime.bigint();
+  const elapsedMicros = Number(currentTime - lastCpuCheck) / 1000;
+  const usedMicros = (currentUsage.user - lastCpuUsage.user) + (currentUsage.system - lastCpuUsage.system);
+
+  lastCpuUsage = currentUsage;
+  lastCpuCheck = currentTime;
+
+  if (!elapsedMicros || elapsedMicros <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((usedMicros / elapsedMicros) * 100)));
 }
 
 function formatBytes(bytes) {
@@ -766,6 +781,7 @@ app.get('/api/stats', requireAuth, (req, res) => {
   const totalTraffic = DB.users.reduce((sum, u) => sum + Number(u.used_bytes || 0), 0);
   res.json({
     ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
+    cpu_usage: getCpuUsagePercent(),
     uptime: Math.round(process.uptime()),
     total_traffic: totalTraffic,
     users_count: DB.users.length,
