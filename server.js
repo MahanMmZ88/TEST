@@ -820,6 +820,36 @@ app.post('/api/users/:id/reset', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+app.put('/api/users/:id', requireAuth, (req, res) => {
+  const user = DB.users.find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const { remark, traffic_limit_gb, expiry_days } = req.body || {};
+  const cleanRemark = String(remark || '').trim();
+  if (!cleanRemark) return res.status(400).json({ error: 'Remark is required' });
+  if (DB.users.some((u) => u.id !== user.id && u.remark === cleanRemark)) {
+    return res.status(400).json({ error: 'Username must be unique' });
+  }
+
+  const limitGB = Number(traffic_limit_gb || 0);
+  const expiryDays = Number(expiry_days || 0);
+
+  user.remark = cleanRemark;
+  user.traffic_limit = limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0;
+  user.expiry_time = expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0;
+
+  if (isUserExpired(user)) {
+    user.is_active = 0;
+    closeUserConnections(user.id, 'user edited and expired');
+  } else {
+    user.is_active = 1;
+  }
+
+  scheduleSaveDB(false);
+  log('[User] Edited:', `${user.remark} ${user.uuid}`);
+  res.json({ success: true, user });
+});
+
 app.get('/sub/:sub_id', (req, res) => {
   const user = DB.users.find((u) => u.sub_id === req.params.sub_id);
   if (!user) return res.status(404).send('Subscription Not Found');
