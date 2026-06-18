@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mahan Dashboard</title>
+    <title>Mahan WS Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -154,7 +154,7 @@
             <div class="stat-value"><span id="ramUsage">0</span><span class="stat-unit">%</span></div>
         </div>
         <div class="stat-card">
-            <div class="stat-label">Xray Core</div>
+            <div class="stat-label">VLESS WS</div>
             <div class="stat-value" style="color: #2ecc71; font-size: 22px;">ONLINE</div>
         </div>
     </div>
@@ -204,7 +204,30 @@
 
 <script>
     const host = window.location.hostname;
-    document.getElementById('hostBadge').textContent = 'Node: ' + host;
+    const pageHost = window.location.host;
+    const wsPath = '/ws';
+    const isHttps = window.location.protocol === 'https:';
+    const vlessPort = isHttps ? '443' : (window.location.port || '80');
+    const vlessSecurity = isHttps ? 'tls' : 'none';
+
+    document.getElementById('hostBadge').textContent = 'VLESS WS: ' + host + ':' + vlessPort + wsPath;
+
+    function buildWsConfig(user) {
+        var remark = encodeURIComponent(user.remark || 'Mahan-WS');
+        var link = 'vless://' + user.uuid + '@' + host + ':' + vlessPort +
+            '?encryption=none' +
+            '&security=' + vlessSecurity +
+            '&type=ws' +
+            '&host=' + encodeURIComponent(host) +
+            '&path=' + encodeURIComponent(wsPath);
+
+        if (isHttps) {
+            link += '&sni=' + encodeURIComponent(host);
+        }
+
+        link += '#' + remark;
+        return link;
+    }
 
     function toggleMenu() {
         var sb = document.getElementById('sidebar');
@@ -323,10 +346,9 @@
                     }
                 }
 
-                // ✅ تصحیح شد: بدون template literal
-                var subUrl = window.location.protocol + '//' + host + '/sub/' + user.sub_id;
-                var extra = encodeURIComponent(JSON.stringify({"xPaddingBytes": "100-500", "xPaddingObfsMode": true}));
-                var configStr = 'vless://' + user.uuid + '@' + host + ':443?mode=auto&path=%2Fapi&security=tls&alpn=h2%2Chttp%2F1.1&encryption=none&extra=' + extra + '&host=' + host + '&fp=chrome&type=xhttp&allowInsecure=0&sni=' + host + '#' + encodeURIComponent(user.remark);
+                // VLESS over WebSocket config
+                var subUrl = window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id;
+                var configStr = buildWsConfig(user);
 
                 var platLabel = '';
                 if (user.created_on === 'railway') {
@@ -457,5 +479,5 @@
     // ✅ تصحیح شد: 10 ثانیه به جای 3 ثانیه
     setInterval(function() { fetchStats(); fetchInbounds(); }, 10000);
 </script>
-</body>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0da6fd1395ee7b1',t:'MTc4MTc4NzIwNQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
