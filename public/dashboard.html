@@ -154,7 +154,7 @@
             <div class="stat-value"><span id="ramUsage">0</span><span class="stat-unit">%</span></div>
         </div>
         <div class="stat-card">
-            <div class="stat-label">VLESS WS</div>
+            <div class="stat-label">VLESS WS/XHTTP</div>
             <div class="stat-value" style="color: #2ecc71; font-size: 22px;">ONLINE</div>
         </div>
     </div>
@@ -206,14 +206,15 @@
     const host = window.location.hostname;
     const pageHost = window.location.host;
     const wsPath = '/ws';
+    const xhttpPath = '/xhttp';
     const isHttps = window.location.protocol === 'https:';
     const vlessPort = isHttps ? '443' : (window.location.port || '80');
     const vlessSecurity = isHttps ? 'tls' : 'none';
 
-    document.getElementById('hostBadge').textContent = 'VLESS WS: ' + host + ':' + vlessPort + wsPath;
+    document.getElementById('hostBadge').textContent = 'VLESS WS/XHTTP: ' + host + ':' + vlessPort;
 
     function buildWsConfig(user) {
-        var remark = encodeURIComponent(user.remark || 'Mahan-WS');
+        var remark = encodeURIComponent((user.remark || 'Mahan') + '-WS');
         var link = 'vless://' + user.uuid + '@' + host + ':' + vlessPort +
             '?encryption=none' +
             '&security=' + vlessSecurity +
@@ -223,6 +224,24 @@
 
         if (isHttps) {
             link += '&sni=' + encodeURIComponent(host);
+        }
+
+        link += '#' + remark;
+        return link;
+    }
+
+    function buildXhttpConfig(user) {
+        var remark = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
+        var link = 'vless://' + user.uuid + '@' + host + ':' + vlessPort +
+            '?encryption=none' +
+            '&security=' + vlessSecurity +
+            '&type=xhttp' +
+            '&host=' + encodeURIComponent(host) +
+            '&path=' + encodeURIComponent(xhttpPath) +
+            '&mode=packet-up';
+
+        if (isHttps) {
+            link += '&sni=' + encodeURIComponent(host) + '&alpn=h2%2Chttp%2F1.1&fp=chrome';
         }
 
         link += '#' + remark;
@@ -346,9 +365,10 @@
                     }
                 }
 
-                // VLESS over WebSocket config
+                // VLESS over WebSocket and XHTTP configs
                 var subUrl = window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id;
-                var configStr = buildWsConfig(user);
+                var wsConfigStr = buildWsConfig(user);
+                var xhttpConfigStr = buildXhttpConfig(user);
 
                 var platLabel = '';
                 if (user.created_on === 'railway') {
@@ -360,7 +380,8 @@
                 // ✅ تصحیح شد: بدون template literal
                 var btnHtml = '<div class="actions-flex">' +
                     '<button class="action-btn sub" onclick="copyLink(\'' + subUrl + '\')" title="Copy Sub Link">Sub Link</button>' +
-                    '<button class="action-btn copy" onclick="copyLink(\'' + configStr.replace(/'/g, "\\'") + '\')" title="Copy Raw Config">Config</button>' +
+                    '<button class="action-btn copy" onclick="copyLink(\'' + xhttpConfigStr.replace(/'/g, "\\'") + '\')" title="Copy XHTTP Config">XHTTP</button>' +
+                    '<button class="action-btn copy" onclick="copyLink(\'' + wsConfigStr.replace(/'/g, "\\'") + '\')" title="Copy WS Config">WS</button>' +
                     '<button class="action-btn" onclick="resetTraffic(\'' + user.id + '\')" title="Reset Traffic">Reset</button>' +
                     '<button class="action-btn delete" onclick="deleteUser(\'' + user.id + '\')" title="Delete">Del</button>' +
                     '</div>';
@@ -479,5 +500,5 @@
     // ✅ تصحیح شد: 10 ثانیه به جای 3 ثانیه
     setInterval(function() { fetchStats(); fetchInbounds(); }, 10000);
 </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0da6fd1395ee7b1',t:'MTc4MTc4NzIwNQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
