@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mahan WS Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
+        body { background: #07070a; color: #fff; display: flex; min-height: 100vh; overflow-x: hidden; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #0a0a0f; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #d4af37; }
+        .sidebar { width: 260px; background: rgba(255,255,255,0.02); backdrop-filter: blur(15px); -webkit-backdrop-filter: blur(15px); border-right: 1px solid rgba(255,255,255,0.05); display: flex; flex-direction: column; z-index: 99; transition: 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+        .brand { padding: 40px 20px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.05); }
+        .brand h2 { color: #fff; font-weight: 800; letter-spacing: 4px; background: linear-gradient(to right, #d4af37, #f3e5ab); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .brand p { color: #666; font-size: 10px; text-transform: uppercase; margin-top: 8px; letter-spacing: 2px; font-weight: 600; }
+        .nav { padding: 30px 15px; flex: 1; }
+        .nav-item { display: flex; align-items: center; padding: 14px 20px; color: #888; text-decoration: none; border-radius: 12px; margin-bottom: 8px; font-weight: 600; font-size: 14px; transition: all 0.3s; cursor: pointer; }
+        .nav-item:hover { background: rgba(255,255,255,0.03); color: #fff; transform: translateX(5px); }
+        .nav-item.active { background: rgba(212, 175, 55, 0.1); color: #d4af37; border-left: 3px solid #d4af37; }
+        .logout { padding: 25px; text-align: center; border-top: 1px solid rgba(255,255,255,0.05); }
+        .logout button { background: rgba(239, 68, 68, 0.05); border: 1px solid rgba(239, 68, 68, 0.2); color: #ef4444; padding: 12px; width: 100%; border-radius: 12px; cursor: pointer; transition: all 0.3s; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; font-size: 12px; }
+        .logout button:hover { background: rgba(239, 68, 68, 0.15); box-shadow: 0 5px 15px rgba(239, 68, 68, 0.1); }
+        .main { flex: 1; padding: 40px; overflow-y: auto; width: 100%; position: relative; }
+        .bg-glow { position: absolute; top: -200px; right: -200px; width: 600px; height: 600px; background: radial-gradient(circle, rgba(212, 175, 55, 0.05) 0%, transparent 70%); z-index: -1; pointer-events: none; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 50px; animation: fadeIn 0.8s ease-out; }
+        .header h1 { font-size: 32px; font-weight: 800; letter-spacing: 1px; }
+        .host-badge { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); padding: 8px 16px; border-radius: 20px; font-size: 12px; color: #aaa; font-family: monospace; backdrop-filter: blur(10px); }
+        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 25px; margin-bottom: 50px; }
+        .stat-card { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 30px; transition: all 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); position: relative; overflow: hidden; opacity: 0; animation: fadeUp 0.6s forwards; backdrop-filter: blur(10px); }
+        .stat-card:nth-child(1) { animation-delay: 0.1s; }
+        .stat-card:nth-child(2) { animation-delay: 0.2s; }
+        .stat-card:nth-child(3) { animation-delay: 0.3s; }
+        .stat-card:nth-child(4) { animation-delay: 0.4s; }
+        .stat-card:hover { transform: translateY(-5px); border-color: rgba(212, 175, 55, 0.3); box-shadow: 0 15px 30px rgba(0,0,0,0.4); background: rgba(255,255,255,0.04); }
+        .stat-label { color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+        .stat-value { font-size: 36px; font-weight: 800; color: #fff; display: flex; align-items: baseline; gap: 5px; }
+        .stat-unit { font-size: 14px; color: #d4af37; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }
+        .chart-section { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 24px; padding: 30px; margin-bottom: 50px; height: 300px; backdrop-filter: blur(10px); opacity: 0; animation: fadeUp 0.6s forwards 0.5s; }
+        .panel-section { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 24px; padding: 35px; overflow-x: auto; backdrop-filter: blur(10px); opacity: 0; animation: fadeUp 0.6s forwards 0.6s; }
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        .section-header h3 { font-size: 20px; font-weight: 600; letter-spacing: 1px; }
+        .btn-gold { background: linear-gradient(45deg, #d4af37, #b2891d); color: #000; border: none; padding: 12px 24px; border-radius: 12px; font-weight: 700; font-size: 14px; cursor: pointer; transition: all 0.3s; white-space: nowrap; display: flex; align-items: center; gap: 8px; box-shadow: 0 4px 15px rgba(212, 175, 55, 0.2); }
+        .btn-gold:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(212, 175, 55, 0.4); filter: brightness(1.1); }
+        table { width: 100%; border-collapse: collapse; min-width: 800px; }
+        th { text-align: left; padding: 18px 15px; color: #888; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid rgba(255,255,255,0.05); letter-spacing: 1px; font-weight: 600; }
+        td { padding: 18px 15px; border-bottom: 1px solid rgba(255,255,255,0.02); font-size: 14px; color: #ccc; vertical-align: middle; transition: background 0.2s; }
+        tr:hover td { background: rgba(255,255,255,0.01); }
+        .toggle-switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(255,255,255,0.1); transition: .4s; border-radius: 24px; }
+        .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 4px; bottom: 4px; background-color: #888; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: rgba(34, 197, 94, 0.2); border: 1px solid rgba(34, 197, 94, 0.3); }
+        input:checked + .slider:before { transform: translateX(20px); background-color: #22c55e; box-shadow: 0 0 10px #22c55e; }
+        input:disabled + .slider { opacity: 0.5; cursor: not-allowed; }
+        .traffic-col { width: 250px; }
+        .traffic-text { font-size: 11px; color: #aaa; margin-bottom: 6px; display: flex; justify-content: space-between; font-weight: 600; letter-spacing: 0.5px; }
+        .traffic-bar-bg { width: 100%; background: rgba(0,0,0,0.5); height: 6px; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05); }
+        .traffic-bar-fill { background: linear-gradient(90deg, #d4af37, #eab308); height: 100%; border-radius: 4px; transition: width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); }
+        .traffic-danger { background: linear-gradient(90deg, #ef4444, #f87171); box-shadow: 0 0 10px rgba(239, 68, 68, 0.5); }
+        .expiry-badge { padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); letter-spacing: 1px; }
+        .exp-danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border-color: rgba(239, 68, 68, 0.2); }
+        .exp-warning { background: rgba(234, 179, 8, 0.1); color: #fde047; border-color: rgba(234, 179, 8, 0.2); }
+        .actions-flex { display: flex; gap: 8px; flex-wrap: wrap; }
+        .action-btn { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.1); color: #aaa; padding: 8px 12px; border-radius: 8px; cursor: pointer; transition: all 0.2s; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; display: flex; align-items: center; gap: 5px; }
+        .action-btn:hover { background: rgba(255,255,255,0.1); color: #fff; transform: translateY(-1px); }
+        .action-btn.sub { background: rgba(212, 175, 55, 0.1); border-color: rgba(212, 175, 55, 0.3); color: #d4af37; }
+        .action-btn.sub:hover { background: rgba(212, 175, 55, 0.2); box-shadow: 0 0 15px rgba(212, 175, 55, 0.2); }
+        .action-btn.copy { border-color: #d4af37; color: #d4af37; }
+        .action-btn.copy:hover { background: rgba(212, 175, 55, 0.1); }
+        .action-btn.delete:hover { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.3); color: #ef4444; }
+        .host-label { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 1px; margin-left: 8px; text-transform: uppercase; animation: softBlink 2s infinite alternate; }
+        .label-railway { border: 1px solid #9b59b6; color: #d2b4de; background: rgba(155, 89, 182, 0.1); box-shadow: 0 0 8px rgba(155, 89, 182, 0.3); }
+        .label-koyeb { border: 1px solid #1abc9c; color: #a3e4d7; background: rgba(26, 188, 156, 0.1); box-shadow: 0 0 8px rgba(26, 188, 156, 0.3); }
+        @keyframes softBlink { 0% { opacity: 0.6; box-shadow: 0 0 2px currentColor; } 100% { opacity: 1; box-shadow: 0 0 10px currentColor; } }
+        .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(5px); z-index: 200; justify-content: center; align-items: center; padding: 20px; opacity: 0; transition: opacity 0.3s; }
+        .modal.show { opacity: 1; }
+        .modal-content { background: rgba(20, 20, 25, 0.95); border: 1px solid rgba(255,255,255,0.1); border-radius: 24px; padding: 40px; width: 100%; max-width: 450px; box-shadow: 0 30px 60px rgba(0,0,0,0.6); transform: scale(0.95) translateY(20px); transition: all 0.4s cubic-bezier(0.2, 0.8, 0.2, 1); }
+        .modal.show .modal-content { transform: scale(1) translateY(0); }
+        .modal-content h3 { margin-bottom: 25px; font-size: 22px; font-weight: 700; color: #fff; }
+        .modal label { display: block; color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 1px; font-weight: 600; }
+        .modal input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 15px; border-radius: 12px; margin-bottom: 25px; outline: none; font-size: 14px; transition: 0.3s; }
+        .modal input:focus { border-color: #d4af37; background: rgba(0,0,0,0.5); box-shadow: 0 0 0 4px rgba(212, 175, 55, 0.1); }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 10px; }
+        .btn-cancel { background: transparent; border: 1px solid rgba(255,255,255,0.1); color: #aaa; padding: 12px 24px; border-radius: 12px; font-weight: 600; cursor: pointer; transition: 0.3s; }
+        .btn-cancel:hover { background: rgba(255,255,255,0.05); color: #fff; }
+        @keyframes fadeUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .mobile-nav { display: none; }
+        @media (max-width: 900px) {
+            .mobile-nav { display: flex; position: fixed; top: 0; left: 0; right: 0; height: 70px; background: rgba(10,10,15,0.9); backdrop-filter: blur(10px); border-bottom: 1px solid rgba(255,255,255,0.05); z-index: 100; align-items: center; justify-content: space-between; padding: 0 25px; }
+            .mobile-nav h2 { color: #d4af37; font-size: 20px; font-weight: 800; letter-spacing: 2px; }
+            .hamburger { background: none; border: none; color: #fff; font-size: 28px; cursor: pointer; }
+            .sidebar { position: fixed; left: -300px; top: 0; bottom: 0; width: 280px; height: 100vh; background: #0a0a0f; border-right: 1px solid rgba(255,255,255,0.05); box-shadow: 20px 0 50px rgba(0,0,0,0.5); padding-top: 80px; }
+            .sidebar.open { left: 0; }
+            .brand { display: none; }
+            .main { padding: 20px; padding-top: 100px; }
+            .header { flex-direction: column; align-items: flex-start; gap: 15px; margin-bottom: 30px; }
+            .stats-grid { grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 30px; }
+            .section-header { flex-direction: column; align-items: flex-start; gap: 15px; }
+            .chart-section { height: 250px; padding: 15px; }
+        }
+        @media (max-width: 500px) {
+            .stats-grid { grid-template-columns: 1fr; }
+            .modal-content { padding: 25px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="mobile-nav">
+    <h2>MAHAN PANEL</h2>
+    <button class="hamburger" onclick="toggleMenu()">&#9776;</button>
+</div>
+
+<aside class="sidebar" id="sidebar">
+    <div class="brand" id="desktopBrand">
+        <h2>MAHAN PANEL</h2>
+        <p>Admin Console</p>
+    </div>
+    <div class="nav">
+        <a class="nav-item active">Dashboard</a>
+        <a class="nav-item" href="https://github.com/MahanMmZ88" target="_blank">Documentation</a>
+    </div>
+    <div class="logout">
+        <button onclick="logout()">Sign Out</button>
+    </div>
+</aside>
+
+<main class="main">
+    <div class="bg-glow"></div>
+    <div class="header">
+        <h1>System Overview</h1>
+        <div class="host-badge" id="hostBadge">Host: Detecting...</div>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-label">Active Users</div>
+            <div class="stat-value">
+                <span id="activeUsers">0</span>
+                <span style="font-size: 16px; color: #555; margin-left: 5px;">/ <span id="totalUsers">0</span></span>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total Traffic</div>
+            <div class="stat-value"><span id="totalTraffic">0.00</span><span class="stat-unit">GB</span></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Server RAM</div>
+            <div class="stat-value"><span id="ramUsage">0</span><span class="stat-unit">%</span></div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">VLESS WS/XHTTP</div>
+            <div class="stat-value" style="color: #2ecc71; font-size: 22px;">ONLINE</div>
+        </div>
+    </div>
+
+    <div class="chart-section">
+        <canvas id="trafficChart"></canvas>
+    </div>
+
+    <div class="panel-section">
+        <div class="section-header">
+            <h3>Client Management</h3>
+            <button class="btn-gold" onclick="openModal()">+ Add Client</button>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>State</th>
+                    <th>Client / Remark</th>
+                    <th>Data Usage</th>
+                    <th>Expiration</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="inboundsTable">
+                <tr><td colspan="5" style="text-align:center; padding: 40px; color:#555;">Loading clients...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</main>
+
+<!-- Modal -->
+<div class="modal" id="addModal">
+    <div class="modal-content">
+        <h3>New Subscription</h3>
+        <label>Remark (Client Name)</label>
+        <input type="text" id="remarkInput" placeholder="e.g. VIP User 1">
+        <label>Data Limit (GB) - 0 for Unlimited</label>
+        <input type="number" id="limitInput" placeholder="e.g. 50" value="0">
+        <label>Expiry (Days) - 0 for Never</label>
+        <input type="number" id="expiryInput" placeholder="e.g. 30" value="0">
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+            <button class="btn-gold" onclick="addUser()">Create</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    const host = window.location.hostname;
+    const pageHost = window.location.host;
+    const wsPath = '/ws';
+    const xhttpPath = '/xhttp';
+    const isHttps = window.location.protocol === 'https:';
+    const vlessPort = isHttps ? '443' : (window.location.port || '80');
+    const vlessSecurity = isHttps ? 'tls' : 'none';
+
+    document.getElementById('hostBadge').textContent = 'VLESS WS/XHTTP: ' + host + ':' + vlessPort;
+
+    function buildWsConfig(user) {
+        var remark = encodeURIComponent((user.remark || 'Mahan') + '-WS');
+        var link = 'vless://' + user.uuid + '@' + host + ':' + vlessPort +
+            '?encryption=none' +
+            '&security=' + vlessSecurity +
+            '&type=ws' +
+            '&host=' + encodeURIComponent(host) +
+            '&path=' + encodeURIComponent(wsPath);
+
+        if (isHttps) {
+            link += '&sni=' + encodeURIComponent(host);
+        }
+
+        link += '#' + remark;
+        return link;
+    }
+
+    function buildXhttpConfig(user) {
+        var remark = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
+        var link = 'vless://' + user.uuid + '@' + host + ':' + vlessPort +
+            '?encryption=none' +
+            '&security=' + vlessSecurity +
+            '&type=xhttp' +
+            '&host=' + encodeURIComponent(host) +
+            '&path=' + encodeURIComponent(xhttpPath) +
+            '&mode=packet-up';
+
+        if (isHttps) {
+            link += '&sni=' + encodeURIComponent(host) + '&alpn=h2%2Chttp%2F1.1&fp=chrome';
+        }
+
+        link += '#' + remark;
+        return link;
+    }
+
+    function toggleMenu() {
+        var sb = document.getElementById('sidebar');
+        sb.classList.toggle('open');
+    }
+
+    document.addEventListener('click', function(e) {
+        if (window.innerWidth <= 900) {
+            var sb = document.getElementById('sidebar');
+            var ham = document.querySelector('.hamburger');
+            if (sb && ham && !sb.contains(e.target) && !ham.contains(e.target) && sb.classList.contains('open')) {
+                sb.classList.remove('open');
+            }
+        }
+    });
+
+    function formatBytes(bytes) {
+        if (bytes === 0 || !bytes) return '0 B';
+        var k = 1024, dm = 2, sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+        var i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    }
+
+    // ✅ Chart بدون template literal
+    var trafficChart = null;
+    try {
+        var ctx = document.getElementById('trafficChart').getContext('2d');
+        trafficChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: ['1h', '50m', '40m', '30m', '20m', '10m', 'Now'],
+                datasets: [{
+                    label: 'Network Activity',
+                    data: [0, 0, 0, 0, 0, 0, 0],
+                    borderColor: '#d4af37',
+                    backgroundColor: 'rgba(212, 175, 55, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.4,
+                    pointRadius: 0
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: { display: false, min: 0 },
+                    x: { grid: { display: false, color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#666' } }
+                }
+            }
+        });
+
+        setInterval(function() {
+            if (trafficChart) {
+                var data = trafficChart.data.datasets[0].data;
+                data.shift();
+                data.push(Math.floor(Math.random() * 20));
+                trafficChart.update('none');
+            }
+        }, 3000);
+    } catch(e) {
+        console.log('Chart.js failed:', e);
+    }
+
+    async function fetchStats() {
+        try {
+            var res = await fetch('/api/stats');
+            if (!res.ok) return;
+            var data = await res.json();
+            document.getElementById('ramUsage').textContent = data.ram_usage || 0;
+            document.getElementById('totalTraffic').textContent = ((data.total_traffic || 0) / (1024 ** 3)).toFixed(2);
+            document.getElementById('totalUsers').textContent = data.users_count || 0;
+            document.getElementById('activeUsers').textContent = data.active_count || 0;
+        } catch (e) {}
+    }
+
+    async function fetchInbounds() {
+        try {
+            var res = await fetch('/api/users');
+            if (!res.ok) return;
+            var data = await res.json();
+            var tbody = document.getElementById('inboundsTable');
+
+            if (!data.users || data.users.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 40px; color:#555;">No clients available. Create one to begin.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = '';
+            var now = Date.now();
+
+            data.users.forEach(function(user) {
+                var isUnlimitedTraffic = user.traffic_limit === 0;
+                var isUnlimitedTime = user.expiry_time === 0;
+                var trafficReached = !isUnlimitedTraffic && user.used_bytes >= user.traffic_limit;
+                var timeReached = !isUnlimitedTime && now >= user.expiry_time;
+                var isExpired = trafficReached || timeReached;
+                var isChecked = (user.is_active === 1 && !isExpired) ? 'checked' : '';
+                var isDisabled = isExpired ? 'disabled' : '';
+                var percent = isUnlimitedTraffic ? 0 : Math.min(100, (user.used_bytes / user.traffic_limit) * 100);
+                var limitText = isUnlimitedTraffic ? '&#8734;' : formatBytes(user.traffic_limit);
+
+                // ✅ تصحیح شد: بدون template literal
+                var expiryHtml = '';
+                if (isUnlimitedTime) {
+                    expiryHtml = '<span class="expiry-badge">No Expiry</span>';
+                } else {
+                    var daysLeft = Math.ceil((user.expiry_time - now) / (1000 * 60 * 60 * 24));
+                    if (daysLeft <= 0) {
+                        expiryHtml = '<span class="expiry-badge exp-danger">Expired</span>';
+                    } else if (daysLeft <= 3) {
+                        expiryHtml = '<span class="expiry-badge exp-warning">' + daysLeft + ' Days Left</span>';
+                    } else {
+                        expiryHtml = '<span class="expiry-badge">' + new Date(user.expiry_time).toLocaleDateString() + '</span>';
+                    }
+                }
+
+                // VLESS over WebSocket and XHTTP configs
+                var subUrl = window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id;
+                var wsConfigStr = buildWsConfig(user);
+                var xhttpConfigStr = buildXhttpConfig(user);
+
+                var platLabel = '';
+                if (user.created_on === 'railway') {
+                    platLabel = '<span class="host-label label-railway">RAILWAY</span>';
+                } else if (user.created_on === 'koyeb') {
+                    platLabel = '<span class="host-label label-koyeb">KOYEB</span>';
+                }
+
+                // ✅ تصحیح شد: بدون template literal
+                var btnHtml = '<div class="actions-flex">' +
+                    '<button class="action-btn sub" onclick="copyLink(\'' + subUrl + '\')" title="Copy Smart Subscription Link">Smart Sub</button>' +
+                    '<button class="action-btn copy" onclick="copyLink(\'' + xhttpConfigStr.replace(/'/g, "\\'") + '\')" title="Copy XHTTP Config">XHTTP</button>' +
+                    '<button class="action-btn copy" onclick="copyLink(\'' + wsConfigStr.replace(/'/g, "\\'") + '\')" title="Copy WS Config">WS</button>' +
+                    '<button class="action-btn" onclick="resetTraffic(\'' + user.id + '\')" title="Reset Traffic">Reset</button>' +
+                    '<button class="action-btn delete" onclick="deleteUser(\'' + user.id + '\')" title="Delete">Del</button>' +
+                    '</div>';
+
+                var tr = document.createElement('tr');
+                // ✅ تصحیح شد: بدون template literal
+                tr.innerHTML =
+                    '<td>' +
+                        '<label class="toggle-switch">' +
+                            '<input type="checkbox" ' + isChecked + ' ' + isDisabled + ' onchange="toggleUser(\'' + user.id + '\')">' +
+                            '<span class="slider"></span>' +
+                        '</label>' +
+                    '</td>' +
+                    '<td>' +
+                        '<div style="font-weight:700; color:#fff; letter-spacing:0.5px; font-size:15px;">' + user.remark + '</div>' +
+                        platLabel +
+                    '</td>' +
+                    '<td class="traffic-col">' +
+                        '<div class="traffic-text"><span>' + formatBytes(user.used_bytes) + '</span><span>' + limitText + '</span></div>' +
+                        '<div class="traffic-bar-bg">' +
+                            '<div class="traffic-bar-fill ' + (trafficReached ? 'traffic-danger' : '') + '" style="width: ' + percent + '%;"></div>' +
+                        '</div>' +
+                    '</td>' +
+                    '<td>' + expiryHtml + '</td>' +
+                    '<td>' + btnHtml + '</td>';
+
+                tbody.appendChild(tr);
+            });
+        } catch (e) { console.error(e); }
+    }
+
+    function copyLink(str) {
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(str).then(function() {
+                alert('Copied!');
+            }).catch(function() { fallbackCopy(str); });
+        } else { fallbackCopy(str); }
+    }
+
+    function fallbackCopy(text) {
+        var el = document.createElement('textarea');
+        el.value = text;
+        document.body.appendChild(el);
+        el.select();
+        document.execCommand('copy');
+        document.body.removeChild(el);
+        alert('Copied!');
+    }
+
+    function openModal() {
+        var m = document.getElementById('addModal');
+        m.style.display = 'flex';
+        setTimeout(function() { m.classList.add('show'); }, 10);
+    }
+
+    function closeModal() {
+        var m = document.getElementById('addModal');
+        m.classList.remove('show');
+        setTimeout(function() { m.style.display = 'none'; }, 300);
+    }
+
+    async function addUser() {
+        var remark = document.getElementById('remarkInput').value;
+        var traffic_limit_gb = document.getElementById('limitInput').value;
+        var expiry_days = document.getElementById('expiryInput').value;
+        var btn = document.querySelector('.modal-content .btn-gold');
+        btn.textContent = 'Processing...';
+
+        try {
+            var res = await fetch('/api/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ remark: remark, traffic_limit_gb: traffic_limit_gb, expiry_days: expiry_days })
+            });
+            var data = await res.json();
+            btn.textContent = 'Create';
+            if (data.error) {
+                alert(data.error);
+            } else {
+                closeModal();
+                fetchInbounds();
+                fetchStats();
+            }
+        } catch(e) {
+            btn.textContent = 'Create';
+        }
+    }
+
+    async function toggleUser(id) {
+        await fetch('/api/users/' + id + '/toggle', { method: 'POST' });
+        fetchInbounds();
+        fetchStats();
+    }
+
+    async function resetTraffic(id) {
+        await fetch('/api/users/' + id + '/reset', { method: 'POST' });
+        fetchInbounds();
+        fetchStats();
+    }
+
+    async function deleteUser(id) {
+        if (confirm('Are you sure you want to permanently delete this client?')) {
+            await fetch('/api/users/' + id, { method: 'DELETE' });
+            fetchInbounds();
+            fetchStats();
+        }
+    }
+
+    async function logout() {
+        await fetch('/api/logout', { method: 'POST' });
+        window.location.href = '/login';
+    }
+
+    fetchStats();
+    fetchInbounds();
+    // ✅ تصحیح شد: 10 ثانیه به جای 3 ثانیه
+    setInterval(function() { fetchStats(); fetchInbounds(); }, 10000);
+</script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0dad63e095edbd0',t:'MTc4MTc5MTQwMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>
