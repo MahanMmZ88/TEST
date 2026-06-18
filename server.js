@@ -45,6 +45,8 @@ let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
 let lastCpuUsage = process.cpuUsage();
 let lastCpuCheck = process.hrtime.bigint();
+let trafficCurrentMinuteBytes = 0;
+let trafficHistory = [];
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
@@ -81,6 +83,23 @@ function log(message, extra = '') {
 
 function generateHash(password) {
   return crypto.createHash('sha256').update(String(password) + PASSWORD_SALT).digest('hex');
+}
+
+function getTrafficChart() {
+  const now = Date.now();
+  const points = trafficHistory.slice(-59).concat([{ ts: now, bytes: trafficCurrentMinuteBytes }]);
+  const padded = [];
+  const missing = Math.max(0, 60 - points.length);
+
+  for (let i = missing; i > 0; i--) {
+    padded.push({ ts: now - i * 60 * 1000, bytes: 0 });
+  }
+  padded.push(...points);
+
+  return {
+    labels: padded.map((p) => new Date(p.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })),
+    values: padded.map((p) => Number((p.bytes / 1024 / 1024).toFixed(3)))
+  };
 }
 
 function getCpuUsagePercent() {
@@ -208,6 +227,7 @@ function closeUserConnections(userId, reason = 'user disabled') {
 
 function updateTraffic(user, bytes) {
   if (!user || !bytes || bytes <= 0) return;
+  trafficCurrentMinuteBytes += bytes;
   user.used_bytes = Number(user.used_bytes || 0) + bytes;
   user.last_seen = Date.now();
   scheduleSaveDB(false);
@@ -788,7 +808,8 @@ app.get('/api/stats', requireAuth, (req, res) => {
     users_count: DB.users.length,
     active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpired(u)).length,
     ws_connections: Array.from(activeConnections.values()).reduce((sum, set) => sum + set.size, 0),
-    xhttp_sessions: xhttpSessions.size
+    xhttp_sessions: xhttpSessions.size,
+    traffic_chart: getTrafficChart()
   });
 });
 
@@ -1199,6 +1220,12 @@ wss.on('connection', (ws, req) => {
     setImmediate(() => handleClientData(earlyData));
   }
 });
+
+setInterval(() => {
+  trafficHistory.push({ ts: Date.now(), bytes: trafficCurrentMinuteBytes });
+  trafficCurrentMinuteBytes = 0;
+  if (trafficHistory.length > 59) trafficHistory = trafficHistory.slice(-59);
+}, 60 * 1000);
 
 setInterval(() => {
   for (const user of DB.users) {
