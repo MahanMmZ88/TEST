@@ -56,6 +56,9 @@ let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Set(closeFn)
+const adminEventClients = new Set();
+const subEventClients = new Map(); // sub_id -> Set(res)
+let realtimeBroadcastTimer = null;
 
 app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
@@ -230,11 +233,13 @@ function getActiveUserByUuid(uuidBytes) {
 function registerConnection(userId, closeFn) {
   if (!activeConnections.has(userId)) activeConnections.set(userId, new Set());
   activeConnections.get(userId).add(closeFn);
+  scheduleRealtimeBroadcast();
   return () => {
     const set = activeConnections.get(userId);
     if (!set) return;
     set.delete(closeFn);
     if (set.size === 0) activeConnections.delete(userId);
+    scheduleRealtimeBroadcast();
   };
 }
 
@@ -251,6 +256,7 @@ function updateTraffic(user, bytes) {
   trafficCurrentMinuteBytes += bytes;
   user.used_bytes = Number(user.used_bytes || 0) + bytes;
   user.last_seen = Date.now();
+  scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
 
   if (user.is_active === 1 && isUserExpired(user)) {
@@ -827,6 +833,94 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
+function buildUsersSnapshot() {
+  return DB.users.map((user) => {
+    const connections = activeConnections.get(user.id)?.size || 0;
+    return { ...user, online: connections > 0, connections };
+  });
+}
+
+function buildStatsSnapshot() {
+  const memory = process.memoryUsage();
+  const totalTraffic = DB.users.reduce((sum, u) => sum + Number(u.used_bytes || 0), 0);
+  const activeConnectionCount = Array.from(activeConnections.values()).reduce((sum, set) => sum + set.size, 0);
+  return {
+    ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
+    cpu_usage: getCpuUsagePercent(),
+    uptime: Math.round(process.uptime()),
+    total_traffic: totalTraffic,
+    users_count: DB.users.length,
+    active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpired(u)).length,
+    online_users: activeConnections.size,
+    ws_connections: activeConnectionCount,
+    xhttp_sessions: xhttpSessions.size,
+    traffic_chart: getTrafficChart()
+  };
+}
+
+function buildSubSnapshot(user) {
+  const used = Number(user.used_bytes || 0);
+  const remaining = user.traffic_limit === 0 ? null : Math.max(0, user.traffic_limit - used);
+  const percent = Number(calcPercent(used, user.traffic_limit).toFixed(1));
+  const progressWidth = Number(calcPercent(used, user.traffic_limit).toFixed(2));
+  const expired = isUserExpired(user);
+  return {
+    used_bytes: used,
+    used_formatted: formatBytes(used),
+    remaining_bytes: remaining,
+    remaining_formatted: remaining === null ? 'Unlimited' : formatBytes(remaining),
+    percent,
+    progress_width: progressWidth,
+    is_danger: user.traffic_limit > 0 && (used / user.traffic_limit) > 0.9,
+    expired,
+    status: expired ? 'Expired' : 'Active',
+    expiry: user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time),
+    last_seen: user.last_seen === 0 ? 'Never' : formatTehranDate(user.last_seen)
+  };
+}
+
+function writeSse(res, event, data) {
+  try {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch (_) {}
+}
+
+function setupSse(req, res) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-store, no-transform',
+    'connection': 'keep-alive',
+    'x-accel-buffering': 'no'
+  });
+  try { res.flushHeaders?.(); } catch (_) {}
+}
+
+function broadcastRealtimeNow() {
+  if (adminEventClients.size) {
+    const snapshot = { stats: buildStatsSnapshot(), users: buildUsersSnapshot() };
+    for (const res of Array.from(adminEventClients)) writeSse(res, 'snapshot', snapshot);
+  }
+
+  for (const [subId, clients] of Array.from(subEventClients.entries())) {
+    const user = DB.users.find((u) => u.sub_id === subId);
+    if (!user) {
+      for (const res of Array.from(clients)) writeSse(res, 'deleted', { deleted: true });
+      continue;
+    }
+    const snapshot = buildSubSnapshot(user);
+    for (const res of Array.from(clients)) writeSse(res, 'snapshot', snapshot);
+  }
+}
+
+function scheduleRealtimeBroadcast() {
+  if (realtimeBroadcastTimer) return;
+  realtimeBroadcastTimer = setTimeout(() => {
+    realtimeBroadcastTimer = null;
+    broadcastRealtimeNow();
+  }, 1000);
+}
+
 app.get('/health', (req, res) => res.type('text/plain').send('ok\n'));
 
 app.options(`${XHTTP_PATH}/*`, (req, res) => {
@@ -922,30 +1016,22 @@ app.post('/api/admin/change-password', requireAuth, (req, res) => {
 });
 
 app.get('/api/stats', requireAuth, (req, res) => {
-  const memory = process.memoryUsage();
-  const totalTraffic = DB.users.reduce((sum, u) => sum + Number(u.used_bytes || 0), 0);
-  const connectionCounts = Array.from(activeConnections.values()).map((set) => set.size);
-  const activeConnectionCount = connectionCounts.reduce((sum, count) => sum + count, 0);
-  res.json({
-    ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
-    cpu_usage: getCpuUsagePercent(),
-    uptime: Math.round(process.uptime()),
-    total_traffic: totalTraffic,
-    users_count: DB.users.length,
-    active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpired(u)).length,
-    online_users: activeConnections.size,
-    ws_connections: activeConnectionCount,
-    xhttp_sessions: xhttpSessions.size,
-    traffic_chart: getTrafficChart()
-  });
+  res.json(buildStatsSnapshot());
 });
 
 app.get('/api/users', requireAuth, (req, res) => {
-  const users = DB.users.map((user) => {
-    const connections = activeConnections.get(user.id)?.size || 0;
-    return { ...user, online: connections > 0, connections };
+  res.json({ users: buildUsersSnapshot() });
+});
+
+app.get('/api/events', requireAuth, (req, res) => {
+  setupSse(req, res);
+  adminEventClients.add(res);
+  writeSse(res, 'snapshot', { stats: buildStatsSnapshot(), users: buildUsersSnapshot() });
+  const heartbeat = setInterval(() => writeSse(res, 'ping', { now: Date.now() }), 25000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    adminEventClients.delete(res);
   });
-  res.json({ users });
 });
 
 app.post('/api/users', requireAuth, (req, res) => {
@@ -977,6 +1063,7 @@ app.post('/api/users', requireAuth, (req, res) => {
   };
 
   DB.users.unshift(user);
+  scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
   log('[User] Created:', `${user.remark} ${user.uuid}`);
   res.json({ success: true, user });
@@ -988,6 +1075,7 @@ app.delete('/api/users/:id', requireAuth, (req, res) => {
   DB.users = DB.users.filter((u) => u.id !== req.params.id);
   if (DB.users.length < before) {
     closeUserConnections(req.params.id, 'user deleted');
+    scheduleRealtimeBroadcast();
     scheduleSaveDB(false);
     log('[User] Deleted:', user ? user.remark : req.params.id);
     return res.json({ success: true });
@@ -1000,6 +1088,7 @@ app.post('/api/users/:id/toggle', requireAuth, (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
   user.is_active = user.is_active === 1 ? 0 : 1;
   if (user.is_active === 0) closeUserConnections(user.id, 'user disabled');
+  scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
   res.json({ success: true, is_active: user.is_active });
 });
@@ -1010,6 +1099,7 @@ app.post('/api/users/:id/reset', requireAuth, (req, res) => {
   user.used_bytes = 0;
   user.is_active = 1;
   user.last_seen = 0;
+  scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
   res.json({ success: true });
 });
@@ -1050,6 +1140,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
     user.is_active = 1;
   }
 
+  scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
   log('[User] Edited:', `${user.remark} ${user.uuid}`);
   res.json({ success: true, user });
@@ -1064,6 +1155,22 @@ app.get('/qr/:sub_id/:type', async (req, res) => {
     log('[QR] Public generate failed:', err && err.message ? err.message : 'unknown');
     res.status(500).type('text/plain').send('QR generation failed');
   }
+});
+
+app.get('/sub/:sub_id/events', (req, res) => {
+  const user = DB.users.find((u) => u.sub_id === req.params.sub_id);
+  if (!user) return res.status(404).end();
+  setupSse(req, res);
+  if (!subEventClients.has(req.params.sub_id)) subEventClients.set(req.params.sub_id, new Set());
+  const clients = subEventClients.get(req.params.sub_id);
+  clients.add(res);
+  writeSse(res, 'snapshot', buildSubSnapshot(user));
+  const heartbeat = setInterval(() => writeSse(res, 'ping', { now: Date.now() }), 25000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    clients.delete(res);
+    if (clients.size === 0) subEventClients.delete(req.params.sub_id);
+  });
 });
 
 app.get('/sub/:sub_id', (req, res) => {
@@ -1121,12 +1228,12 @@ app.get('/sub/:sub_id', (req, res) => {
 <style>
 *{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:radial-gradient(circle at top right,#1a1a2e,#08080d 70%);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}.shell{width:100%;max-width:980px}.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:28px;padding:30px;box-shadow:0 25px 70px rgba(0,0,0,.55);backdrop-filter:blur(18px)}.hero{text-align:center;margin-bottom:26px}h1{color:#d4af37;margin-bottom:8px;font-size:32px}.sub{color:#888;letter-spacing:2px;font-size:12px;text-transform:uppercase}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.stat{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;text-align:center}.label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px}.value{font-size:22px;font-weight:800;margin-top:6px}.progress{height:9px;background:rgba(255,255,255,.08);border-radius:10px;overflow:hidden;margin:12px 0 22px}.fill{height:100%;background:linear-gradient(90deg,#d4af37,#eab308);width:${progressWidth}%}.danger{background:linear-gradient(90deg,#ef4444,#f87171)}.info{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;margin:18px 0}.row{display:flex;justify-content:space-between;gap:14px;margin:12px 0;color:#ddd}.row span:first-child{color:#888}.badge{white-space:nowrap;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:800}.active{background:rgba(34,197,94,.13);color:#4ade80}.expired{background:rgba(239,68,68,.13);color:#f87171}.configs{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}.cfg{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:20px;padding:18px}.cfg h3{font-size:16px;margin-bottom:12px;color:#d4af37}.qr{background:#fff;border-radius:14px;padding:10px;width:148px;height:148px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center}.qr img{width:128px;height:128px}.btn{width:100%;background:linear-gradient(45deg,#d4af37,#b2891d);color:#000;border:0;padding:14px;border-radius:12px;font-weight:900;cursor:pointer;margin-top:9px}.btn.secondary{background:rgba(255,255,255,.06);color:#d4af37;border:1px solid rgba(212,175,55,.35)}.btn.dark{background:rgba(0,0,0,.28);color:#ddd;border:1px solid rgba(255,255,255,.1)}.guide{text-align:center;margin-top:18px;color:#777;font-size:12px;line-height:1.6}@media(max-width:760px){.card{padding:22px;border-radius:22px}.grid,.configs{grid-template-columns:1fr}h1{font-size:26px}.row{font-size:13px}.qr{width:136px;height:136px}.qr img{width:116px;height:116px}}
 </style></head><body><main class="shell"><div class="card"><div class="hero"><h1>${remarkSafe}</h1><div class="sub">Smart VLESS Subscription</div></div>
-<div class="grid"><div class="stat"><div class="label">Used Traffic</div><div class="value">${usedFormatted}</div></div><div class="stat"><div class="label">Remaining</div><div class="value">${remainingFormatted}</div></div></div>
-<div style="display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:18px"><span>Traffic Usage</span><span>${percent}%</span></div><div class="progress"><div class="fill ${isDanger ? 'danger' : ''}"></div></div>
-<div class="info"><div class="row"><span>Status</span><b class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b>${expiryStr}</b></div><div class="row"><span>Last Seen</span><b>${lastSeenStr}</b></div></div>
+<div class="grid"><div class="stat"><div class="label">Used Traffic</div><div class="value" id="usedValue">${usedFormatted}</div></div><div class="stat"><div class="label">Remaining</div><div class="value" id="remainingValue">${remainingFormatted}</div></div></div>
+<div style="display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:18px"><span>Traffic Usage</span><span id="percentValue">${percent}%</span></div><div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : ''}"></div></div>
+<div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
 <div class="configs"><section class="cfg"><h3>XHTTP Config</h3><div class="qr"><img alt="XHTTP QR" src="${qrBase}/xhttp"></div><button class="btn" onclick="copyXhttp()">Copy XHTTP Config</button></section><section class="cfg"><h3>WebSocket Config</h3><div class="qr"><img alt="WebSocket QR" src="${qrBase}/ws"></div><button class="btn secondary" onclick="copyWs()">Copy WebSocket Config</button></section></div>
 <button class="btn dark" onclick="copySub()">Copy Subscription URL</button><button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button><div class="guide">VPN clients get both configs automatically. Browsers see this smart page with separate QR codes and copy buttons.</div></div></main>
-<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};function copyText(t){navigator.clipboard.writeText(t).then(function(){alert('Copied!')}).catch(function(){prompt('Copy:',t)})}function copyXhttp(){copyText(XHTTP_LINK)}function copyWs(){copyText(WS_LINK)}function copyAll(){copyText(ALL_LINKS)}function copySub(){copyText(SUB_URL)}</script></body></html>`);});
+<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};function copyText(t){navigator.clipboard.writeText(t).then(function(){alert('Copied!')}).catch(function(){prompt('Copy:',t)})}function copyXhttp(){copyText(XHTTP_LINK)}function copyWs(){copyText(WS_LINK)}function copyAll(){copyText(ALL_LINKS)}function copySub(){copyText(SUB_URL)}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('percentValue').textContent=d.percent+'%';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':'');var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+(d.expired?'expired':'active');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);});
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 app.get('/panel', (req, res) => {
@@ -1381,6 +1488,7 @@ setInterval(() => {
   trafficHistory.push({ ts: Date.now(), bytes: trafficCurrentMinuteBytes });
   trafficCurrentMinuteBytes = 0;
   if (trafficHistory.length > 59) trafficHistory = trafficHistory.slice(-59);
+  scheduleRealtimeBroadcast();
 }, 60 * 1000);
 
 setInterval(() => {
@@ -1388,6 +1496,7 @@ setInterval(() => {
     if (user.is_active === 1 && isUserExpired(user)) {
       user.is_active = 0;
       closeUserConnections(user.id, 'expired');
+      scheduleRealtimeBroadcast();
       scheduleSaveDB(false);
       log('[User] Expired:', user.remark);
     }
