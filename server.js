@@ -11,7 +11,9 @@ const cookieParser = require('cookie-parser');
 const { WebSocketServer } = require('ws');
 
 const app = express();
-const PORT = Number(process.env.PORT || 3000); // Railway provides PORT automatically.
+app.set('trust proxy', true);
+
+const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide PORT automatically.
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 const DB_PATH = path.join(__dirname, 'db.json');
@@ -25,6 +27,7 @@ const WS_BACKPRESSURE_LIMIT = 8 * 1024 * 1024;
 const WS_BACKPRESSURE_RESUME = 2 * 1024 * 1024;
 const MAX_UDP_PACKET_SIZE = 64 * 1024;
 const UDP_IDLE_TIMEOUT_MS = 60000;
+const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_XHTTP_POST_SIZE = 2 * 1024 * 1024;
 const MAX_XHTTP_BUFFERED_POSTS = 64;
 const MAX_XHTTP_DOWNLINK_BUFFER = 8 * 1024 * 1024;
@@ -40,11 +43,33 @@ const DB_SAVE_DEBOUNCE_MS = 1500;
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
+let selfPingHealthUrl = '';
+let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
 const activeConnections = new Map(); // user.id -> Set(closeFn)
 
 app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
+
+function rememberPublicSelfUrl(req) {
+  const host = String(req.headers.host || '').trim();
+  if (!host) return;
+
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const proto = forwardedProto || (req.secure ? 'https' : req.protocol || 'http');
+  if (proto !== 'http' && proto !== 'https') return;
+
+  const nextUrl = `${proto}://${host}/health`;
+  if (selfPingHealthUrl !== nextUrl) {
+    selfPingHealthUrl = nextUrl;
+  }
+}
+
+app.use((req, res, next) => {
+  rememberPublicSelfUrl(req);
+  next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 function log(message, extra = '') {
@@ -1171,10 +1196,23 @@ setInterval(() => {
 
 setInterval(() => {
   try {
-    const url = 'https://www.google.com';
-    fetch(url, { method: 'HEAD' }).catch(() => {});
+    const url = selfPingHealthUrl;
+    if (!url) return;
+
+    if (lastSelfPingUrlLog !== url) {
+      lastSelfPingUrlLog = url;
+      log('[KEEPALIVE] Self-ping target:', url);
+    }
+
+    fetch(url, {
+      method: 'HEAD',
+      cache: 'no-store',
+      headers: { 'user-agent': 'Mahan-Panel-Self-Keepalive/1.0' }
+    }).catch((err) => {
+      log('[KEEPALIVE] Self-ping failed:', err && err.message ? err.message : 'unknown');
+    });
   } catch (_) {}
-}, 4 * 60 * 1000);
+}, SELF_PING_INTERVAL_MS);
 
 process.on('SIGTERM', () => {
   try { saveDBNow(); } catch (_) {}
