@@ -93,7 +93,8 @@ function getCpuUsagePercent() {
   lastCpuCheck = currentTime;
 
   if (!elapsedMicros || elapsedMicros <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.round((usedMicros / elapsedMicros) * 100)));
+  const percent = Math.max(0, Math.min(100, (usedMicros / elapsedMicros) * 100));
+  return Number(percent.toFixed(1));
 }
 
 function formatBytes(bytes) {
