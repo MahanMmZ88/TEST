@@ -8,6 +8,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
 const cookieParser = require('cookie-parser');
+const QRCode = require('qrcode');
 const { WebSocketServer } = require('ws');
 
 const app = express();
@@ -40,6 +41,9 @@ const XHTTP_RESPONSE_HEADERS = {
   'access-control-allow-methods': 'GET, POST, OPTIONS'
 };
 const DB_SAVE_DEBOUNCE_MS = 1500;
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
@@ -50,6 +54,7 @@ let trafficHistory = [];
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
+const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Set(closeFn)
 
 app.use(express.json({ limit: '256kb' }));
@@ -429,6 +434,41 @@ function buildSubscriptionLinks(req, user) {
   return [buildWsVlessLink(req, user), buildXhttpVlessLink(req, user)];
 }
 
+function getPublicBaseUrl(req) {
+  const rawHost = String(req.get('host') || '').trim();
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const proto = forwardedProto || req.protocol || 'https';
+  return `${proto}://${rawHost}`;
+}
+
+function buildSubUrl(req, user) {
+  return `${getPublicBaseUrl(req)}/sub/${user.sub_id}`;
+}
+
+function getQrPayload(req, user, type) {
+  if (type === 'ws') return buildWsVlessLink(req, user);
+  if (type === 'xhttp') return buildXhttpVlessLink(req, user);
+  if (type === 'sub') return buildSubUrl(req, user);
+  return '';
+}
+
+async function sendQrSvg(res, payload) {
+  if (!payload) {
+    res.status(400).type('text/plain').send('bad qr type');
+    return;
+  }
+  const svg = await QRCode.toString(payload, {
+    type: 'svg',
+    errorCorrectionLevel: 'M',
+    margin: 1,
+    color: { dark: '#111111', light: '#ffffff' },
+    width: 320
+  });
+  res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(svg);
+}
+
 function readRequestBody(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -744,6 +784,43 @@ function getXHttpSession(sessionId) {
   return session;
 }
 
+function getClientIp(req) {
+  return String(req.headers['cf-connecting-ip'] || req.ip || req.socket.remoteAddress || 'unknown');
+}
+
+function getLoginState(ip) {
+  const now = Date.now();
+  let state = loginAttempts.get(ip);
+  if (!state || now - state.firstAt > LOGIN_WINDOW_MS) {
+    state = { count: 0, firstAt: now, lockedUntil: 0 };
+    loginAttempts.set(ip, state);
+  }
+  return state;
+}
+
+function isLoginLocked(ip) {
+  const state = getLoginState(ip);
+  if (state.lockedUntil && Date.now() < state.lockedUntil) return state.lockedUntil;
+  if (state.lockedUntil && Date.now() >= state.lockedUntil) {
+    loginAttempts.delete(ip);
+  }
+  return 0;
+}
+
+function recordLoginFailure(ip) {
+  const state = getLoginState(ip);
+  state.count += 1;
+  if (state.count >= LOGIN_MAX_ATTEMPTS) {
+    state.lockedUntil = Date.now() + LOGIN_LOCK_MS;
+  }
+  loginAttempts.set(ip, state);
+  return state;
+}
+
+function recordLoginSuccess(ip) {
+  loginAttempts.delete(ip);
+}
+
 function requireAuth(req, res, next) {
   const token = req.cookies.admin_session;
   if (token && activeSessions.has(token)) return next();
@@ -791,9 +868,18 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
 });
 
 app.post('/api/login', (req, res) => {
+  const ip = getClientIp(req);
+  const lockedUntil = isLoginLocked(ip);
+  if (lockedUntil) {
+    const retryAfter = Math.ceil((lockedUntil - Date.now()) / 1000);
+    res.setHeader('Retry-After', String(retryAfter));
+    return res.status(429).json({ success: false, error: 'Too many login attempts. Try again later.', retry_after: retryAfter });
+  }
+
   const { username, password } = req.body || {};
   const hash = generateHash(password || '');
   if (DB.admin && DB.admin.username === username && DB.admin.password_hash === hash) {
+    recordLoginSuccess(ip);
     const token = crypto.randomBytes(32).toString('hex');
     activeSessions.add(token);
     res.cookie('admin_session', token, {
@@ -804,7 +890,9 @@ app.post('/api/login', (req, res) => {
     });
     return res.json({ success: true });
   }
-  return res.status(401).json({ success: false });
+
+  const state = recordLoginFailure(ip);
+  return res.status(401).json({ success: false, error: 'Invalid credentials', attempts_left: Math.max(0, LOGIN_MAX_ATTEMPTS - state.count) });
 });
 
 app.post('/api/logout', requireAuth, (req, res) => {
@@ -813,9 +901,31 @@ app.post('/api/logout', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/admin/change-password', requireAuth, (req, res) => {
+  const { current_password, new_password } = req.body || {};
+  const currentHash = generateHash(current_password || '');
+  const nextPassword = String(new_password || '');
+
+  if (!DB.admin || DB.admin.password_hash !== currentHash) {
+    return res.status(400).json({ error: 'Current password is incorrect' });
+  }
+  if (nextPassword.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  }
+
+  DB.admin.password_hash = generateHash(nextPassword);
+  scheduleSaveDB(false);
+  activeSessions.clear();
+  res.clearCookie('admin_session');
+  log('[Admin] Password changed');
+  res.json({ success: true, relogin: true });
+});
+
 app.get('/api/stats', requireAuth, (req, res) => {
   const memory = process.memoryUsage();
   const totalTraffic = DB.users.reduce((sum, u) => sum + Number(u.used_bytes || 0), 0);
+  const connectionCounts = Array.from(activeConnections.values()).map((set) => set.size);
+  const activeConnectionCount = connectionCounts.reduce((sum, count) => sum + count, 0);
   res.json({
     ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
     cpu_usage: getCpuUsagePercent(),
@@ -823,14 +933,19 @@ app.get('/api/stats', requireAuth, (req, res) => {
     total_traffic: totalTraffic,
     users_count: DB.users.length,
     active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpired(u)).length,
-    ws_connections: Array.from(activeConnections.values()).reduce((sum, set) => sum + set.size, 0),
+    online_users: activeConnections.size,
+    ws_connections: activeConnectionCount,
     xhttp_sessions: xhttpSessions.size,
     traffic_chart: getTrafficChart()
   });
 });
 
 app.get('/api/users', requireAuth, (req, res) => {
-  res.json({ users: DB.users });
+  const users = DB.users.map((user) => {
+    const connections = activeConnections.get(user.id)?.size || 0;
+    return { ...user, online: connections > 0, connections };
+  });
+  res.json({ users });
 });
 
 app.post('/api/users', requireAuth, (req, res) => {
@@ -899,6 +1014,17 @@ app.post('/api/users/:id/reset', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+app.get('/api/users/:id/qr/:type', requireAuth, async (req, res) => {
+  try {
+    const user = DB.users.find((u) => u.id === req.params.id);
+    if (!user) return res.status(404).type('text/plain').send('User not found');
+    await sendQrSvg(res, getQrPayload(req, user, req.params.type));
+  } catch (err) {
+    log('[QR] Generate failed:', err && err.message ? err.message : 'unknown');
+    res.status(500).type('text/plain').send('QR generation failed');
+  }
+});
+
 app.put('/api/users/:id', requireAuth, (req, res) => {
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -927,6 +1053,17 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   scheduleSaveDB(false);
   log('[User] Edited:', `${user.remark} ${user.uuid}`);
   res.json({ success: true, user });
+});
+
+app.get('/qr/:sub_id/:type', async (req, res) => {
+  try {
+    const user = DB.users.find((u) => u.sub_id === req.params.sub_id);
+    if (!user) return res.status(404).type('text/plain').send('Subscription not found');
+    await sendQrSvg(res, getQrPayload(req, user, req.params.type));
+  } catch (err) {
+    log('[QR] Public generate failed:', err && err.message ? err.message : 'unknown');
+    res.status(500).type('text/plain').send('QR generation failed');
+  }
 });
 
 app.get('/sub/:sub_id', (req, res) => {
@@ -975,18 +1112,21 @@ app.get('/sub/:sub_id', (req, res) => {
   const xhttpLinkJSON = JSON.stringify(xhttpLink);
   const allLinksJSON = JSON.stringify(subscriptionLinks.join('\n'));
 
+  const subUrlJSON = JSON.stringify(buildSubUrl(req, user));
+  const qrBase = `/qr/${user.sub_id}`;
+
   res.send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>${remarkSafe} - Subscription</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:radial-gradient(circle at top right,#1a1a2e,#0f0f16);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:24px;padding:36px;width:100%;max-width:450px;box-shadow:0 25px 50px rgba(0,0,0,.5)}h1{text-align:center;color:#d4af37;margin-bottom:6px}.sub{text-align:center;color:#888;margin-bottom:28px;letter-spacing:2px}.stats{display:flex;gap:12px;margin-bottom:22px}.box{flex:1;background:rgba(0,0,0,.25);border-radius:16px;padding:15px;text-align:center}.label{color:#888;font-size:11px}.value{font-size:20px;font-weight:700;margin-top:5px}.progress{height:8px;background:rgba(255,255,255,.08);border-radius:8px;overflow:hidden;margin:10px 0 24px}.fill{height:100%;background:linear-gradient(90deg,#d4af37,#eab308);width:${progressWidth}%}.danger{background:linear-gradient(90deg,#ef4444,#f87171)}.info{background:rgba(0,0,0,.25);border-radius:16px;padding:18px;margin-bottom:22px}.row{display:flex;justify-content:space-between;margin:10px 0;color:#ddd}.row span:first-child{color:#888}.badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700}.active{background:rgba(34,197,94,.12);color:#4ade80}.expired{background:rgba(239,68,68,.12);color:#f87171}.btn{width:100%;background:linear-gradient(45deg,#d4af37,#b2891d);color:#000;border:0;padding:16px;border-radius:12px;font-weight:800;cursor:pointer;margin-top:10px}.btn.secondary{background:rgba(255,255,255,.06);color:#d4af37;border:1px solid rgba(212,175,55,.35)}.btn.dark{background:rgba(0,0,0,.28);color:#ddd;border:1px solid rgba(255,255,255,.1)}.guide{text-align:center;margin-top:16px;color:#777;font-size:12px}
-</style></head><body><div class="card"><h1>${remarkSafe}</h1><div class="sub">VLESS WS + XHTTP SUBSCRIPTION</div>
-<div class="stats"><div class="box"><div class="label">Used</div><div class="value">${usedFormatted}</div></div><div class="box"><div class="label">Remaining</div><div class="value">${remainingFormatted}</div></div></div>
-<div style="display:flex;justify-content:space-between;color:#aaa;font-size:12px"><span>Traffic</span><span>${percent}%</span></div><div class="progress"><div class="fill ${isDanger ? 'danger' : ''}"></div></div>
+*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:radial-gradient(circle at top right,#1a1a2e,#08080d 70%);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}.shell{width:100%;max-width:980px}.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:28px;padding:30px;box-shadow:0 25px 70px rgba(0,0,0,.55);backdrop-filter:blur(18px)}.hero{text-align:center;margin-bottom:26px}h1{color:#d4af37;margin-bottom:8px;font-size:32px}.sub{color:#888;letter-spacing:2px;font-size:12px;text-transform:uppercase}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.stat{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;text-align:center}.label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px}.value{font-size:22px;font-weight:800;margin-top:6px}.progress{height:9px;background:rgba(255,255,255,.08);border-radius:10px;overflow:hidden;margin:12px 0 22px}.fill{height:100%;background:linear-gradient(90deg,#d4af37,#eab308);width:${progressWidth}%}.danger{background:linear-gradient(90deg,#ef4444,#f87171)}.info{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;margin:18px 0}.row{display:flex;justify-content:space-between;gap:14px;margin:12px 0;color:#ddd}.row span:first-child{color:#888}.badge{white-space:nowrap;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:800}.active{background:rgba(34,197,94,.13);color:#4ade80}.expired{background:rgba(239,68,68,.13);color:#f87171}.configs{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}.cfg{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:20px;padding:18px}.cfg h3{font-size:16px;margin-bottom:12px;color:#d4af37}.qr{background:#fff;border-radius:14px;padding:10px;width:148px;height:148px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center}.qr img{width:128px;height:128px}.btn{width:100%;background:linear-gradient(45deg,#d4af37,#b2891d);color:#000;border:0;padding:14px;border-radius:12px;font-weight:900;cursor:pointer;margin-top:9px}.btn.secondary{background:rgba(255,255,255,.06);color:#d4af37;border:1px solid rgba(212,175,55,.35)}.btn.dark{background:rgba(0,0,0,.28);color:#ddd;border:1px solid rgba(255,255,255,.1)}.guide{text-align:center;margin-top:18px;color:#777;font-size:12px;line-height:1.6}@media(max-width:760px){.card{padding:22px;border-radius:22px}.grid,.configs{grid-template-columns:1fr}h1{font-size:26px}.row{font-size:13px}.qr{width:136px;height:136px}.qr img{width:116px;height:116px}}
+</style></head><body><main class="shell"><div class="card"><div class="hero"><h1>${remarkSafe}</h1><div class="sub">Smart VLESS Subscription</div></div>
+<div class="grid"><div class="stat"><div class="label">Used Traffic</div><div class="value">${usedFormatted}</div></div><div class="stat"><div class="label">Remaining</div><div class="value">${remainingFormatted}</div></div></div>
+<div style="display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:18px"><span>Traffic Usage</span><span>${percent}%</span></div><div class="progress"><div class="fill ${isDanger ? 'danger' : ''}"></div></div>
 <div class="info"><div class="row"><span>Status</span><b class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b>${expiryStr}</b></div><div class="row"><span>Last Seen</span><b>${lastSeenStr}</b></div></div>
-<button class="btn" onclick="copyXhttp()">Copy XHTTP Config</button><button class="btn secondary" onclick="copyWs()">Copy WebSocket Config</button><button class="btn dark" onclick="copyAll()">Copy Both Configs</button><div class="guide">VPN clients get both configs automatically. Browsers see this smart subscription page.</div></div>
-<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};function copyText(t){navigator.clipboard.writeText(t).then(function(){alert('Copied!')}).catch(function(){prompt('Copy:',t)})}function copyXhttp(){copyText(XHTTP_LINK)}function copyWs(){copyText(WS_LINK)}function copyAll(){copyText(ALL_LINKS)}</script></body></html>`);
-});
+<div class="configs"><section class="cfg"><h3>XHTTP Config</h3><div class="qr"><img alt="XHTTP QR" src="${qrBase}/xhttp"></div><button class="btn" onclick="copyXhttp()">Copy XHTTP Config</button></section><section class="cfg"><h3>WebSocket Config</h3><div class="qr"><img alt="WebSocket QR" src="${qrBase}/ws"></div><button class="btn secondary" onclick="copyWs()">Copy WebSocket Config</button></section></div>
+<button class="btn dark" onclick="copySub()">Copy Subscription URL</button><button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button><div class="guide">VPN clients get both configs automatically. Browsers see this smart page with separate QR codes and copy buttons.</div></div></main>
+<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};function copyText(t){navigator.clipboard.writeText(t).then(function(){alert('Copied!')}).catch(function(){prompt('Copy:',t)})}function copyXhttp(){copyText(XHTTP_LINK)}function copyWs(){copyText(WS_LINK)}function copyAll(){copyText(ALL_LINKS)}function copySub(){copyText(SUB_URL)}</script></body></html>`);});
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 app.get('/panel', (req, res) => {
