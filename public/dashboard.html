@@ -71,7 +71,8 @@
         .action-btn.sub:hover { background: rgba(212, 175, 55, 0.2); box-shadow: 0 0 15px rgba(212, 175, 55, 0.2); }
         .action-btn.copy { border-color: #d4af37; color: #d4af37; }
         .action-btn.copy:hover { background: rgba(212, 175, 55, 0.1); }
-        .action-btn.delete:hover { background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.3); color: #ef4444; }
+        .action-btn.delete { background: rgba(239, 68, 68, 0.12); border-color: rgba(239, 68, 68, 0.45); color: #f87171; }
+        .action-btn.delete:hover { background: rgba(239, 68, 68, 0.25); border-color: rgba(239, 68, 68, 0.75); color: #fff; box-shadow: 0 0 14px rgba(239, 68, 68, 0.25); }
         .host-label { display: inline-block; padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; letter-spacing: 1px; margin-left: 8px; text-transform: uppercase; animation: softBlink 2s infinite alternate; }
         .label-railway { border: 1px solid #9b59b6; color: #d2b4de; background: rgba(155, 89, 182, 0.1); box-shadow: 0 0 8px rgba(155, 89, 182, 0.3); }
         .label-koyeb { border: 1px solid #1abc9c; color: #a3e4d7; background: rgba(26, 188, 156, 0.1); box-shadow: 0 0 8px rgba(26, 188, 156, 0.3); }
@@ -185,7 +186,7 @@
     </div>
 </main>
 
-<!-- Modal -->
+<!-- Add Modal -->
 <div class="modal" id="addModal">
     <div class="modal-content">
         <h3>New Subscription</h3>
@@ -202,6 +203,24 @@
     </div>
 </div>
 
+<!-- Edit Modal -->
+<div class="modal" id="editModal">
+    <div class="modal-content">
+        <h3>Edit Subscription</h3>
+        <input type="hidden" id="editUserId">
+        <label>Remark (Client Name)</label>
+        <input type="text" id="editRemarkInput" placeholder="e.g. VIP User 1">
+        <label>Data Limit (GB) - 0 for Unlimited</label>
+        <input type="number" id="editLimitInput" placeholder="e.g. 50" value="0" step="0.01">
+        <label>New Expiry From Today (Days) - 0 for Never</label>
+        <input type="number" id="editExpiryInput" placeholder="e.g. 30" value="0">
+        <div class="modal-actions">
+            <button class="btn-cancel" onclick="closeEditModal()">Cancel</button>
+            <button class="btn-gold" onclick="saveEditUser()">Save</button>
+        </div>
+    </div>
+</div>
+
 <script>
     const host = window.location.hostname;
     const pageHost = window.location.host;
@@ -210,6 +229,7 @@
     const isHttps = window.location.protocol === 'https:';
     const vlessPort = isHttps ? '443' : (window.location.port || '80');
     const vlessSecurity = isHttps ? 'tls' : 'none';
+    var currentUsers = [];
 
     document.getElementById('hostBadge').textContent = 'VLESS WS/XHTTP: ' + host + ':' + vlessPort;
 
@@ -330,6 +350,7 @@
             if (!res.ok) return;
             var data = await res.json();
             var tbody = document.getElementById('inboundsTable');
+            currentUsers = data.users || [];
 
             if (!data.users || data.users.length === 0) {
                 tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding: 40px; color:#555;">No clients available. Create one to begin.</td></tr>';
@@ -382,6 +403,7 @@
                     '<button class="action-btn sub" onclick="copyLink(\'' + subUrl + '\')" title="Copy Smart Subscription Link">Smart Sub</button>' +
                     '<button class="action-btn copy" onclick="copyLink(\'' + xhttpConfigStr.replace(/'/g, "\\'") + '\')" title="Copy XHTTP Config">XHTTP</button>' +
                     '<button class="action-btn copy" onclick="copyLink(\'' + wsConfigStr.replace(/'/g, "\\'") + '\')" title="Copy WS Config">WS</button>' +
+                    '<button class="action-btn" onclick="openEditModal(\'' + user.id + '\')" title="Edit Client">Edit</button>' +
                     '<button class="action-btn" onclick="resetTraffic(\'' + user.id + '\')" title="Reset Traffic">Reset</button>' +
                     '<button class="action-btn delete" onclick="deleteUser(\'' + user.id + '\')" title="Delete">Del</button>' +
                     '</div>';
@@ -443,6 +465,63 @@
         setTimeout(function() { m.style.display = 'none'; }, 300);
     }
 
+    function openEditModal(id) {
+        var user = currentUsers.find(function(u) { return u.id === id; });
+        if (!user) {
+            alert('User not found. Please refresh the panel.');
+            return;
+        }
+
+        document.getElementById('editUserId').value = user.id;
+        document.getElementById('editRemarkInput').value = user.remark || '';
+        document.getElementById('editLimitInput').value = user.traffic_limit > 0 ? (user.traffic_limit / (1024 ** 3)).toFixed(2) : 0;
+
+        var daysLeft = 0;
+        if (user.expiry_time && user.expiry_time > 0) {
+            daysLeft = Math.max(1, Math.ceil((user.expiry_time - Date.now()) / (1000 * 60 * 60 * 24)));
+        }
+        document.getElementById('editExpiryInput').value = daysLeft;
+
+        var m = document.getElementById('editModal');
+        m.style.display = 'flex';
+        setTimeout(function() { m.classList.add('show'); }, 10);
+    }
+
+    function closeEditModal() {
+        var m = document.getElementById('editModal');
+        m.classList.remove('show');
+        setTimeout(function() { m.style.display = 'none'; }, 300);
+    }
+
+    async function saveEditUser() {
+        var id = document.getElementById('editUserId').value;
+        var remark = document.getElementById('editRemarkInput').value;
+        var traffic_limit_gb = document.getElementById('editLimitInput').value;
+        var expiry_days = document.getElementById('editExpiryInput').value;
+        var btn = document.querySelector('#editModal .btn-gold');
+        btn.textContent = 'Saving...';
+
+        try {
+            var res = await fetch('/api/users/' + id, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ remark: remark, traffic_limit_gb: traffic_limit_gb, expiry_days: expiry_days })
+            });
+            var data = await res.json();
+            btn.textContent = 'Save';
+            if (data.error) {
+                alert(data.error);
+            } else {
+                closeEditModal();
+                fetchInbounds();
+                fetchStats();
+            }
+        } catch(e) {
+            btn.textContent = 'Save';
+            alert('Edit failed. Please try again.');
+        }
+    }
+
     async function addUser() {
         var remark = document.getElementById('remarkInput').value;
         var traffic_limit_gb = document.getElementById('limitInput').value;
@@ -500,5 +579,5 @@
     // ✅ تصحیح شد: 10 ثانیه به جای 3 ثانیه
     setInterval(function() { fetchStats(); fetchInbounds(); }, 10000);
 </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0dad63e095edbd0',t:'MTc4MTc5MTQwMA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
