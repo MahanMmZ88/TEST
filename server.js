@@ -97,7 +97,7 @@ function getTrafficChart() {
   padded.push(...points);
 
   return {
-    labels: padded.map((p) => new Date(p.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })),
+    labels: padded.map((p) => new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Tehran', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(p.ts))),
     values: padded.map((p) => Number((p.bytes / 1024 / 1024).toFixed(3)))
   };
 }
@@ -127,6 +127,22 @@ function formatBytes(bytes) {
 function calcPercent(used, limit) {
   if (!limit || limit <= 0) return 0;
   return Math.min(100, (used / limit) * 100);
+}
+
+function formatTehranDate(timestamp) {
+  if (!timestamp || timestamp <= 0) return 'Never';
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Tehran',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).formatToParts(new Date(timestamp));
+
+  const get = (type) => (parts.find((p) => p.type === type) || {}).value || '00';
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}`;
 }
 
 function safeName(value) {
@@ -952,8 +968,8 @@ app.get('/sub/:sub_id', (req, res) => {
   const progressWidth = calcPercent(user.used_bytes, user.traffic_limit).toFixed(2);
   const isDanger = user.traffic_limit > 0 && (user.used_bytes / user.traffic_limit) > 0.9;
   const expired = isUserExpired(user);
-  const expiryStr = user.expiry_time === 0 ? 'Never' : new Date(user.expiry_time).toLocaleDateString();
-  const lastSeenStr = user.last_seen === 0 ? 'Never' : new Date(user.last_seen).toLocaleString();
+  const expiryStr = user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time);
+  const lastSeenStr = user.last_seen === 0 ? 'Never' : formatTehranDate(user.last_seen);
   const remarkSafe = safeName(user.remark);
   const wsLinkJSON = JSON.stringify(wsLink);
   const xhttpLinkJSON = JSON.stringify(xhttpLink);
