@@ -1,14 +1,15 @@
 {
-  "name": "ws-proxy",
+  "name": "vless-over-ws-railway",
   "version": "1.0.0",
+  "description": "Minimal VLESS over WebSocket server for Railway without xray-core",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "ws": "8.16.0"
-  },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
   }
 }
