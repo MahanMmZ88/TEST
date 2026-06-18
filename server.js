@@ -314,6 +314,7 @@ function isForbiddenTarget(host, port) {
 
 function parseVlessRequest(buffer, options = {}) {
   const allowUdp = options.allowUdp === true;
+  const allowMux = options.allowMux === true;
   if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer);
   if (buffer.length < 24) throw new Error(`request too short: ${buffer.length}`);
   if (buffer.length > MAX_FIRST_PACKET) throw new Error(`first packet too large: ${buffer.length}`);
@@ -330,12 +331,15 @@ function parseVlessRequest(buffer, options = {}) {
   offset += optLen;
 
   const command = buffer[offset++];
-  if (command !== 0x01 && command !== 0x02) {
-    if (command === 0x03) throw new Error('MUX is not supported; disable MUX in client');
+  if (command !== 0x01 && command !== 0x02 && command !== 0x03) {
     throw new Error(`unsupported command: ${command}`);
   }
   if (command === 0x02 && !allowUdp) {
     throw new Error('UDP is not supported on this transport yet; use WebSocket UDP or disable UDP/xudp in client');
+  }
+  if (command === 0x03) {
+    if (!allowMux) throw new Error('MUX is not supported on this transport yet; disable MUX in client');
+    return { version, user, command, host: 'v1.mux.cool', port: 0, payload: buffer.subarray(offset) };
   }
 
   const port = buffer.readUInt16BE(offset);
@@ -366,6 +370,101 @@ function parseVlessRequest(buffer, options = {}) {
   if (isForbiddenTarget(host, port)) throw new Error(`forbidden target: ${host}:${port}`);
 
   return { version, user, command, host, port, payload: buffer.subarray(offset) };
+}
+
+const MUX_STATUS_NEW = 0x01;
+const MUX_STATUS_KEEP = 0x02;
+const MUX_STATUS_END = 0x03;
+const MUX_STATUS_KEEPALIVE = 0x04;
+const MUX_OPTION_DATA = 0x01;
+const MUX_OPTION_ERROR = 0x02;
+const MUX_NETWORK_TCP = 0x01;
+const MUX_NETWORK_UDP = 0x02;
+const MUX_CHUNK_SIZE = 8 * 1024;
+
+function encodeMuxAddress(host) {
+  const h = String(host || '');
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) {
+    return Buffer.from([0x01, ...h.split('.').map((x) => Number(x) & 0xff)]);
+  }
+  if (h.includes(':')) {
+    const net = require('net');
+    if (net.isIP(h) === 6) {
+      // Basic IPv6 expansion.
+      const sections = h.split('::');
+      const left = sections[0] ? sections[0].split(':').filter(Boolean) : [];
+      const right = sections[1] ? sections[1].split(':').filter(Boolean) : [];
+      const missing = 8 - left.length - right.length;
+      const parts = left.concat(Array(Math.max(0, missing)).fill('0')).concat(right).map((x) => parseInt(x || '0', 16));
+      const out = Buffer.alloc(17);
+      out[0] = 0x03;
+      for (let i = 0; i < 8; i++) out.writeUInt16BE(parts[i] || 0, 1 + i * 2);
+      return out;
+    }
+  }
+  const domain = Buffer.from(h, 'utf8');
+  if (domain.length > 255) throw new Error('mux domain too long');
+  return Buffer.concat([Buffer.from([0x02, domain.length]), domain]);
+}
+
+function parseMuxAddressPort(buffer, offset) {
+  if (buffer.length < offset + 3) throw new Error('mux address too short');
+  const port = buffer.readUInt16BE(offset);
+  offset += 2;
+  const type = buffer[offset++];
+  let host;
+  if (type === 0x01) {
+    if (buffer.length < offset + 4) throw new Error('mux ipv4 too short');
+    host = `${buffer[offset]}.${buffer[offset + 1]}.${buffer[offset + 2]}.${buffer[offset + 3]}`;
+    offset += 4;
+  } else if (type === 0x02) {
+    if (buffer.length < offset + 1) throw new Error('mux domain length missing');
+    const len = buffer[offset++];
+    if (!len || buffer.length < offset + len) throw new Error('mux domain invalid');
+    host = buffer.subarray(offset, offset + len).toString('utf8');
+    offset += len;
+  } else if (type === 0x03) {
+    if (buffer.length < offset + 16) throw new Error('mux ipv6 too short');
+    const parts = [];
+    for (let i = 0; i < 8; i++) parts.push(buffer.readUInt16BE(offset + i * 2).toString(16));
+    host = parts.join(':');
+    offset += 16;
+  } else {
+    throw new Error('mux unsupported address type');
+  }
+  return { host, port, offset };
+}
+
+function encodeMuxFrame(sessionId, status, option = 0, target = null, data = null) {
+  const metaParts = [];
+  const base = Buffer.alloc(4);
+  base.writeUInt16BE(sessionId & 0xffff, 0);
+  base[2] = status;
+  base[3] = option;
+  metaParts.push(base);
+  if (status === MUX_STATUS_NEW && target) {
+    const netByte = target.network === 'udp' ? MUX_NETWORK_UDP : MUX_NETWORK_TCP;
+    const port = Buffer.alloc(2);
+    port.writeUInt16BE(target.port & 0xffff, 0);
+    metaParts.push(Buffer.from([netByte]), port, encodeMuxAddress(target.host));
+  }
+  const meta = Buffer.concat(metaParts);
+  const metaLen = Buffer.alloc(2);
+  metaLen.writeUInt16BE(meta.length, 0);
+  if (option & MUX_OPTION_DATA) {
+    const payload = Buffer.isBuffer(data) ? data : Buffer.from(data || []);
+    const dataLen = Buffer.alloc(2);
+    dataLen.writeUInt16BE(payload.length, 0);
+    return Buffer.concat([metaLen, meta, dataLen, payload]);
+  }
+  return Buffer.concat([metaLen, meta]);
+}
+
+function splitMuxData(data) {
+  const chunks = [];
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data || []);
+  for (let i = 0; i < buf.length; i += MUX_CHUNK_SIZE) chunks.push(buf.subarray(i, i + MUX_CHUNK_SIZE));
+  return chunks;
 }
 
 function encodeUdpPacket(packet) {
@@ -515,6 +614,8 @@ class XHttpSession {
     this.established = false;
     this.responseHeaderSent = false;
     this.udpMode = false;
+    this.muxMode = false;
+    this.muxHandler = null;
     this.udpTargetHost = '';
     this.udpTargetPort = 0;
     this.udpState = { buffer: Buffer.alloc(0) };
@@ -593,11 +694,11 @@ class XHttpSession {
   }
 
   initialize(firstPacket) {
-    if (this.remote || this.udpMode) return Promise.resolve();
+    if (this.remote || this.udpMode || this.muxMode) return Promise.resolve();
 
     let request;
     try {
-      request = parseVlessRequest(firstPacket, { allowUdp: true });
+      request = parseVlessRequest(firstPacket, { allowUdp: true, allowMux: true });
     } catch (err) {
       this.close('bad vless request');
       throw err;
@@ -607,6 +708,21 @@ class XHttpSession {
     this.version = request.version;
     this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason));
     log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId}`);
+
+    if (request.command === 0x03) {
+      this.muxMode = true;
+      this.established = true;
+      this.flushDownlink();
+      this.muxHandler = new MuxHandler({
+        user: this.user,
+        label: 'XHTTP MUX',
+        send: (chunk) => this.sendDownlink(chunk),
+        close: (reason) => this.close(reason || 'mux closed')
+      });
+      if (request.payload.length) this.writeToRemote(request.payload);
+      this.flushRemoteWrites();
+      return Promise.resolve();
+    }
 
     if (request.command === 0x02) {
       this.udpMode = true;
@@ -690,6 +806,16 @@ class XHttpSession {
     if (this.closed) return;
     if (!chunk || chunk.length === 0) return;
 
+    if (this.muxMode) {
+      try {
+        this.muxHandler?.feed(chunk);
+      } catch (err) {
+        log('[XHTTP MUX] Bad frame:', err.message);
+        this.close('bad mux frame');
+      }
+      return;
+    }
+
     if (this.udpMode) {
       try {
         drainUdpPackets(this.udpState, chunk, (packet) => this.sendUdpPacket(packet));
@@ -724,7 +850,7 @@ class XHttpSession {
   }
 
   flushRemoteWrites() {
-    if (this.udpMode) {
+    if (this.muxMode || this.udpMode) {
       while (this.pendingRemoteWrites.length) this.writeToRemote(this.pendingRemoteWrites.shift());
       return;
     }
@@ -775,6 +901,7 @@ class XHttpSession {
     if (this.unregisterConnection) this.unregisterConnection();
     destroySocket(this.remote);
     closeUdpSocket(this.udpSocket);
+    this.muxHandler?.close();
     if (this.downlinkRes && !this.downlinkRes.writableEnded) {
       try { this.downlinkRes.end(); } catch (_) {}
     }
@@ -796,6 +923,181 @@ function getXHttpSession(sessionId) {
     xhttpSessions.set(sessionId, session);
   }
   return session;
+}
+
+class MuxHandler {
+  constructor({ user, send, close, label = 'MUX' }) {
+    this.user = user;
+    this.send = send;
+    this.closeTransport = close;
+    this.label = label;
+    this.buffer = Buffer.alloc(0);
+    this.sessions = new Map();
+    this.closed = false;
+  }
+
+  feed(chunk) {
+    if (this.closed || !chunk || chunk.length === 0) return;
+    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : Buffer.from(chunk);
+
+    while (this.buffer.length >= 2) {
+      const metaLen = this.buffer.readUInt16BE(0);
+      if (metaLen > 512) throw new Error('mux invalid metadata length');
+      if (this.buffer.length < 2 + metaLen) break;
+
+      const meta = this.buffer.subarray(2, 2 + metaLen);
+      if (meta.length < 4) throw new Error('mux metadata too short');
+      const sessionId = meta.readUInt16BE(0);
+      const status = meta[2];
+      const option = meta[3];
+      let offset = 4;
+      let target = null;
+
+      if (status === MUX_STATUS_NEW) {
+        if (meta.length < 5) throw new Error('mux new missing network');
+        const networkByte = meta[offset++];
+        const parsed = parseMuxAddressPort(meta, offset);
+        offset = parsed.offset;
+        target = { network: networkByte === MUX_NETWORK_UDP ? 'udp' : 'tcp', host: parsed.host, port: parsed.port };
+        if (isForbiddenTarget(target.host, target.port)) throw new Error(`mux forbidden target: ${target.host}:${target.port}`);
+      }
+
+      let frameLen = 2 + metaLen;
+      let data = Buffer.alloc(0);
+      if (option & MUX_OPTION_DATA) {
+        if (this.buffer.length < frameLen + 2) break;
+        const dataLen = this.buffer.readUInt16BE(frameLen);
+        if (dataLen > MAX_WS_PAYLOAD) throw new Error('mux data too large');
+        if (this.buffer.length < frameLen + 2 + dataLen) break;
+        data = this.buffer.subarray(frameLen + 2, frameLen + 2 + dataLen);
+        frameLen += 2 + dataLen;
+      }
+
+      this.buffer = this.buffer.subarray(frameLen);
+      this.handleFrame({ sessionId, status, option, target, data });
+    }
+  }
+
+  handleFrame(frame) {
+    if (frame.status === MUX_STATUS_KEEPALIVE) return;
+    if (frame.status === MUX_STATUS_NEW) {
+      this.openSession(frame.sessionId, frame.target);
+      if (frame.option & MUX_OPTION_DATA) this.writeSession(frame.sessionId, frame.data);
+      return;
+    }
+    if (frame.status === MUX_STATUS_KEEP) {
+      if (frame.option & MUX_OPTION_DATA) this.writeSession(frame.sessionId, frame.data);
+      return;
+    }
+    if (frame.status === MUX_STATUS_END) {
+      this.closeSession(frame.sessionId, Boolean(frame.option & MUX_OPTION_ERROR));
+    }
+  }
+
+  openSession(sessionId, target) {
+    this.closeSession(sessionId, false, true);
+    const session = { id: sessionId, target, remote: null, udp: null, connected: false, pending: [], closed: false };
+    this.sessions.set(sessionId, session);
+
+    if (target.network === 'udp') {
+      const udpType = target.host.includes(':') ? 'udp6' : 'udp4';
+      session.udp = dgram.createSocket(udpType);
+      session.connected = true;
+      session.udp.on('message', (msg) => {
+        updateTraffic(this.user, msg.length);
+        this.sendData(sessionId, msg);
+      });
+      session.udp.on('error', (err) => {
+        log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
+        this.sendEnd(sessionId, true);
+        this.closeSession(sessionId, true);
+      });
+      return;
+    }
+
+    session.remote = net.createConnection({ host: target.host, port: target.port, allowHalfOpen: false, autoSelectFamily: true });
+    session.remote.setNoDelay(true);
+    session.remote.setKeepAlive(true, 30000);
+    session.remote.setTimeout(IDLE_TIMEOUT_MS);
+    session.remote.once('connect', () => {
+      session.connected = true;
+      while (session.pending.length && session.remote && !session.remote.destroyed) {
+        const p = session.pending.shift();
+        updateTraffic(this.user, p.length);
+        if (!session.remote.write(p)) break;
+      }
+    });
+    session.remote.on('data', (data) => {
+      updateTraffic(this.user, data.length);
+      this.sendData(sessionId, data);
+    });
+    session.remote.once('error', (err) => {
+      log(`[${this.label}] TCP error:`, `${target.host}:${target.port} ${err && err.message ? err.message : ''}`);
+      this.sendEnd(sessionId, true);
+      this.closeSession(sessionId, true);
+    });
+    session.remote.on('timeout', () => {
+      this.sendEnd(sessionId, false);
+      this.closeSession(sessionId, false);
+    });
+    session.remote.on('close', () => {
+      if (!session.closed) this.sendEnd(sessionId, false);
+      this.closeSession(sessionId, false, true);
+    });
+  }
+
+  writeSession(sessionId, data) {
+    if (!data || data.length === 0) return;
+    const session = this.sessions.get(sessionId);
+    if (!session || session.closed) return;
+
+    if (session.target.network === 'udp') {
+      updateTraffic(this.user, data.length);
+      session.udp?.send(data, session.target.port, session.target.host, (err) => {
+        if (err) {
+          log(`[${this.label}] UDP send failed:`, err.message);
+          this.sendEnd(sessionId, true);
+          this.closeSession(sessionId, true);
+        }
+      });
+      return;
+    }
+
+    if (!session.remote || session.remote.destroyed || !session.connected) {
+      session.pending.push(Buffer.from(data));
+      return;
+    }
+    updateTraffic(this.user, data.length);
+    session.remote.write(data);
+  }
+
+  sendData(sessionId, data) {
+    for (const chunk of splitMuxData(data)) {
+      this.send(encodeMuxFrame(sessionId, MUX_STATUS_KEEP, MUX_OPTION_DATA, null, chunk));
+    }
+  }
+
+  sendEnd(sessionId, hasError = false) {
+    this.send(encodeMuxFrame(sessionId, MUX_STATUS_END, hasError ? MUX_OPTION_ERROR : 0));
+  }
+
+  closeSession(sessionId, hasError = false, silent = false) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.closed = true;
+    destroySocket(session.remote);
+    closeUdpSocket(session.udp);
+    session.pending = [];
+    this.sessions.delete(sessionId);
+    if (hasError && !silent) log(`[${this.label}] Session closed with error:`, String(sessionId));
+  }
+
+  close() {
+    if (this.closed) return;
+    this.closed = true;
+    for (const id of Array.from(this.sessions.keys())) this.closeSession(id, false, true);
+    this.buffer = Buffer.alloc(0);
+  }
 }
 
 function getClientIp(req) {
@@ -1276,6 +1578,8 @@ wss.on('connection', (ws, req) => {
   let firstPacketHandled = false;
   let responseHeaderSent = false;
   let udpMode = false;
+  let muxMode = false;
+  let muxHandler = null;
   let udpTargetHost = '';
   let udpTargetPort = 0;
   let udpIdleTimer = null;
@@ -1298,6 +1602,7 @@ wss.on('connection', (ws, req) => {
     if (unregisterConnection) unregisterConnection();
     destroySocket(remote);
     closeUdpSocket(udpSocket);
+    muxHandler?.close();
     safeCloseWebSocket(ws, code, reason);
   }
 
@@ -1357,7 +1662,7 @@ wss.on('connection', (ws, req) => {
       firstPacketHandled = true;
       let request;
       try {
-        request = parseVlessRequest(chunk, { allowUdp: true });
+        request = parseVlessRequest(chunk, { allowUdp: true, allowMux: true });
       } catch (err) {
         log('[VLESS] Bad request:', err.message);
         closeAll(1008, 'bad vless request');
@@ -1367,6 +1672,27 @@ wss.on('connection', (ws, req) => {
       user = request.user;
       unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason));
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port}`);
+
+      if (request.command === 0x03) {
+        muxMode = true;
+        clearTimeout(connectTimer);
+        established = true;
+        sendVlessResponseHeader(request.version);
+        muxHandler = new MuxHandler({
+          user,
+          label: 'WS MUX',
+          send: (chunk) => sendToWs(chunk),
+          close: (reason) => closeAll(1000, reason || 'mux closed')
+        });
+        try {
+          if (request.payload.length) muxHandler.feed(request.payload);
+          while (pendingClientChunks.length) muxHandler.feed(pendingClientChunks.shift());
+        } catch (err) {
+          log('[MUX] Bad frame:', err.message);
+          closeAll(1008, 'bad mux frame');
+        }
+        return;
+      }
 
       if (request.command === 0x02) {
         udpMode = true;
@@ -1443,6 +1769,16 @@ wss.on('connection', (ws, req) => {
 
       remote.on('timeout', () => closeAll(1000, 'remote timeout'));
       remote.on('close', () => closeAll(1000, 'remote closed'));
+      return;
+    }
+
+    if (muxMode) {
+      try {
+        muxHandler?.feed(chunk);
+      } catch (err) {
+        log('[MUX] Bad frame:', err.message);
+        closeAll(1008, 'bad mux frame');
+      }
       return;
     }
 
