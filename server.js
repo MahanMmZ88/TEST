@@ -49,6 +49,7 @@ let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
 let lastCpuUsage = process.cpuUsage();
 let lastCpuCheck = process.hrtime.bigint();
+let cachedCpuUsage = 0;
 let trafficCurrentMinuteBytes = 0;
 let trafficHistory = [];
 let selfPingHealthUrl = '';
@@ -110,7 +111,7 @@ function getTrafficChart() {
   };
 }
 
-function getCpuUsagePercent() {
+function sampleCpuUsage() {
   const currentUsage = process.cpuUsage();
   const currentTime = process.hrtime.bigint();
   const elapsedMicros = Number(currentTime - lastCpuCheck) / 1000;
@@ -119,9 +120,16 @@ function getCpuUsagePercent() {
   lastCpuUsage = currentUsage;
   lastCpuCheck = currentTime;
 
-  if (!elapsedMicros || elapsedMicros <= 0) return 0;
-  const percent = Math.max(0, Math.min(100, (usedMicros / elapsedMicros) * 100));
-  return Number(percent.toFixed(1));
+  if (!elapsedMicros || elapsedMicros <= 0) return cachedCpuUsage;
+
+  const rawPercent = Math.max(0, Math.min(100, (usedMicros / elapsedMicros) * 100));
+  // Smooth short page-refresh/build spikes so the dashboard shows stable process load.
+  cachedCpuUsage = Number(((cachedCpuUsage * 0.65) + (rawPercent * 0.35)).toFixed(1));
+  return cachedCpuUsage;
+}
+
+function getCpuUsagePercent() {
+  return cachedCpuUsage;
 }
 
 function formatBytes(bytes) {
@@ -1483,6 +1491,14 @@ wss.on('connection', (ws, req) => {
     setImmediate(() => handleClientData(earlyData));
   }
 });
+
+setInterval(() => {
+  sampleCpuUsage();
+}, 1000);
+
+setInterval(() => {
+  if (adminEventClients.size || subEventClients.size) broadcastRealtimeNow();
+}, 2000);
 
 setInterval(() => {
   trafficHistory.push({ ts: Date.now(), bytes: trafficCurrentMinuteBytes });
