@@ -397,6 +397,17 @@ function closeUserConnections(userId, reason = 'user disabled') {
   }
 }
 
+function forceClearUserConnections(userId, reason = 'connections cleared') {
+  const map = activeConnections.get(userId);
+  if (map) {
+    for (const conn of Array.from(map.values())) {
+      try { conn.closeFn(reason); } catch (_) {}
+    }
+  }
+  activeConnections.delete(userId);
+  scheduleRealtimeBroadcast();
+}
+
 function markUserDataActivity(userId) {
   const map = activeConnections.get(userId);
   if (!map) return;
@@ -1700,15 +1711,23 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   const limitGB = Number(traffic_limit_gb || 0);
   const expiryDays = Number(expiry_days || 0);
   const connectionLimit = Math.max(0, Math.floor(Number(connection_limit ?? ip_limit ?? 0)));
+  const oldConnectionLimit = Number(user.connection_limit || user.ip_limit || 0);
 
   user.remark = cleanRemark;
   user.traffic_limit = limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0;
   user.connection_limit = connectionLimit;
   user.expiry_time = expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0;
 
+  if (oldConnectionLimit !== connectionLimit) {
+    // Changing the connection limit invalidates the old session accounting.
+    // Force-clear existing sessions so a previously unlimited connection cannot
+    // reserve capacity and block the user's next connection.
+    forceClearUserConnections(user.id, 'connection limit changed');
+  }
+
   if (isUserExpired(user)) {
     user.is_active = 0;
-    closeUserConnections(user.id, 'user edited and expired');
+    forceClearUserConnections(user.id, 'user edited and expired');
   } else {
     user.is_active = 1;
   }
