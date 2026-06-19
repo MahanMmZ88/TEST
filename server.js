@@ -179,7 +179,7 @@ function normalizeUser(u) {
     uuid: String(u.uuid || crypto.randomUUID()).toLowerCase(),
     sub_id: String(u.sub_id || crypto.randomBytes(8).toString('hex')),
     traffic_limit: Number(u.traffic_limit || 0),
-    ip_limit: Number(u.ip_limit || u.connection_limit || 0),
+    connection_limit: Number(u.connection_limit || u.ip_limit || 0),
     used_bytes: Number(u.used_bytes || 0),
     expiry_time: Number(u.expiry_time || 0),
     last_seen: Number(u.last_seen || 0),
@@ -337,16 +337,18 @@ function getActiveIpSet(userId) {
   return new Set(Array.from(map.values()).map((conn) => conn.ip).filter(Boolean));
 }
 
-function canAcceptUserIp(user, ip) {
-  const limit = Number(user.ip_limit || 0);
+function getActiveSessionCount(userId) {
+  pruneStaleConnections(userId, ACTIVE_CONNECTION_STALE_MS);
+  return activeConnections.get(userId)?.size || 0;
+}
+
+function canAcceptUserSession(user) {
+  const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
 
-  // Before rejecting a new IP, aggressively prune silent/stuck sessions.
-  // This prevents a disconnected phone from reserving the user's only IP forever.
-  pruneStaleConnections(user.id, IP_LIMIT_STALE_MS);
-
-  const ips = getActiveIpSet(user.id);
-  return ips.has(ip) || ips.size < limit;
+  // Remove truly stale sessions first. If the limit is still full, reject the new
+  // connection without disconnecting existing active users.
+  return getActiveSessionCount(user.id) < limit;
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -891,9 +893,9 @@ class XHttpSession {
 
     this.user = request.user;
     this.version = request.version;
-    if (!canAcceptUserIp(this.user, this.clientIp)) {
-      this.close('ip limit exceeded');
-      throw new Error('ip limit exceeded');
+    if (!canAcceptUserSession(this.user)) {
+      this.close('connection limit exceeded');
+      throw new Error('connection limit exceeded');
     }
     this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, kind: 'xhttp' });
     log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId}`);
@@ -1596,14 +1598,14 @@ app.get('/api/events', requireAuth, (req, res) => {
 });
 
 app.post('/api/users', requireAuth, (req, res) => {
-  const { remark, traffic_limit_gb, expiry_days, ip_limit } = req.body || {};
+  const { remark, traffic_limit_gb, expiry_days, ip_limit, connection_limit } = req.body || {};
   const cleanRemark = String(remark || '').trim();
   if (!cleanRemark) return res.status(400).json({ error: 'Remark is required' });
   if (DB.users.some((u) => u.remark === cleanRemark)) return res.status(400).json({ error: 'Username must be unique' });
 
   const limitGB = Number(traffic_limit_gb || 0);
   const expiryDays = Number(expiry_days || 0);
-  const ipLimit = Math.max(0, Math.floor(Number(ip_limit || 0)));
+  const connectionLimit = Math.max(0, Math.floor(Number(connection_limit ?? ip_limit ?? 0)));
   const host = req.get('host') || '';
   let createdOn = 'other';
   if (host.includes('railway.app')) createdOn = 'railway';
@@ -1615,7 +1617,7 @@ app.post('/api/users', requireAuth, (req, res) => {
     uuid: crypto.randomUUID(),
     sub_id: crypto.randomBytes(8).toString('hex'),
     traffic_limit: limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0,
-    ip_limit: ipLimit,
+    connection_limit: connectionLimit,
     used_bytes: 0,
     expiry_time: expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0,
     last_seen: 0,
@@ -1688,7 +1690,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { remark, traffic_limit_gb, expiry_days, ip_limit } = req.body || {};
+  const { remark, traffic_limit_gb, expiry_days, ip_limit, connection_limit } = req.body || {};
   const cleanRemark = String(remark || '').trim();
   if (!cleanRemark) return res.status(400).json({ error: 'Remark is required' });
   if (DB.users.some((u) => u.id !== user.id && u.remark === cleanRemark)) {
@@ -1697,11 +1699,11 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
 
   const limitGB = Number(traffic_limit_gb || 0);
   const expiryDays = Number(expiry_days || 0);
-  const ipLimit = Math.max(0, Math.floor(Number(ip_limit || 0)));
+  const connectionLimit = Math.max(0, Math.floor(Number(connection_limit ?? ip_limit ?? 0)));
 
   user.remark = cleanRemark;
   user.traffic_limit = limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0;
-  user.ip_limit = ipLimit;
+  user.connection_limit = connectionLimit;
   user.expiry_time = expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0;
 
   if (isUserExpired(user)) {
@@ -1948,9 +1950,9 @@ wss.on('connection', (ws, req) => {
 
       user = request.user;
       const clientIp = getClientIp(req);
-      if (!canAcceptUserIp(user, clientIp)) {
-        log('[LIMIT] IP limit exceeded:', `${user.remark} ip=${clientIp}`);
-        closeAll(1008, 'ip limit exceeded');
+      if (!canAcceptUserSession(user)) {
+        log('[LIMIT] Connection limit exceeded:', `${user.remark} ip=${clientIp}`);
+        closeAll(1008, 'connection limit exceeded');
         return;
       }
       unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, kind: 'ws' });
