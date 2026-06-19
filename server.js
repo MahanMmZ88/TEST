@@ -46,7 +46,7 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
 const ACTIVE_CONNECTION_STALE_MS = 60 * 1000;
 const CONNECTION_CLEANUP_INTERVAL_MS = 1000;
-const CLIENT_SLOT_TTL_MS = 10 * 1000;
+const CLIENT_SLOT_TTL_MS = 10 * 1000; // client slot lease TTL; renewed by real session activity/heartbeat
 const WS_PING_INTERVAL_MS = 2000;
 
 let DB = { admin: null, users: [] };
@@ -360,19 +360,12 @@ function pruneClientSlots(userId) {
   const slots = clientSlots.get(userId);
   if (!slots) return 0;
   const now = Date.now();
-  const active = activeConnections.get(userId);
   let removed = 0;
 
   for (const [key, slot] of Array.from(slots.entries())) {
-    const hasFreshConnection = active && Array.from(active.values()).some((conn) => {
-      return conn.clientKey === key && now - Number(conn.lastSeen || 0) <= ACTIVE_CONNECTION_STALE_MS;
-    });
-
-    if (hasFreshConnection) {
-      slot.lastSeen = now;
-      continue;
-    }
-
+    // Lease-based client slots expire only by their own lastSeen timestamp.
+    // We intentionally do NOT keep a slot alive just because a raw socket still
+    // exists; mobile clients/PaaS proxies can leave half-open sockets behind.
     if (now - Number(slot.lastSeen || 0) > CLIENT_SLOT_TTL_MS) {
       slots.delete(key);
       removed += 1;
@@ -411,14 +404,12 @@ function acquireClientSlot(userId, clientKey) {
 }
 
 function releaseClientSlotIfUnused(userId, clientKey) {
+  // Lease-based slots are not deleted immediately on socket close.
+  // Keeping the lease until CLIENT_SLOT_TTL_MS prevents reconnect flapping and
+  // makes limit behavior independent from unreliable close events. The periodic
+  // pruner will release it shortly if the client does not renew activity.
   if (!clientKey) return;
-  const active = activeConnections.get(userId);
-  const stillUsed = active && Array.from(active.values()).some((conn) => conn.clientKey === clientKey);
-  if (stillUsed) return;
-  const slots = clientSlots.get(userId);
-  if (!slots) return;
-  if (slots.delete(clientKey)) scheduleRealtimeBroadcast();
-  if (slots.size === 0) clientSlots.delete(userId);
+  pruneClientSlots(userId);
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
