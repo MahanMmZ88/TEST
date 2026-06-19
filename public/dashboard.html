@@ -627,6 +627,8 @@
                 var percent = isUnlimitedTraffic ? 0 : Math.min(100, (user.used_bytes / user.traffic_limit) * 100);
                 var limitText = isUnlimitedTraffic ? '∞' : formatBytes(user.traffic_limit);
                 var usedText = formatBytes(user.used_bytes);
+                var uploadText = formatBytes(user.uplink_bytes || 0);
+                var downloadText = formatBytes(user.downlink_bytes || 0);
                 var remainText = isUnlimitedTraffic ? 'Unlimited' : formatBytes(Math.max(0, user.traffic_limit - user.used_bytes));
                 var limitValue = Number(user.connection_limit || user.ip_limit || 0);
                 var activeClients = Number(user.active_clients || 0);
@@ -662,7 +664,8 @@
                     '<div class="client-usage">' +
                         '<div class="usage-top"><span>' + usedText + ' used</span><span class="usage-percent">' + percent.toFixed(1) + '%</span></div>' +
                         '<div class="traffic-bar-bg"><div class="traffic-bar-fill ' + (trafficReached ? 'traffic-danger' : '') + '" style="width:' + percent + '%"></div></div>' +
-                        '<div class="traffic-text" style="margin-top:8px"><span>Limit: ' + limitText + '</span><span>Left: ' + remainText + '</span></div>' +
+                        '<div class="traffic-text" style="margin-top:8px"><span>↑ ' + uploadText + '</span><span>↓ ' + downloadText + '</span></div>' +
+                        '<div class="traffic-text" style="margin-top:4px"><span>Limit: ' + limitText + '</span><span>Left: ' + remainText + '</span></div>' +
                     '</div>' +
                     '<div class="client-actions">' +
                         '<label class="toggle-switch" title="Enable / Disable"><input type="checkbox" ' + isChecked + ' ' + isDisabled + ' onchange="toggleUser(\'' + user.id + '\')"><span class="slider"></span></label>' +
