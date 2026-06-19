@@ -45,8 +45,8 @@ const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
 const ACTIVE_CONNECTION_STALE_MS = 60 * 1000;
-const CONNECTION_CLEANUP_INTERVAL_MS = 1000;
-const CLIENT_SLOT_TTL_MS = 10 * 1000; // client slot lease TTL; renewed by real session activity/heartbeat
+const CONNECTION_CLEANUP_INTERVAL_MS = 500;
+const CLIENT_SLOT_TTL_MS = 2 * 1000; // client slot lease TTL; renewed only by real traffic bytes
 const WS_PING_INTERVAL_MS = 2000;
 
 let DB = { admin: null, users: [] };
@@ -437,8 +437,9 @@ function registerConnection(userId, closeFn, meta = {}) {
     const current = activeConnections.get(userId);
     const item = current?.get(id);
     if (item) {
+      // Heartbeat/session liveness only. Do not renew the client slot here;
+      // Client Limit must be based on real byte traffic, not ping/pong.
       item.lastSeen = Date.now();
-      refreshClientSlot(userId, item.clientKey);
     }
   };
   unregister.touchData = () => {
@@ -2219,7 +2220,21 @@ wss.on('connection', (ws, req) => {
 setInterval(() => {
   const now = Date.now();
   for (const [userId, map] of Array.from(activeConnections.entries())) {
+    const user = DB.users.find((u) => u.id === userId);
+    const hasClientLimit = Number(user?.connection_limit || user?.ip_limit || 0) > 0;
+
     for (const conn of Array.from(map.values())) {
+      const noTrafficFor = now - Number(conn.lastDataAt || conn.createdAt || 0);
+
+      // For limited users, a client slot is considered gone when absolutely no
+      // traffic bytes pass for CLIENT_SLOT_TTL_MS. Close the stale raw sockets too
+      // so they cannot reserve/revive a slot later and cause EOF/limit confusion.
+      if (hasClientLimit && noTrafficFor > CLIENT_SLOT_TTL_MS) {
+        try { conn.closeFn('client traffic idle'); } catch (_) {}
+        removeConnection(userId, conn.id, 'traffic idle');
+        continue;
+      }
+
       if (now - conn.lastSeen > ACTIVE_CONNECTION_STALE_MS) {
         try { conn.closeFn('connection stale'); } catch (_) {}
         removeConnection(userId, conn.id, 'stale cleaner');
