@@ -67,10 +67,7 @@
         .exp-danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border-color: rgba(239, 68, 68, 0.2); }
         .exp-warning { background: rgba(234, 179, 8, 0.1); color: #fde047; border-color: rgba(234, 179, 8, 0.2); }
         .client-name { font-weight: 700; color: #fff; letter-spacing: 0.5px; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
-        .online-badge { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; margin-top: 7px; padding: 4px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; border: 1px solid rgba(255,255,255,0.08); color: #888; background: rgba(255,255,255,0.04); }
-        .online-badge:before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: #777; }
-        .online-badge.online { color: #4ade80; background: rgba(34,197,94,0.11); border-color: rgba(34,197,94,0.24); }
-        .online-badge.online:before { background: #22c55e; box-shadow: 0 0 10px #22c55e; }
+        .client-limit-badge { display: inline-flex; align-items: center; white-space: nowrap; margin-top: 7px; padding: 4px 9px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .7px; text-transform: uppercase; border: 1px solid rgba(212,175,55,0.22); color: #d4af37; background: rgba(212,175,55,0.08); }
         .qr-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 10px; }
         .qr-card { background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 14px; text-align: center; }
         .qr-card h4 { color: #d4af37; margin-bottom: 10px; font-size: 13px; letter-spacing: 1px; }
@@ -194,7 +191,6 @@
             <div class="stat-value">
                 <span id="activeUsers">0</span>
                 <span style="font-size: 16px; color: #555; margin-left: 5px;">/ <span id="totalUsers">0</span></span>
-                <span style="font-size: 13px; color: #4ade80; margin-left: 8px;">● <span id="onlineUsers">0</span></span>
             </div>
         </div>
         <div class="stat-card">
@@ -460,7 +456,6 @@
         document.getElementById('totalTraffic').textContent = ((data.total_traffic || 0) / (1024 ** 3)).toFixed(2);
         document.getElementById('totalUsers').textContent = data.users_count || 0;
         document.getElementById('activeUsers').textContent = data.active_count || 0;
-        document.getElementById('onlineUsers').textContent = data.online_users || 0;
         updateTrafficChart(data.traffic_chart);
     }
 
@@ -505,7 +500,9 @@
                 var subUrl = window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id;
                 var wsConfigStr = buildWsConfig(user);
                 var xhttpConfigStr = buildXhttpConfig(user);
-                var onlineHtml = '<div class="online-badge ' + (user.online ? 'online' : '') + '">' + (user.online ? 'Online' : 'Offline') + '</div>';
+                var limitValue = Number(user.connection_limit || user.ip_limit || 0);
+                var activeClients = Number(user.active_clients || 0);
+                var clientLimitHtml = '<div class="client-limit-badge">Clients: ' + activeClients + '/' + (limitValue > 0 ? limitValue : '∞') + '</div>';
 
                 var platLabel = '';
                 if (user.created_on === 'railway') {
@@ -533,7 +530,7 @@
                         '</label>' +
                     '</td>' +
                     '<td data-label="Client">' +
-                        '<div><div class="client-name">' + user.remark + '</div>' + onlineHtml + '</div>' +
+                        '<div><div class="client-name">' + user.remark + '</div>' + clientLimitHtml + '</div>' +
                         platLabel +
                     '</td>' +
                     '<td data-label="Data Usage" class="traffic-col">' +
