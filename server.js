@@ -40,7 +40,7 @@ const XHTTP_RESPONSE_HEADERS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET, POST, OPTIONS'
 };
-const DB_SAVE_DEBOUNCE_MS = 1500;
+const DB_SAVE_DEBOUNCE_MS = 5000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
@@ -52,6 +52,8 @@ let lastCpuCheck = process.hrtime.bigint();
 let cachedCpuUsage = 0;
 let trafficCurrentMinuteBytes = 0;
 let trafficHistory = [];
+const pendingTrafficBytes = new Map(); // user.id -> bytes waiting for batched commit
+const pendingLastSeen = new Map(); // user.id -> latest timestamp waiting for batched commit
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
@@ -222,6 +224,20 @@ function scheduleSaveDB(immediate = false) {
   }, DB_SAVE_DEBOUNCE_MS);
 }
 
+function getPendingTraffic(userId) {
+  return Number(pendingTrafficBytes.get(userId) || 0);
+}
+
+function getEffectiveUsedBytes(user) {
+  if (!user) return 0;
+  return Number(user.used_bytes || 0) + getPendingTraffic(user.id);
+}
+
+function getEffectiveLastSeen(user) {
+  if (!user) return 0;
+  return Math.max(Number(user.last_seen || 0), Number(pendingLastSeen.get(user.id) || 0));
+}
+
 function isUserExpired(user) {
   if (!user) return true;
   const now = Date.now();
@@ -230,11 +246,58 @@ function isUserExpired(user) {
   return trafficExceeded || timeExceeded;
 }
 
+function isUserExpiredEffective(user) {
+  if (!user) return true;
+  const now = Date.now();
+  const trafficExceeded = user.traffic_limit > 0 && getEffectiveUsedBytes(user) >= user.traffic_limit;
+  const timeExceeded = user.expiry_time > 0 && now > user.expiry_time;
+  return trafficExceeded || timeExceeded;
+}
+
+function flushTrafficBuffers() {
+  if (pendingTrafficBytes.size === 0 && pendingLastSeen.size === 0) return false;
+
+  let changed = false;
+  const ids = new Set([...pendingTrafficBytes.keys(), ...pendingLastSeen.keys()]);
+
+  for (const userId of ids) {
+    const user = DB.users.find((u) => u.id === userId);
+    const bytes = Number(pendingTrafficBytes.get(userId) || 0);
+    const seen = Number(pendingLastSeen.get(userId) || 0);
+
+    pendingTrafficBytes.delete(userId);
+    pendingLastSeen.delete(userId);
+
+    if (!user) continue;
+    if (bytes > 0) {
+      user.used_bytes = Number(user.used_bytes || 0) + bytes;
+      changed = true;
+    }
+    if (seen > Number(user.last_seen || 0)) {
+      user.last_seen = seen;
+      changed = true;
+    }
+
+    if (user.is_active === 1 && isUserExpired(user)) {
+      user.is_active = 0;
+      log('[QUOTA] Limit reached:', `${user.remark} total=${formatBytes(user.used_bytes)}`);
+      closeUserConnections(user.id, 'quota exceeded');
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    scheduleRealtimeBroadcast();
+    scheduleSaveDB(false);
+  }
+  return changed;
+}
+
 function getActiveUserByUuid(uuidBytes) {
   const uuidHex = uuidBytes.toString('hex');
   const user = DB.users.find((u) => String(u.uuid).replace(/-/g, '').toLowerCase() === uuidHex);
   if (!user) return null;
-  if (user.is_active !== 1 || isUserExpired(user)) return null;
+  if (user.is_active !== 1 || isUserExpiredEffective(user)) return null;
   return user;
 }
 
@@ -261,17 +324,16 @@ function closeUserConnections(userId, reason = 'user disabled') {
 
 function updateTraffic(user, bytes) {
   if (!user || !bytes || bytes <= 0) return;
-  trafficCurrentMinuteBytes += bytes;
-  user.used_bytes = Number(user.used_bytes || 0) + bytes;
-  user.last_seen = Date.now();
-  scheduleRealtimeBroadcast();
-  scheduleSaveDB(false);
 
-  if (user.is_active === 1 && isUserExpired(user)) {
-    user.is_active = 0;
-    scheduleSaveDB(false);
-    log('[QUOTA] Limit reached:', `${user.remark} total=${formatBytes(user.used_bytes)}`);
-    closeUserConnections(user.id, 'quota exceeded');
+  // Fast data-plane path: only increment in-memory counters here.
+  // Expensive UI/DB/quota work is committed in a 1s batch by flushTrafficBuffers().
+  trafficCurrentMinuteBytes += bytes;
+  pendingTrafficBytes.set(user.id, getPendingTraffic(user.id) + bytes);
+  pendingLastSeen.set(user.id, Date.now());
+
+  // Enforce quota promptly when the buffered total crosses the limit.
+  if (user.traffic_limit > 0 && getEffectiveUsedBytes(user) >= user.traffic_limit) {
+    flushTrafficBuffers();
   }
 }
 
@@ -380,7 +442,7 @@ const MUX_OPTION_DATA = 0x01;
 const MUX_OPTION_ERROR = 0x02;
 const MUX_NETWORK_TCP = 0x01;
 const MUX_NETWORK_UDP = 0x02;
-const MUX_CHUNK_SIZE = 8 * 1024;
+const MUX_CHUNK_SIZE = 16 * 1024;
 
 function encodeMuxAddress(host) {
   const h = String(host || '');
@@ -1146,13 +1208,19 @@ function requireAuth(req, res, next) {
 function buildUsersSnapshot() {
   return DB.users.map((user) => {
     const connections = activeConnections.get(user.id)?.size || 0;
-    return { ...user, online: connections > 0, connections };
+    return {
+      ...user,
+      used_bytes: getEffectiveUsedBytes(user),
+      last_seen: getEffectiveLastSeen(user),
+      online: connections > 0,
+      connections
+    };
   });
 }
 
 function buildStatsSnapshot() {
   const memory = process.memoryUsage();
-  const totalTraffic = DB.users.reduce((sum, u) => sum + Number(u.used_bytes || 0), 0);
+  const totalTraffic = DB.users.reduce((sum, u) => sum + getEffectiveUsedBytes(u), 0);
   const activeConnectionCount = Array.from(activeConnections.values()).reduce((sum, set) => sum + set.size, 0);
   return {
     ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
@@ -1160,7 +1228,7 @@ function buildStatsSnapshot() {
     uptime: Math.round(process.uptime()),
     total_traffic: totalTraffic,
     users_count: DB.users.length,
-    active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpired(u)).length,
+    active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpiredEffective(u)).length,
     online_users: activeConnections.size,
     ws_connections: activeConnectionCount,
     xhttp_sessions: xhttpSessions.size,
@@ -1169,11 +1237,11 @@ function buildStatsSnapshot() {
 }
 
 function buildSubSnapshot(user) {
-  const used = Number(user.used_bytes || 0);
+  const used = getEffectiveUsedBytes(user);
   const remaining = user.traffic_limit === 0 ? null : Math.max(0, user.traffic_limit - used);
   const percent = Number(calcPercent(used, user.traffic_limit).toFixed(1));
   const progressWidth = Number(calcPercent(used, user.traffic_limit).toFixed(2));
-  const expired = isUserExpired(user);
+  const expired = isUserExpiredEffective(user);
   return {
     used_bytes: used,
     used_formatted: formatBytes(used),
@@ -1185,7 +1253,7 @@ function buildSubSnapshot(user) {
     expired,
     status: expired ? 'Expired' : 'Active',
     expiry: user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time),
-    last_seen: user.last_seen === 0 ? 'Never' : formatTehranDate(user.last_seen)
+    last_seen: getEffectiveLastSeen(user) === 0 ? 'Never' : formatTehranDate(getEffectiveLastSeen(user))
   };
 }
 
@@ -1382,6 +1450,8 @@ app.post('/api/users', requireAuth, (req, res) => {
 app.delete('/api/users/:id', requireAuth, (req, res) => {
   const before = DB.users.length;
   const user = DB.users.find((u) => u.id === req.params.id);
+  pendingTrafficBytes.delete(req.params.id);
+  pendingLastSeen.delete(req.params.id);
   DB.users = DB.users.filter((u) => u.id !== req.params.id);
   if (DB.users.length < before) {
     closeUserConnections(req.params.id, 'user deleted');
@@ -1394,6 +1464,7 @@ app.delete('/api/users/:id', requireAuth, (req, res) => {
 });
 
 app.post('/api/users/:id/toggle', requireAuth, (req, res) => {
+  flushTrafficBuffers();
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   user.is_active = user.is_active === 1 ? 0 : 1;
@@ -1406,6 +1477,8 @@ app.post('/api/users/:id/toggle', requireAuth, (req, res) => {
 app.post('/api/users/:id/reset', requireAuth, (req, res) => {
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
+  pendingTrafficBytes.delete(user.id);
+  pendingLastSeen.delete(user.id);
   user.used_bytes = 0;
   user.is_active = 1;
   user.last_seen = 0;
@@ -1426,6 +1499,7 @@ app.get('/api/users/:id/qr/:type', requireAuth, async (req, res) => {
 });
 
 app.put('/api/users/:id', requireAuth, (req, res) => {
+  flushTrafficBuffers();
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -1516,14 +1590,16 @@ app.get('/sub/:sub_id', (req, res) => {
     return res.send(Buffer.from(subscriptionLinks.join('\n')).toString('base64'));
   }
 
-  const usedFormatted = formatBytes(user.used_bytes);
-  const remainingFormatted = user.traffic_limit === 0 ? 'Unlimited' : formatBytes(Math.max(0, user.traffic_limit - user.used_bytes));
-  const percent = calcPercent(user.used_bytes, user.traffic_limit).toFixed(1);
-  const progressWidth = calcPercent(user.used_bytes, user.traffic_limit).toFixed(2);
-  const isDanger = user.traffic_limit > 0 && (user.used_bytes / user.traffic_limit) > 0.9;
-  const expired = isUserExpired(user);
+  const effectiveUsed = getEffectiveUsedBytes(user);
+  const effectiveLastSeen = getEffectiveLastSeen(user);
+  const usedFormatted = formatBytes(effectiveUsed);
+  const remainingFormatted = user.traffic_limit === 0 ? 'Unlimited' : formatBytes(Math.max(0, user.traffic_limit - effectiveUsed));
+  const percent = calcPercent(effectiveUsed, user.traffic_limit).toFixed(1);
+  const progressWidth = calcPercent(effectiveUsed, user.traffic_limit).toFixed(2);
+  const isDanger = user.traffic_limit > 0 && (effectiveUsed / user.traffic_limit) > 0.9;
+  const expired = isUserExpiredEffective(user);
   const expiryStr = user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time);
-  const lastSeenStr = user.last_seen === 0 ? 'Never' : formatTehranDate(user.last_seen);
+  const lastSeenStr = effectiveLastSeen === 0 ? 'Never' : formatTehranDate(effectiveLastSeen);
   const remarkSafe = safeName(user.remark);
   const wsLinkJSON = JSON.stringify(wsLink);
   const xhttpLinkJSON = JSON.stringify(xhttpLink);
@@ -1829,6 +1905,10 @@ wss.on('connection', (ws, req) => {
 });
 
 setInterval(() => {
+  flushTrafficBuffers();
+}, 1000);
+
+setInterval(() => {
   sampleCpuUsage();
 }, 1000);
 
@@ -1876,11 +1956,11 @@ setInterval(() => {
 }, SELF_PING_INTERVAL_MS);
 
 process.on('SIGTERM', () => {
-  try { saveDBNow(); } catch (_) {}
+  try { flushTrafficBuffers(); saveDBNow(); } catch (_) {}
   process.exit(0);
 });
 process.on('SIGINT', () => {
-  try { saveDBNow(); } catch (_) {}
+  try { flushTrafficBuffers(); saveDBNow(); } catch (_) {}
   process.exit(0);
 });
 process.on('uncaughtException', (err) => log('[ERROR] Uncaught:', err && err.stack ? err.stack : String(err)));
