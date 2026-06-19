@@ -44,9 +44,9 @@ const DB_SAVE_DEBOUNCE_MS = 5000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
-const ACTIVE_CONNECTION_STALE_MS = 5000;
+const ACTIVE_CONNECTION_STALE_MS = 60 * 1000;
 const CONNECTION_CLEANUP_INTERVAL_MS = 1000;
-const CLIENT_SLOT_TTL_MS = 30000;
+const CLIENT_SLOT_TTL_MS = 10 * 1000;
 const WS_PING_INTERVAL_MS = 2000;
 
 let DB = { admin: null, users: [] };
@@ -347,18 +347,40 @@ function getActiveSessionCount(userId) {
   return activeConnections.get(userId)?.size || 0;
 }
 
+function refreshClientSlot(userId, clientKey) {
+  if (!clientKey) return;
+  const slots = clientSlots.get(userId);
+  const slot = slots?.get(clientKey);
+  if (slot) {
+    slot.lastSeen = Date.now();
+  }
+}
+
 function pruneClientSlots(userId) {
   const slots = clientSlots.get(userId);
   if (!slots) return 0;
   const now = Date.now();
+  const active = activeConnections.get(userId);
   let removed = 0;
+
   for (const [key, slot] of Array.from(slots.entries())) {
+    const hasFreshConnection = active && Array.from(active.values()).some((conn) => {
+      return conn.clientKey === key && now - Number(conn.lastSeen || 0) <= ACTIVE_CONNECTION_STALE_MS;
+    });
+
+    if (hasFreshConnection) {
+      slot.lastSeen = now;
+      continue;
+    }
+
     if (now - Number(slot.lastSeen || 0) > CLIENT_SLOT_TTL_MS) {
       slots.delete(key);
       removed += 1;
     }
   }
+
   if (slots.size === 0) clientSlots.delete(userId);
+  if (removed) scheduleRealtimeBroadcast();
   return removed;
 }
 
@@ -371,7 +393,6 @@ function canAcceptUserSession(user, clientKey) {
   const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
 
-  pruneStaleConnections(user.id, ACTIVE_CONNECTION_STALE_MS);
   pruneClientSlots(user.id);
 
   const slots = clientSlots.get(user.id);
@@ -424,7 +445,10 @@ function registerConnection(userId, closeFn, meta = {}) {
   unregister.touch = () => {
     const current = activeConnections.get(userId);
     const item = current?.get(id);
-    if (item) item.lastSeen = Date.now();
+    if (item) {
+      item.lastSeen = Date.now();
+      refreshClientSlot(userId, item.clientKey);
+    }
   };
   unregister.touchData = () => {
     const current = activeConnections.get(userId);
@@ -433,6 +457,7 @@ function registerConnection(userId, closeFn, meta = {}) {
       const now = Date.now();
       item.lastSeen = now;
       item.lastDataAt = now;
+      refreshClientSlot(userId, item.clientKey);
     }
   };
   unregister.id = id;
@@ -467,6 +492,7 @@ function markUserDataActivity(userId) {
   for (const conn of map.values()) {
     conn.lastSeen = now;
     conn.lastDataAt = now;
+    refreshClientSlot(userId, conn.clientKey);
   }
 }
 
