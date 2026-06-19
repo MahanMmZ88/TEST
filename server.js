@@ -282,6 +282,12 @@ function isUserExpiredEffective(user) {
   return trafficExceeded || timeExceeded;
 }
 
+function getUserStatus(user) {
+  if (!user || user.is_active !== 1) return 'Inactive';
+  if (isUserExpiredEffective(user)) return 'Expired';
+  return 'Active';
+}
+
 function flushTrafficBuffers() {
   if (pendingTrafficBytes.size === 0 && pendingUplinkBytes.size === 0 && pendingDownlinkBytes.size === 0 && pendingLastSeen.size === 0) return false;
 
@@ -1500,10 +1506,12 @@ function buildStatsSnapshot() {
 
 function buildSubSnapshot(user) {
   const used = getEffectiveUsedBytes(user);
-  const remaining = user.traffic_limit === 0 ? null : Math.max(0, user.traffic_limit - used);
-  const percent = Number(calcPercent(used, user.traffic_limit).toFixed(1));
-  const progressWidth = Number(calcPercent(used, user.traffic_limit).toFixed(2));
-  const expired = isUserExpiredEffective(user);
+  const unlimited = Number(user.traffic_limit || 0) === 0;
+  const remaining = unlimited ? null : Math.max(0, user.traffic_limit - used);
+  const percent = unlimited ? null : Number(calcPercent(used, user.traffic_limit).toFixed(1));
+  const progressWidth = unlimited ? 100 : Number(calcPercent(used, user.traffic_limit).toFixed(2));
+  const status = getUserStatus(user);
+  const unavailable = status !== 'Active';
   return {
     used_bytes: used,
     used_formatted: formatBytes(used),
@@ -1513,11 +1521,16 @@ function buildSubSnapshot(user) {
     downlink_formatted: formatBytes(getEffectiveDownlinkBytes(user)),
     remaining_bytes: remaining,
     remaining_formatted: remaining === null ? 'Unlimited' : formatBytes(remaining),
+    unlimited,
     percent,
+    percent_label: unlimited ? '∞' : `${percent}%`,
     progress_width: progressWidth,
-    is_danger: user.traffic_limit > 0 && (used / user.traffic_limit) > 0.9,
-    expired,
-    status: expired ? 'Expired' : 'Active',
+    is_danger: unavailable || (!unlimited && user.traffic_limit > 0 && (used / user.traffic_limit) > 0.9),
+    expired: status === 'Expired',
+    inactive: status === 'Inactive',
+    status,
+    status_class: unavailable ? 'expired' : 'active',
+    ring_theme: unavailable ? 'red' : (unlimited ? 'green' : 'gold'),
     expiry: user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time),
     last_seen: getEffectiveLastSeen(user) === 0 ? 'Never' : formatTehranDate(getEffectiveLastSeen(user))
   };
@@ -1707,6 +1720,7 @@ app.post('/api/admin/change-password', requireAuth, (req, res) => {
 
 app.post('/api/backup/restore', requireAuth, (req, res) => {
   const incomingUsers = Array.isArray(req.body?.users) ? req.body.users : null;
+  const overwrite = req.body?.overwrite === true;
   if (!incomingUsers) return res.status(400).json({ error: 'Invalid backup: users array is required' });
   if (incomingUsers.length > 10000) return res.status(400).json({ error: 'Invalid backup: too many users' });
 
@@ -1715,18 +1729,43 @@ app.post('/api/backup/restore', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Invalid backup: one or more users are malformed' });
   }
 
-  for (const userId of Array.from(activeConnections.keys())) forceClearUserConnections(userId, 'backup restored');
+  const duplicateKeys = (a, b) => {
+    return (a.id && b.id && a.id === b.id) ||
+      (a.uuid && b.uuid && String(a.uuid).toLowerCase() === String(b.uuid).toLowerCase()) ||
+      (a.sub_id && b.sub_id && a.sub_id === b.sub_id) ||
+      (a.remark && b.remark && a.remark === b.remark);
+  };
+
+  let added = 0;
+  let overwritten = 0;
+  let skipped = 0;
+
+  for (const restored of restoredUsers) {
+    const idx = DB.users.findIndex((existing) => duplicateKeys(existing, restored));
+    if (idx >= 0) {
+      if (overwrite) {
+        forceClearUserConnections(DB.users[idx].id, 'backup overwrite');
+        DB.users[idx] = restored;
+        overwritten += 1;
+      } else {
+        skipped += 1;
+      }
+    } else {
+      DB.users.unshift(restored);
+      added += 1;
+    }
+  }
+
   pendingTrafficBytes.clear();
   pendingUplinkBytes.clear();
   pendingDownlinkBytes.clear();
   pendingLastSeen.clear();
   clientSlots.clear();
 
-  DB.users = restoredUsers;
   scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
-  log('[Backup] Restored users:', String(restoredUsers.length));
-  res.json({ success: true, users_count: restoredUsers.length });
+  log('[Backup] Merge restored:', `added=${added} overwritten=${overwritten} skipped=${skipped}`);
+  res.json({ success: true, added, overwritten, skipped, users_count: DB.users.length });
 });
 
 app.get('/api/stats', requireAuth, (req, res) => {
@@ -1951,11 +1990,14 @@ app.get('/sub/:sub_id', (req, res) => {
   const usedFormatted = formatBytes(effectiveUsed);
   const uplinkFormatted = formatBytes(getEffectiveUplinkBytes(user));
   const downlinkFormatted = formatBytes(getEffectiveDownlinkBytes(user));
-  const remainingFormatted = user.traffic_limit === 0 ? 'Unlimited' : formatBytes(Math.max(0, user.traffic_limit - effectiveUsed));
-  const percent = calcPercent(effectiveUsed, user.traffic_limit).toFixed(1);
-  const progressWidth = calcPercent(effectiveUsed, user.traffic_limit).toFixed(2);
-  const isDanger = user.traffic_limit > 0 && (effectiveUsed / user.traffic_limit) > 0.9;
-  const expired = isUserExpiredEffective(user);
+  const unlimitedTraffic = Number(user.traffic_limit || 0) === 0;
+  const remainingFormatted = unlimitedTraffic ? 'Unlimited' : formatBytes(Math.max(0, user.traffic_limit - effectiveUsed));
+  const numericPercent = unlimitedTraffic ? null : Number(calcPercent(effectiveUsed, user.traffic_limit).toFixed(1));
+  const percent = unlimitedTraffic ? '∞' : numericPercent.toFixed(1);
+  const progressWidth = unlimitedTraffic ? '100.00' : calcPercent(effectiveUsed, user.traffic_limit).toFixed(2);
+  const statusText = getUserStatus(user);
+  const expired = statusText !== 'Active';
+  const isDanger = expired || (!unlimitedTraffic && user.traffic_limit > 0 && (effectiveUsed / user.traffic_limit) > 0.9);
   const expiryStr = user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time);
   const lastSeenStr = effectiveLastSeen === 0 ? 'Never' : formatTehranDate(effectiveLastSeen);
   const remarkSafe = safeName(user.remark);
@@ -1966,7 +2008,8 @@ app.get('/sub/:sub_id', (req, res) => {
   const subUrlJSON = JSON.stringify(buildSubUrl(req, user));
   const qrBase = `/qr/${user.sub_id}`;
 
-  const ringDeg = Math.max(0, Math.min(100, Number(percent))) * 3.6;
+  const ringColor = expired ? '#ef4444' : (unlimitedTraffic ? '#22c55e' : 'var(--gold)');
+  const ringDeg = expired ? 360 : (unlimitedTraffic ? 360 : Math.max(0, Math.min(100, Number(numericPercent))) * 3.6);
 
   res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -2002,14 +2045,14 @@ app.get('/sub/:sub_id', (req, res) => {
     .main-grid { display:grid; grid-template-columns: 1.05fr .95fr; gap:18px; align-items:stretch; position:relative; z-index:1; }
     .panel { background:rgba(0,0,0,.24); border:1px solid rgba(255,255,255,.075); border-radius:24px; padding:20px; }
     .usage-head { display:flex; justify-content:space-between; align-items:center; gap:14px; margin-bottom:18px; }
-    .ring { width:132px; height:132px; border-radius:50%; display:grid; place-items:center; background: conic-gradient(var(--gold) 0 ${ringDeg}deg, rgba(255,255,255,.09) ${ringDeg}deg 360deg); box-shadow:0 0 34px rgba(212,175,55,.10); position:relative; flex:0 0 auto; }
+    .ring { width:132px; height:132px; border-radius:50%; display:grid; place-items:center; background: conic-gradient(${ringColor} 0 ${ringDeg}deg, rgba(255,255,255,.09) ${ringDeg}deg 360deg); box-shadow:0 0 34px rgba(212,175,55,.10); position:relative; flex:0 0 auto; }
     .ring:before { content:''; position:absolute; inset:11px; border-radius:50%; background:#111119; border:1px solid rgba(255,255,255,.06); }
     .ring span { position:relative; z-index:1; font-size:28px; font-weight:900; color:#fff; }
     .usage-title h2 { font-size:22px; margin-bottom:6px; }
     .usage-title p { color:#888; font-size:13px; line-height:1.6; }
     .progress { height:10px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; margin:14px 0 18px; }
     .fill { height:100%; width:${progressWidth}%; background:linear-gradient(90deg,var(--gold),#eab308); border-radius:999px; box-shadow:0 0 18px rgba(212,175,55,.25); }
-    .danger { background:linear-gradient(90deg,#ef4444,#f87171)!important; }
+    .danger { background:linear-gradient(90deg,#ef4444,#f87171)!important; }.greenfill{background:linear-gradient(90deg,#22c55e,#86efac)!important;box-shadow:0 0 18px rgba(34,197,94,.24)!important;}
     .stat-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
     .stat { background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.065); border-radius:18px; padding:15px; }
     .label { color:#888; font-size:10px; text-transform:uppercase; letter-spacing:1.2px; font-weight:900; }
@@ -2034,7 +2077,7 @@ app.get('/sub/:sub_id', (req, res) => {
     .btn.primary { background:linear-gradient(135deg,var(--gold),#b2891d); color:#000; box-shadow:0 12px 26px rgba(212,175,55,.16); }
     .btn.dark { background:rgba(0,0,0,.32); color:#ddd; border:1px solid rgba(255,255,255,.095); }
     .guide { color:#777; text-align:center; font-size:12px; line-height:1.7; margin-top:16px; }
-    .toast { position:fixed; right:20px; bottom:20px; background:#15151d; color:#fff; border:1px solid rgba(212,175,55,.35); padding:12px 16px; border-radius:14px; z-index:999; box-shadow:0 15px 35px rgba(0,0,0,.42); animation:toastIn .22s ease; }
+    .show-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}.show-btn{border:1px solid rgba(212,175,55,.22);background:rgba(212,175,55,.07);color:#d4af37;border-radius:12px;padding:10px;font-weight:900;cursor:pointer}.qr-full{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);backdrop-filter:blur(8px);z-index:900;align-items:center;justify-content:center;padding:20px}.qr-full-card{background:#111119;border:1px solid rgba(255,255,255,.1);border-radius:26px;padding:24px;width:min(420px,100%);text-align:center;box-shadow:0 30px 80px rgba(0,0,0,.6)}.qr-full-card .qr{width:300px;height:300px}.qr-full-card .qr img{width:276px;height:276px}.toast { position:fixed; right:20px; bottom:20px; background:#15151d; color:#fff; border:1px solid rgba(212,175,55,.35); padding:12px 16px; border-radius:14px; z-index:999; box-shadow:0 15px 35px rgba(0,0,0,.42); animation:toastIn .22s ease; }
     @keyframes toastIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
     @media(max-width:850px){ body{padding:14px}.card{padding:20px;border-radius:24px}.hero{flex-direction:column}.status-box{text-align:left}.main-grid{grid-template-columns:1fr}.usage-head{flex-direction:column;text-align:center}.stat-grid{grid-template-columns:1fr}.qr{width:190px;height:190px}.qr-tabs{flex-direction:column} }
   </style>
@@ -2048,14 +2091,14 @@ app.get('/sub/:sub_id', (req, res) => {
           <div class="kicker">Subscription</div>
           <h1>${remarkSafe}</h1>
           <p class="desc">VLESS subscription with realtime usage, QR import options, upload/download details and transport information.</p>
-          <div class="chips"><span class="chip ${expired ? '' : 'ok'}">${expired ? 'Expired' : 'Active'}</span><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
+          <div class="chips"><span class="chip ${expired ? '' : 'ok'}">${statusText}</span><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
         </div>
-        <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${expired ? 'Expired' : 'Ready'}</div><p style="margin-top:10px">Asia/Tehran time</p></div>
+        <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${expired ? statusText : 'Ready'}</div><p style="margin-top:10px">Asia/Tehran time</p></div>
       </div>
       <div class="main-grid">
         <section class="panel">
           <div class="usage-head"><div class="usage-title"><h2>Traffic Usage</h2><p>Usage values update in realtime while this page is open.</p></div><div class="ring" id="usageRing"><span id="ringValue">${percent}%</span></div></div>
-          <div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : ''}"></div></div>
+          <div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : (unlimitedTraffic ? 'greenfill' : '')}"></div></div>
           <div class="stat-grid">
             <div class="stat"><div class="label">Used</div><div class="value" id="usedValue">${usedFormatted}</div></div>
             <div class="stat"><div class="label">Remaining</div><div class="value gold" id="remainingValue">${remainingFormatted}</div></div>
@@ -2065,15 +2108,15 @@ app.get('/sub/:sub_id', (req, res) => {
           <div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
         </section>
         <section class="panel">
-          <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div>
-          <div class="qr-stage"><div class="qr"><img id="qrImage" alt="QR Code" src="${qrBase}/xhttp"></div><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
+          <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div><div class="show-grid"><button class="show-btn" onclick="showFullQr('xhttp')">Show XHTTP QR</button><button class="show-btn" onclick="showFullQr('ws')">Show WS QR</button><button class="show-btn" onclick="showFullQr('sub')">Show Sub QR</button></div>
+          <div class="qr-stage"><div class="qr"><img id="qrImage" alt="QR Code" src="${qrBase}/xhttp"></div><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" onclick="downloadQr()">Download QR JPG</button></div>
           <button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button>
           <p class="guide">VPN clients receive both configs automatically. Browser users see this page.</p>
         </section>
       </div>
     </section>
-  </main>
-  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});document.getElementById('qrImage').src=QR_BASE+'/'+t+'?ts='+Date.now();var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function downloadQr(){var a=document.createElement('a');a.href=QR_BASE+'/'+ACTIVE_QR;a.download='qr-'+ACTIVE_QR+'.svg';a.click()}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent+'%';var deg=(Number(d.percent)||0)*3.6;document.getElementById('usageRing').style.background='conic-gradient(var(--gold) 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':'');var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+(d.expired?'expired':'active');var p=document.getElementById('statusPill');p.textContent=d.expired?'Expired':'Ready';p.className='status-pill '+(d.expired?'expired':'');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
+  </main><div class="qr-full" id="qrFull" onclick="hideFullQr(event)"><div class="qr-full-card"><h2 id="qrFullTitle" style="margin-bottom:16px;color:#d4af37">QR Code</h2><div class="qr"><img id="qrFullImg" alt="Full QR"></div><button class="btn primary" onclick="downloadQr()">Download QR JPG</button><button class="btn dark" onclick="document.getElementById('qrFull').style.display='none'">Close</button></div></div>
+  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});document.getElementById('qrImage').src=QR_BASE+'/'+t+'?ts='+Date.now();var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function showFullQr(t){setQrTab(t);document.getElementById('qrFullTitle').textContent=(t==='xhttp'?'XHTTP':(t==='ws'?'WebSocket':'Subscription'))+' QR';document.getElementById('qrFullImg').src=QR_BASE+'/'+t+'?ts='+Date.now();document.getElementById('qrFull').style.display='flex'}function hideFullQr(e){if(e.target.id==='qrFull')e.currentTarget.style.display='none'}function downloadQr(){var src=(document.getElementById('qrFull').style.display==='flex'?document.getElementById('qrFullImg').src:document.getElementById('qrImage').src);var c=document.createElement('canvas');c.width=900;c.height=900;var x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);var i=new Image();i.onload=function(){x.drawImage(i,40,40,820,820);var a=document.createElement('a');a.href=c.toDataURL('image/jpeg',0.92);a.download='qr-'+ACTIVE_QR+'.jpg';a.click()};i.src=src}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent_label||((d.percent||0)+'%');var deg=d.unlimited&&!d.is_danger?360:(Number(d.percent)||0)*3.6;if(d.is_danger)deg=360;var color=d.is_danger?'#ef4444':(d.unlimited?'#22c55e':'var(--gold)');document.getElementById('usageRing').style.background='conic-gradient('+color+' 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':(d.unlimited?'greenfill':''));var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+d.status_class;var p=document.getElementById('statusPill');p.textContent=d.status==='Active'?'Ready':d.status;p.className='status-pill '+(d.status==='Active'?'':'expired');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
 });
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
