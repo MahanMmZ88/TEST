@@ -63,7 +63,8 @@
         .traffic-text { font-size: 11px; color: #aaa; margin-bottom: 6px; display: flex; justify-content: space-between; font-weight: 600; letter-spacing: 0.5px; }
         .traffic-bar-bg { width: 100%; background: rgba(0,0,0,0.5); height: 6px; border-radius: 4px; overflow: hidden; border: 1px solid rgba(255,255,255,0.05); }
         .traffic-bar-fill { background: linear-gradient(90deg, #d4af37, #eab308); height: 100%; border-radius: 4px; transition: width 0.8s cubic-bezier(0.2, 0.8, 0.2, 1); }
-        .traffic-danger { background: linear-gradient(90deg, #ef4444, #f87171); box-shadow: 0 0 10px rgba(239, 68, 68, 0.5); }
+        .traffic-danger { background: linear-gradient(90deg, #ef4444, #f87171) !important; box-shadow: 0 0 10px rgba(239, 68, 68, 0.5); }
+        .traffic-unlimited { background: linear-gradient(90deg, #22c55e, #86efac) !important; box-shadow: 0 0 10px rgba(34, 197, 94, 0.28); }
         .expiry-badge { display: inline-flex; align-items: center; white-space: nowrap; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); letter-spacing: 1px; }
         .exp-danger { background: rgba(239, 68, 68, 0.1); color: #f87171; border-color: rgba(239, 68, 68, 0.2); }
         .exp-warning { background: rgba(234, 179, 8, 0.1); color: #fde047; border-color: rgba(234, 179, 8, 0.2); }
@@ -118,7 +119,7 @@
         .chart-title { position:absolute; top:22px; left:28px; z-index:2; }
         .chart-title h3 { font-size:15px; letter-spacing:1px; }
         .chart-title p { color:#777; font-size:11px; margin-top:3px; }
-        .chart-section canvas { margin-top:28px; }
+        .chart-section canvas { margin-top:28px; width:100%; height:calc(100% - 28px); display:block; }
         .toolbar { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom:22px; flex-wrap:wrap; }
         .toolbar-left { display:flex; gap:10px; align-items:center; flex:1; min-width:260px; }
         .search-box, .filter-select { background: rgba(0,0,0,0.28); border:1px solid rgba(255,255,255,0.09); color:#fff; border-radius:14px; padding:13px 14px; outline:none; transition:.25s; }
@@ -338,7 +339,7 @@
                     <span class="chip gold">XHTTP</span>
                     <span class="chip">UDP</span>
                     <span class="chip">MUX</span>
-                    <span class="chip realtime-indicator" id="realtimeIndicator">Realtime connecting</span>
+                    
                 </div>
             </div>
             <div class="host-badge" id="hostBadge">Host: Detecting...</div>
@@ -517,6 +518,18 @@
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeConfirmModal(false)">Cancel</button>
             <button class="action-btn delete" style="padding:12px 22px; justify-content:center" onclick="closeConfirmModal(true)">Delete</button>
+        </div>
+    </div>
+</div>
+
+<!-- Restore Conflict Modal -->
+<div class="modal" id="restoreConflictModal">
+    <div class="modal-content">
+        <h3>Duplicate Clients Found</h3>
+        <p id="restoreConflictMessage" style="color:#aaa;line-height:1.7;margin-bottom:22px">Some clients already exist. Overwrite them?</p>
+        <div class="modal-actions">
+            <button class="round-action cancel" style="width:auto;padding:0 18px" onclick="closeRestoreConflict(false)">No</button>
+            <button class="round-action ok" style="width:auto;padding:0 18px" onclick="closeRestoreConflict(true)">Yes</button>
         </div>
     </div>
 </div>
@@ -827,9 +840,13 @@
                 var trafficReached = !isUnlimitedTraffic && user.used_bytes >= user.traffic_limit;
                 var timeReached = !isUnlimitedTime && now >= user.expiry_time;
                 var isExpired = trafficReached || timeReached;
-                var isChecked = (user.is_active === 1 && !isExpired) ? 'checked' : '';
+                var isInactive = user.is_active !== 1;
+                var isProblem = isInactive || isExpired;
+                var isChecked = (!isInactive && !isExpired) ? 'checked' : '';
                 var isDisabled = isExpired ? 'disabled' : '';
-                var percent = isUnlimitedTraffic ? 0 : Math.min(100, (user.used_bytes / user.traffic_limit) * 100);
+                var percent = isUnlimitedTraffic ? 100 : Math.min(100, (user.used_bytes / user.traffic_limit) * 100);
+                var percentLabel = isUnlimitedTraffic ? '∞' : percent.toFixed(1) + '%';
+                var barClass = isProblem ? 'traffic-danger' : (isUnlimitedTraffic ? 'traffic-unlimited' : '');
                 var limitText = isUnlimitedTraffic ? '∞' : formatBytes(user.traffic_limit);
                 var usedText = formatBytes(user.used_bytes);
                 var uploadText = formatBytes(user.uplink_bytes || 0);
@@ -841,7 +858,8 @@
                 var clientLimitHtml = '<span class="mini-badge ' + limitState + '">Clients ' + activeClients + '/' + (limitValue > 0 ? limitValue : '∞') + '</span>' + buildSlotDots(activeClients, limitValue);
 
                 var expiryHtml = '';
-                if (isUnlimitedTime) expiryHtml = '<span class="mini-badge gold">No Expiry</span>';
+                if (isInactive) expiryHtml = '<span class="mini-badge danger">Inactive</span>';
+                else if (isUnlimitedTime) expiryHtml = '<span class="mini-badge gold">No Expiry</span>';
                 else {
                     var daysLeft = Math.ceil((user.expiry_time - now) / (1000 * 60 * 60 * 24));
                     if (daysLeft <= 0) expiryHtml = '<span class="mini-badge danger">Expired</span>';
@@ -867,8 +885,8 @@
                         '</div>' +
                     '</div>' +
                     '<div class="client-usage">' +
-                        '<div class="usage-top"><span>' + usedText + ' used</span><span class="usage-percent">' + percent.toFixed(1) + '%</span></div>' +
-                        '<div class="traffic-bar-bg"><div class="traffic-bar-fill ' + (trafficReached ? 'traffic-danger' : '') + '" style="width:' + percent + '%"></div></div>' +
+                        '<div class="usage-top"><span>' + usedText + ' used</span><span class="usage-percent">' + percentLabel + '</span></div>' +
+                        '<div class="traffic-bar-bg"><div class="traffic-bar-fill ' + barClass + '" style="width:' + percent + '%"></div></div>' +
                         buildBreakdownBar(user.uplink_bytes || 0, user.downlink_bytes || 0) +
                         '<div class="traffic-text" style="margin-top:8px"><span>↑ ' + uploadText + '</span><span>↓ ' + downloadText + '</span></div>' +
                         '<div class="traffic-text" style="margin-top:4px"><span>Limit: ' + limitText + '</span><span>Left: ' + remainText + '</span></div>' +
@@ -967,6 +985,23 @@
         setTimeout(function() { if (el.parentNode) el.parentNode.removeChild(el); }, 2900);
     }
 
+    var restoreConflictResolver = null;
+    function askRestoreConflict(count) {
+        document.getElementById('restoreConflictMessage').textContent = count + ' clients already exist. Do you want to overwrite them?';
+        var m = document.getElementById('restoreConflictModal');
+        m.style.display = 'flex';
+        setTimeout(function() { m.classList.add('show'); }, 10);
+        return new Promise(function(resolve) { restoreConflictResolver = resolve; });
+    }
+
+    function closeRestoreConflict(result) {
+        var m = document.getElementById('restoreConflictModal');
+        m.classList.remove('show');
+        setTimeout(function() { m.style.display = 'none'; }, 250);
+        if (restoreConflictResolver) restoreConflictResolver(!!result);
+        restoreConflictResolver = null;
+    }
+
     var confirmResolver = null;
     function askConfirm(title, message) {
         document.getElementById('confirmTitle').textContent = title || 'Confirm Action';
@@ -1048,7 +1083,7 @@
                 if (!Array.isArray(data.users)) throw new Error('users array missing');
                 pendingRestoreBackup = data;
                 document.getElementById('restoreFileName').textContent = file.name;
-                document.getElementById('backupPreview').textContent = 'Valid backup file\nUsers: ' + data.users.length + '\nRestore will replace current clients.';
+                document.getElementById('backupPreview').textContent = 'Valid backup file\nUsers: ' + data.users.length + '\nRestore will add new clients. Duplicates can be skipped or overwritten.';
                 document.getElementById('restoreReview').style.display = 'block';
                 showToast('Backup file loaded');
             } catch(e) {
@@ -1070,22 +1105,35 @@
         if (!silent) showToast('Restore cancelled');
     }
 
+    function backupDuplicateCount(users) {
+        function duplicate(a, b) {
+            return (a.id && b.id && a.id === b.id) ||
+                (a.uuid && b.uuid && String(a.uuid).toLowerCase() === String(b.uuid).toLowerCase()) ||
+                (a.sub_id && b.sub_id && a.sub_id === b.sub_id) ||
+                (a.remark && b.remark && a.remark === b.remark);
+        }
+        return users.filter(function(u) { return currentUsers.some(function(c) { return duplicate(c, u); }); }).length;
+    }
+
     async function confirmRestoreBackup() {
         if (!pendingRestoreBackup || !Array.isArray(pendingRestoreBackup.users)) {
             return showToast('No valid backup selected', 'error');
         }
-        var ok = await askConfirm('Restore Backup', 'Restore will replace all current clients. Continue?');
-        if (!ok) return;
+        var duplicateCount = backupDuplicateCount(pendingRestoreBackup.users);
+        var overwrite = false;
+        if (duplicateCount > 0) {
+            overwrite = await askRestoreConflict(duplicateCount);
+        }
         try {
             var res = await fetch('/api/backup/restore', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ users: pendingRestoreBackup.users })
+                body: JSON.stringify({ users: pendingRestoreBackup.users, overwrite: overwrite })
             });
             var data = await res.json();
             if (data.error) return showToast(data.error, 'error');
             showToast('Backup restored');
-            addActivity('Backup restored: ' + (data.users_count || 0) + ' clients');
+            addActivity('Backup restored: +' + (data.added || 0) + ' / overwritten ' + (data.overwritten || 0) + ' / skipped ' + (data.skipped || 0));
             cancelRestoreBackup(true);
             fetchInbounds();
             fetchStats();
