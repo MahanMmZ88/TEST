@@ -44,6 +44,7 @@ const DB_SAVE_DEBOUNCE_MS = 5000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const ACTIVE_CONNECTION_STALE_MS = 90 * 1000;
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
@@ -58,7 +59,7 @@ let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
-const activeConnections = new Map(); // user.id -> Set(closeFn)
+const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, kind, closeFn, lastSeen })
 const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
 let realtimeBroadcastTimer = null;
@@ -175,6 +176,7 @@ function normalizeUser(u) {
     uuid: String(u.uuid || crypto.randomUUID()).toLowerCase(),
     sub_id: String(u.sub_id || crypto.randomBytes(8).toString('hex')),
     traffic_limit: Number(u.traffic_limit || 0),
+    ip_limit: Number(u.ip_limit || u.connection_limit || 0),
     used_bytes: Number(u.used_bytes || 0),
     expiry_time: Number(u.expiry_time || 0),
     last_seen: Number(u.last_seen || 0),
@@ -301,24 +303,55 @@ function getActiveUserByUuid(uuidBytes) {
   return user;
 }
 
-function registerConnection(userId, closeFn) {
-  if (!activeConnections.has(userId)) activeConnections.set(userId, new Set());
-  activeConnections.get(userId).add(closeFn);
+function getActiveIpSet(userId) {
+  const map = activeConnections.get(userId);
+  if (!map) return new Set();
+  return new Set(Array.from(map.values()).map((conn) => conn.ip).filter(Boolean));
+}
+
+function canAcceptUserIp(user, ip) {
+  const limit = Number(user.ip_limit || 0);
+  if (!limit || limit <= 0) return true;
+  const ips = getActiveIpSet(user.id);
+  return ips.has(ip) || ips.size < limit;
+}
+
+function registerConnection(userId, closeFn, meta = {}) {
+  if (!activeConnections.has(userId)) activeConnections.set(userId, new Map());
+  const map = activeConnections.get(userId);
+  const id = crypto.randomBytes(8).toString('hex');
+  const conn = {
+    id,
+    ip: String(meta.ip || 'unknown'),
+    kind: String(meta.kind || 'unknown'),
+    closeFn,
+    createdAt: Date.now(),
+    lastSeen: Date.now()
+  };
+  map.set(id, conn);
   scheduleRealtimeBroadcast();
-  return () => {
-    const set = activeConnections.get(userId);
-    if (!set) return;
-    set.delete(closeFn);
-    if (set.size === 0) activeConnections.delete(userId);
+
+  const unregister = () => {
+    const current = activeConnections.get(userId);
+    if (!current) return;
+    current.delete(id);
+    if (current.size === 0) activeConnections.delete(userId);
     scheduleRealtimeBroadcast();
   };
+  unregister.touch = () => {
+    const current = activeConnections.get(userId);
+    const item = current?.get(id);
+    if (item) item.lastSeen = Date.now();
+  };
+  unregister.id = id;
+  return unregister;
 }
 
 function closeUserConnections(userId, reason = 'user disabled') {
-  const set = activeConnections.get(userId);
-  if (!set) return;
-  for (const closeFn of Array.from(set)) {
-    try { closeFn(reason); } catch (_) {}
+  const map = activeConnections.get(userId);
+  if (!map) return;
+  for (const conn of Array.from(map.values())) {
+    try { conn.closeFn(reason); } catch (_) {}
   }
 }
 
@@ -682,6 +715,7 @@ class XHttpSession {
     this.udpTargetPort = 0;
     this.udpState = { buffer: Buffer.alloc(0) };
     this.udpIdleTimer = null;
+    this.clientIp = 'unknown';
     this.version = 0;
     this.downlinkRes = null;
     this.nextSeq = 0;
@@ -698,6 +732,7 @@ class XHttpSession {
 
   refresh() {
     this.lastActivity = Date.now();
+    this.unregisterConnection?.touch?.();
     if (this.cleanupTimer && this.cleanupTimer.refresh) this.cleanupTimer.refresh();
   }
 
@@ -714,6 +749,7 @@ class XHttpSession {
     }
 
     this.refresh();
+    this.clientIp = getClientIp(req);
     this.downlinkRes = res;
     req.setTimeout(0);
     res.setTimeout(0);
@@ -804,7 +840,11 @@ class XHttpSession {
 
     this.user = request.user;
     this.version = request.version;
-    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason));
+    if (!canAcceptUserIp(this.user, this.clientIp)) {
+      this.close('ip limit exceeded');
+      throw new Error('ip limit exceeded');
+    }
+    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, kind: 'xhttp' });
     log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId}`);
 
     if (request.command === 0x03) {
@@ -1200,7 +1240,11 @@ class MuxHandler {
 }
 
 function getClientIp(req) {
-  return String(req.headers['cf-connecting-ip'] || req.ip || req.socket.remoteAddress || 'unknown');
+  const cfIp = req.headers['cf-connecting-ip'];
+  if (cfIp) return String(cfIp).trim();
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return String(req.ip || req.socket.remoteAddress || 'unknown');
 }
 
 function getLoginState(ip) {
@@ -1244,13 +1288,16 @@ function requireAuth(req, res, next) {
 
 function buildUsersSnapshot() {
   return DB.users.map((user) => {
-    const connections = activeConnections.get(user.id)?.size || 0;
+    const map = activeConnections.get(user.id);
+    const connections = map?.size || 0;
+    const activeIps = getActiveIpSet(user.id);
     return {
       ...user,
       used_bytes: getEffectiveUsedBytes(user),
       last_seen: getEffectiveLastSeen(user),
       online: connections > 0,
-      connections
+      connections,
+      active_ips: activeIps.size
     };
   });
 }
@@ -1258,7 +1305,7 @@ function buildUsersSnapshot() {
 function buildStatsSnapshot() {
   const memory = process.memoryUsage();
   const totalTraffic = DB.users.reduce((sum, u) => sum + getEffectiveUsedBytes(u), 0);
-  const activeConnectionCount = Array.from(activeConnections.values()).reduce((sum, set) => sum + set.size, 0);
+  const activeConnectionCount = Array.from(activeConnections.values()).reduce((sum, map) => sum + map.size, 0);
   return {
     ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
     cpu_usage: getCpuUsagePercent(),
@@ -1364,6 +1411,7 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
   }
 
   const session = getXHttpSession(sessionId);
+  if (!session.clientIp || session.clientIp === 'unknown') session.clientIp = getClientIp(req);
   let failed = false;
   req.setTimeout(0);
   res.setTimeout(0);
@@ -1410,6 +1458,7 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
   try {
     const body = await readRequestBody(req, MAX_XHTTP_POST_SIZE);
     const session = getXHttpSession(sessionId);
+    if (!session.clientIp || session.clientIp === 'unknown') session.clientIp = getClientIp(req);
     await session.processPacket(seq, body);
     res.writeHead(200, XHTTP_RESPONSE_HEADERS);
     res.end();
@@ -1494,13 +1543,14 @@ app.get('/api/events', requireAuth, (req, res) => {
 });
 
 app.post('/api/users', requireAuth, (req, res) => {
-  const { remark, traffic_limit_gb, expiry_days } = req.body || {};
+  const { remark, traffic_limit_gb, expiry_days, ip_limit } = req.body || {};
   const cleanRemark = String(remark || '').trim();
   if (!cleanRemark) return res.status(400).json({ error: 'Remark is required' });
   if (DB.users.some((u) => u.remark === cleanRemark)) return res.status(400).json({ error: 'Username must be unique' });
 
   const limitGB = Number(traffic_limit_gb || 0);
   const expiryDays = Number(expiry_days || 0);
+  const ipLimit = Math.max(0, Math.floor(Number(ip_limit || 0)));
   const host = req.get('host') || '';
   let createdOn = 'other';
   if (host.includes('railway.app')) createdOn = 'railway';
@@ -1512,6 +1562,7 @@ app.post('/api/users', requireAuth, (req, res) => {
     uuid: crypto.randomUUID(),
     sub_id: crypto.randomBytes(8).toString('hex'),
     traffic_limit: limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0,
+    ip_limit: ipLimit,
     used_bytes: 0,
     expiry_time: expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0,
     last_seen: 0,
@@ -1584,7 +1635,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { remark, traffic_limit_gb, expiry_days } = req.body || {};
+  const { remark, traffic_limit_gb, expiry_days, ip_limit } = req.body || {};
   const cleanRemark = String(remark || '').trim();
   if (!cleanRemark) return res.status(400).json({ error: 'Remark is required' });
   if (DB.users.some((u) => u.id !== user.id && u.remark === cleanRemark)) {
@@ -1593,9 +1644,11 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
 
   const limitGB = Number(traffic_limit_gb || 0);
   const expiryDays = Number(expiry_days || 0);
+  const ipLimit = Math.max(0, Math.floor(Number(ip_limit || 0)));
 
   user.remark = cleanRemark;
   user.traffic_limit = limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0;
+  user.ip_limit = ipLimit;
   user.expiry_time = expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0;
 
   if (isUserExpired(user)) {
@@ -1742,11 +1795,24 @@ wss.on('connection', (ws, req) => {
   let udpIdleTimer = null;
   const udpState = { buffer: Buffer.alloc(0) };
   const pendingClientChunks = [];
+  let wsAlive = true;
+
+  const wsPingTimer = setInterval(() => {
+    if (closed) return;
+    if (!wsAlive) {
+      closeAll(1000, 'websocket ping timeout');
+      try { ws.terminate(); } catch (_) {}
+      return;
+    }
+    wsAlive = false;
+    try { ws.ping(); } catch (_) { closeAll(1011, 'websocket ping failed'); }
+  }, 30000);
 
   const idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), IDLE_TIMEOUT_MS);
   const connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), CONNECT_TIMEOUT_MS);
 
   function refreshIdleTimer() {
+    unregisterConnection?.touch?.();
     if (idleTimer.refresh) idleTimer.refresh();
   }
 
@@ -1755,6 +1821,7 @@ wss.on('connection', (ws, req) => {
     closed = true;
     clearTimeout(idleTimer);
     clearTimeout(connectTimer);
+    clearInterval(wsPingTimer);
     clearTimeout(udpIdleTimer);
     if (unregisterConnection) unregisterConnection();
     destroySocket(remote);
@@ -1827,7 +1894,13 @@ wss.on('connection', (ws, req) => {
       }
 
       user = request.user;
-      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason));
+      const clientIp = getClientIp(req);
+      if (!canAcceptUserIp(user, clientIp)) {
+        log('[LIMIT] IP limit exceeded:', `${user.remark} ip=${clientIp}`);
+        closeAll(1008, 'ip limit exceeded');
+        return;
+      }
+      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, kind: 'ws' });
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port}`);
 
       if (request.command === 0x03) {
@@ -1965,6 +2038,11 @@ wss.on('connection', (ws, req) => {
     }
   }
 
+  ws.on('pong', () => {
+    wsAlive = true;
+    refreshIdleTimer();
+  });
+
   ws.on('message', (data, isBinary) => {
     if (!isBinary && typeof data === 'string') {
       closeAll(1003, 'binary frames required');
@@ -1984,6 +2062,17 @@ wss.on('connection', (ws, req) => {
     setImmediate(() => handleClientData(earlyData));
   }
 });
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, map] of Array.from(activeConnections.entries())) {
+    for (const conn of Array.from(map.values())) {
+      if (now - conn.lastSeen > ACTIVE_CONNECTION_STALE_MS) {
+        try { conn.closeFn('connection stale'); } catch (_) {}
+      }
+    }
+  }
+}, 30000);
 
 setInterval(() => {
   flushTrafficBuffers();
