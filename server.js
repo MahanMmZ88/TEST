@@ -44,10 +44,9 @@ const DB_SAVE_DEBOUNCE_MS = 5000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
-const ACTIVE_CONNECTION_STALE_MS = 45 * 1000;
-const IP_LIMIT_STALE_MS = 20 * 1000;
-const ONLINE_ACTIVITY_WINDOW_MS = 2500;
-const WS_PING_INTERVAL_MS = 15 * 1000;
+const ACTIVE_CONNECTION_STALE_MS = 5000;
+const CONNECTION_CLEANUP_INTERVAL_MS = 1000;
+const WS_PING_INTERVAL_MS = 2000;
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
@@ -789,6 +788,7 @@ class XHttpSession {
     this.pendingDownlinkBytes = 0;
     this.streamInitBuffer = Buffer.alloc(0);
     this.streamQueue = Promise.resolve();
+    this.aliveTimer = null;
     this.lastActivity = Date.now();
     this.connectTimer = null;
     this.cleanupTimer = setTimeout(() => this.close('session timeout'), XHTTP_SESSION_TIMEOUT_MS);
@@ -822,6 +822,16 @@ class XHttpSession {
     if (!res.headersSent) {
       res.writeHead(200, XHTTP_RESPONSE_HEADERS);
     }
+
+    clearInterval(this.aliveTimer);
+    this.aliveTimer = setInterval(() => {
+      if (this.closed || !this.downlinkRes || this.downlinkRes.writableEnded || this.downlinkRes.destroyed) {
+        clearInterval(this.aliveTimer);
+        this.aliveTimer = null;
+        return;
+      }
+      this.unregisterConnection?.touch?.();
+    }, 1000);
 
     res.on('close', () => {
       // In packet-up mode this is the only download pipe; closing it ends the session.
@@ -1100,6 +1110,7 @@ class XHttpSession {
     clearTimeout(this.cleanupTimer);
     clearTimeout(this.connectTimer);
     clearTimeout(this.udpIdleTimer);
+    clearInterval(this.aliveTimer);
     if (this.unregisterConnection) this.unregisterConnection();
     destroySocket(this.remote);
     closeUdpSocket(this.udpSocket);
@@ -1352,18 +1363,18 @@ function requireAuth(req, res, next) {
 
 function buildUsersSnapshot() {
   return DB.users.map((user) => {
+    pruneStaleConnections(user.id, ACTIVE_CONNECTION_STALE_MS);
     const map = activeConnections.get(user.id);
-    const connections = map?.size || 0;
     const now = Date.now();
-    const recentConnections = map ? Array.from(map.values()).filter((conn) => now - Number(conn.lastDataAt || 0) <= ONLINE_ACTIVITY_WINDOW_MS) : [];
-    const recentIps = new Set(recentConnections.map((conn) => conn.ip).filter(Boolean));
+    const aliveConnections = map ? Array.from(map.values()).filter((conn) => now - Number(conn.lastSeen || 0) <= ACTIVE_CONNECTION_STALE_MS) : [];
+    const aliveIps = new Set(aliveConnections.map((conn) => conn.ip).filter(Boolean));
     return {
       ...user,
       used_bytes: getEffectiveUsedBytes(user),
       last_seen: getEffectiveLastSeen(user),
-      online: recentConnections.length > 0,
-      connections,
-      active_ips: recentIps.size
+      online: aliveConnections.length > 0,
+      connections: aliveConnections.length,
+      active_ips: aliveIps.size
     };
   });
 }
@@ -2143,10 +2154,11 @@ setInterval(() => {
     for (const conn of Array.from(map.values())) {
       if (now - conn.lastSeen > ACTIVE_CONNECTION_STALE_MS) {
         try { conn.closeFn('connection stale'); } catch (_) {}
+        removeConnection(userId, conn.id, 'stale cleaner');
       }
     }
   }
-}, 30000);
+}, CONNECTION_CLEANUP_INTERVAL_MS);
 
 setInterval(() => {
   flushTrafficBuffers();
