@@ -15,6 +15,7 @@ const app = express();
 app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide PORT automatically.
+const BUILD_ID = 'sub-ui-marker-2026-06-19-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 const DB_PATH = path.join(__dirname, 'db.json');
@@ -1579,7 +1580,7 @@ function scheduleRealtimeBroadcast() {
   }, 1000);
 }
 
-app.get('/health', (req, res) => res.type('text/plain').send('ok\n'));
+app.get('/health', (req, res) => res.type('text/plain').send(`ok - ${BUILD_ID}\n`));
 
 app.options(`${XHTTP_PATH}/*`, (req, res) => {
   res.writeHead(204, XHTTP_RESPONSE_HEADERS);
@@ -2019,6 +2020,7 @@ app.get('/sub/:sub_id', (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${remarkSafe} - Subscription</title>
+  <!-- BUILD_MARKER: ${BUILD_ID} -->
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
     :root { --gold:#d4af37; --gold2:#f3e5ab; --bg:#07070a; --line:rgba(255,255,255,.085); --muted:#8a8a94; --success:#22c55e; --danger:#ef4444; }
@@ -2520,4 +2522,8 @@ process.on('unhandledRejection', (err) => log('[ERROR] Unhandled:', err && err.s
 
 loadDB();
 server.listen(PORT, '0.0.0.0', () => {
-  log('[INFO] Mahan Panel VLESS-
+  log('[INFO] Mahan Panel VLESS-WS/XHTTP active on port', String(PORT));
+  log('[INFO] WS path:', WS_PATH);
+  log('[INFO] XHTTP path:', XHTTP_PATH);
+  log('[INFO] Default admin:', 'admin / admin');
+});
