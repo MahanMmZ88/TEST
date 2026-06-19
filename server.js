@@ -1510,8 +1510,9 @@ function buildSubSnapshot(user) {
   const remaining = unlimited ? null : Math.max(0, user.traffic_limit - used);
   const percent = unlimited ? null : Number(calcPercent(used, user.traffic_limit).toFixed(1));
   const progressWidth = unlimited ? 100 : Number(calcPercent(used, user.traffic_limit).toFixed(2));
-  const status = getUserStatus(user);
-  const unavailable = status !== 'Active';
+  const rawStatus = getUserStatus(user);
+  const unavailable = rawStatus !== 'Active';
+  const status = unavailable ? 'INACTIVE' : 'ACTIVE';
   return {
     used_bytes: used,
     used_formatted: formatBytes(used),
@@ -1526,8 +1527,8 @@ function buildSubSnapshot(user) {
     percent_label: unlimited ? '∞' : `${percent}%`,
     progress_width: progressWidth,
     is_danger: unavailable || (!unlimited && user.traffic_limit > 0 && (used / user.traffic_limit) > 0.9),
-    expired: status === 'Expired',
-    inactive: status === 'Inactive',
+    expired: rawStatus === 'Expired',
+    inactive: rawStatus === 'Inactive',
     status,
     status_class: unavailable ? 'expired' : 'active',
     ring_theme: unavailable ? 'red' : (unlimited ? 'green' : 'gold'),
@@ -1995,8 +1996,9 @@ app.get('/sub/:sub_id', (req, res) => {
   const numericPercent = unlimitedTraffic ? null : Number(calcPercent(effectiveUsed, user.traffic_limit).toFixed(1));
   const percent = unlimitedTraffic ? '∞' : numericPercent.toFixed(1);
   const progressWidth = unlimitedTraffic ? '100.00' : calcPercent(effectiveUsed, user.traffic_limit).toFixed(2);
-  const statusText = getUserStatus(user);
-  const expired = statusText !== 'Active';
+  const rawStatusText = getUserStatus(user);
+  const expired = rawStatusText !== 'Active';
+  const statusText = expired ? 'INACTIVE' : 'ACTIVE';
   const isDanger = expired || (!unlimitedTraffic && user.traffic_limit > 0 && (effectiveUsed / user.traffic_limit) > 0.9);
   const expiryStr = user.expiry_time === 0 ? 'Never' : formatTehranDate(user.expiry_time);
   const lastSeenStr = effectiveLastSeen === 0 ? 'Never' : formatTehranDate(effectiveLastSeen);
@@ -2091,9 +2093,9 @@ app.get('/sub/:sub_id', (req, res) => {
           <div class="kicker">Subscription</div>
           <h1>${remarkSafe}</h1>
           <p class="desc">VLESS subscription with realtime usage, QR import options, upload/download details and transport information.</p>
-          <div class="chips"><span class="chip ${expired ? '' : 'ok'}">${statusText}</span><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
+          <div class="chips"><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
         </div>
-        <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${expired ? statusText : 'Ready'}</div></div>
+        <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${statusText}</div></div>
       </div>
       <div class="main-grid">
         <section class="panel">
@@ -2109,14 +2111,14 @@ app.get('/sub/:sub_id', (req, res) => {
         </section>
         <section class="panel">
           <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div>
-          <div class="qr-stage"><div class="qr"><img id="qrImage" alt="QR Code" src="${qrBase}/xhttp"></div><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" id="showQrBtn" onclick="showFullQr(ACTIVE_QR)">Show QR</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
+          <div class="qr-stage"><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" id="showQrBtn" onclick="showFullQr(ACTIVE_QR)">Show QR</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
           <button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button>
           <p class="guide">VPN clients receive both configs automatically. Browser users see this page.</p>
         </section>
       </div>
     </section>
   </main><div class="qr-full" id="qrFull" onclick="hideFullQr(event)"><div class="qr-full-card"><h2 id="qrFullTitle" style="margin-bottom:16px;color:#d4af37">QR Code</h2><div class="qr"><img id="qrFullImg" alt="Full QR"></div><button class="btn primary" onclick="downloadQr()">Download QR</button><button class="btn dark" onclick="document.getElementById('qrFull').style.display='none'">Close</button></div></div>
-  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});document.getElementById('qrImage').src=QR_BASE+'/'+t+'?ts='+Date.now();var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function showFullQr(t){setQrTab(t);document.getElementById('qrFullTitle').textContent=(t==='xhttp'?'XHTTP':(t==='ws'?'WebSocket':'Subscription'))+' QR';document.getElementById('qrFullImg').src=QR_BASE+'/'+t+'?ts='+Date.now();document.getElementById('qrFull').style.display='flex'}function hideFullQr(e){if(e.target.id==='qrFull')e.currentTarget.style.display='none'}function downloadQr(){var src=(document.getElementById('qrFull').style.display==='flex'?document.getElementById('qrFullImg').src:document.getElementById('qrImage').src);var c=document.createElement('canvas');c.width=900;c.height=900;var x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);var i=new Image();i.onload=function(){x.drawImage(i,40,40,820,820);var a=document.createElement('a');a.href=c.toDataURL('image/jpeg',0.92);a.download='qr-'+ACTIVE_QR+'.jpg';a.click()};i.src=src}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent_label||((d.percent||0)+'%');var deg=d.unlimited&&!d.is_danger?360:(Number(d.percent)||0)*3.6;if(d.is_danger)deg=360;var color=d.is_danger?'#ef4444':(d.unlimited?'#22c55e':'var(--gold)');document.getElementById('usageRing').style.background='conic-gradient('+color+' 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':(d.unlimited?'greenfill':''));var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+d.status_class;var p=document.getElementById('statusPill');p.textContent=d.status==='Active'?'Ready':d.status;p.className='status-pill '+(d.status==='Active'?'':'expired');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
+  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function showFullQr(t){setQrTab(t);document.getElementById('qrFullTitle').textContent=(t==='xhttp'?'XHTTP':(t==='ws'?'WebSocket':'Subscription'))+' QR';document.getElementById('qrFullImg').src=QR_BASE+'/'+t+'?ts='+Date.now();document.getElementById('qrFull').style.display='flex'}function hideFullQr(e){if(e.target.id==='qrFull')e.currentTarget.style.display='none'}function downloadQr(){var src=(document.getElementById('qrFull').style.display==='flex'?document.getElementById('qrFullImg').src:(QR_BASE+'/'+ACTIVE_QR));var c=document.createElement('canvas');c.width=900;c.height=900;var x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);var i=new Image();i.onload=function(){x.drawImage(i,40,40,820,820);var a=document.createElement('a');a.href=c.toDataURL('image/jpeg',0.92);a.download='qr-'+ACTIVE_QR+'.jpg';a.click()};i.src=src}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent_label||((d.percent||0)+'%');var deg=d.unlimited&&!d.is_danger?360:(Number(d.percent)||0)*3.6;if(d.is_danger)deg=360;var color=d.is_danger?'#ef4444':(d.unlimited?'#22c55e':'var(--gold)');document.getElementById('usageRing').style.background='conic-gradient('+color+' 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':(d.unlimited?'greenfill':''));var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+d.status_class;var p=document.getElementById('statusPill');p.textContent=d.status;p.className='status-pill '+(d.status==='ACTIVE'?'':'expired');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
 });
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
