@@ -341,13 +341,23 @@ function getActiveSessionCount(userId) {
   return activeConnections.get(userId)?.size || 0;
 }
 
-function canAcceptUserSession(user) {
+function getActiveClientSlotSet(userId) {
+  pruneStaleConnections(userId, ACTIVE_CONNECTION_STALE_MS);
+  const map = activeConnections.get(userId);
+  if (!map) return new Set();
+  return new Set(Array.from(map.values()).map((conn) => conn.clientKey || conn.ip || conn.id).filter(Boolean));
+}
+
+function canAcceptUserSession(user, clientKey) {
   const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
 
-  // Remove truly stale sessions first. If the limit is still full, reject the new
-  // connection without disconnecting existing active users.
-  return getActiveSessionCount(user.id) < limit;
+  // Client Limit is based on active client slots, not raw sockets.
+  // A single real client may open multiple WS/XHTTP sessions; if they share the
+  // same clientKey, they count as one slot. A new clientKey is rejected when the
+  // slot limit is full, without disconnecting existing active clients.
+  const slots = getActiveClientSlotSet(user.id);
+  return slots.has(clientKey) || slots.size < limit;
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -357,6 +367,7 @@ function registerConnection(userId, closeFn, meta = {}) {
   const conn = {
     id,
     ip: String(meta.ip || 'unknown'),
+    clientKey: String(meta.clientKey || meta.ip || 'unknown'),
     kind: String(meta.kind || 'unknown'),
     closeFn,
     createdAt: Date.now(),
@@ -914,11 +925,11 @@ class XHttpSession {
 
     this.user = request.user;
     this.version = request.version;
-    if (!canAcceptUserSession(this.user)) {
-      this.close('connection limit exceeded');
-      throw new Error('connection limit exceeded');
+    if (!canAcceptUserSession(this.user, this.clientIp)) {
+      this.close('client limit exceeded');
+      throw new Error('client limit exceeded');
     }
-    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, kind: 'xhttp' });
+    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientIp, kind: 'xhttp' });
     log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId}`);
 
     if (request.command === 0x03) {
@@ -1368,13 +1379,15 @@ function buildUsersSnapshot() {
     const now = Date.now();
     const aliveConnections = map ? Array.from(map.values()).filter((conn) => now - Number(conn.lastSeen || 0) <= ACTIVE_CONNECTION_STALE_MS) : [];
     const aliveIps = new Set(aliveConnections.map((conn) => conn.ip).filter(Boolean));
+    const aliveClientSlots = new Set(aliveConnections.map((conn) => conn.clientKey || conn.ip).filter(Boolean));
     return {
       ...user,
       used_bytes: getEffectiveUsedBytes(user),
       last_seen: getEffectiveLastSeen(user),
       online: aliveConnections.length > 0,
       connections: aliveConnections.length,
-      active_ips: aliveIps.size
+      active_ips: aliveIps.size,
+      active_clients: aliveClientSlots.size
     };
   });
 }
@@ -1980,12 +1993,12 @@ wss.on('connection', (ws, req) => {
 
       user = request.user;
       const clientIp = getClientIp(req);
-      if (!canAcceptUserSession(user)) {
-        log('[LIMIT] Connection limit exceeded:', `${user.remark} ip=${clientIp}`);
-        closeAll(1008, 'connection limit exceeded');
+      if (!canAcceptUserSession(user, clientIp)) {
+        log('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
+        closeAll(1008, 'client limit exceeded');
         return;
       }
-      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, kind: 'ws' });
+      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey: clientIp, kind: 'ws' });
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port}`);
 
       if (request.command === 0x03) {
