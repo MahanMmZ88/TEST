@@ -46,6 +46,7 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
 const ACTIVE_CONNECTION_STALE_MS = 5000;
 const CONNECTION_CLEANUP_INTERVAL_MS = 1000;
+const CLIENT_SLOT_TTL_MS = 30000;
 const WS_PING_INTERVAL_MS = 2000;
 
 let DB = { admin: null, users: [] };
@@ -61,7 +62,8 @@ let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
-const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, kind, closeFn, lastSeen })
+const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clientKey, kind, closeFn, lastSeen })
+const clientSlots = new Map(); // user.id -> Map(clientKey, { firstSeen, lastSeen })
 const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
 let realtimeBroadcastTimer = null;
@@ -308,9 +310,13 @@ function getActiveUserByUuid(uuidBytes) {
 function removeConnection(userId, connectionId, reason = 'removed') {
   const map = activeConnections.get(userId);
   if (!map) return false;
+  const conn = map.get(connectionId);
   const existed = map.delete(connectionId);
   if (map.size === 0) activeConnections.delete(userId);
-  if (existed) scheduleRealtimeBroadcast();
+  if (existed) {
+    releaseClientSlotIfUnused(userId, conn?.clientKey);
+    scheduleRealtimeBroadcast();
+  }
   return existed;
 }
 
@@ -341,23 +347,57 @@ function getActiveSessionCount(userId) {
   return activeConnections.get(userId)?.size || 0;
 }
 
-function getActiveClientSlotSet(userId) {
-  pruneStaleConnections(userId, ACTIVE_CONNECTION_STALE_MS);
-  const map = activeConnections.get(userId);
-  if (!map) return new Set();
-  return new Set(Array.from(map.values()).map((conn) => conn.clientKey || conn.ip || conn.id).filter(Boolean));
+function pruneClientSlots(userId) {
+  const slots = clientSlots.get(userId);
+  if (!slots) return 0;
+  const now = Date.now();
+  let removed = 0;
+  for (const [key, slot] of Array.from(slots.entries())) {
+    if (now - Number(slot.lastSeen || 0) > CLIENT_SLOT_TTL_MS) {
+      slots.delete(key);
+      removed += 1;
+    }
+  }
+  if (slots.size === 0) clientSlots.delete(userId);
+  return removed;
+}
+
+function getClientSlotCount(userId) {
+  pruneClientSlots(userId);
+  return clientSlots.get(userId)?.size || 0;
 }
 
 function canAcceptUserSession(user, clientKey) {
   const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
 
-  // Client Limit is based on active client slots, not raw sockets.
-  // A single real client may open multiple WS/XHTTP sessions; if they share the
-  // same clientKey, they count as one slot. A new clientKey is rejected when the
-  // slot limit is full, without disconnecting existing active clients.
-  const slots = getActiveClientSlotSet(user.id);
-  return slots.has(clientKey) || slots.size < limit;
+  pruneStaleConnections(user.id, ACTIVE_CONNECTION_STALE_MS);
+  pruneClientSlots(user.id);
+
+  const slots = clientSlots.get(user.id);
+  if (slots?.has(clientKey)) return true;
+  return (slots?.size || 0) < limit;
+}
+
+function acquireClientSlot(userId, clientKey) {
+  if (!clientKey) return;
+  if (!clientSlots.has(userId)) clientSlots.set(userId, new Map());
+  const slots = clientSlots.get(userId);
+  const now = Date.now();
+  const existing = slots.get(clientKey);
+  slots.set(clientKey, { firstSeen: existing?.firstSeen || now, lastSeen: now });
+  scheduleRealtimeBroadcast();
+}
+
+function releaseClientSlotIfUnused(userId, clientKey) {
+  if (!clientKey) return;
+  const active = activeConnections.get(userId);
+  const stillUsed = active && Array.from(active.values()).some((conn) => conn.clientKey === clientKey);
+  if (stillUsed) return;
+  const slots = clientSlots.get(userId);
+  if (!slots) return;
+  if (slots.delete(clientKey)) scheduleRealtimeBroadcast();
+  if (slots.size === 0) clientSlots.delete(userId);
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -375,6 +415,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     lastDataAt: 0
   };
   map.set(id, conn);
+  acquireClientSlot(userId, conn.clientKey);
   scheduleRealtimeBroadcast();
 
   const unregister = () => {
@@ -415,6 +456,7 @@ function forceClearUserConnections(userId, reason = 'connections cleared') {
     }
   }
   activeConnections.delete(userId);
+  clientSlots.delete(userId);
   scheduleRealtimeBroadcast();
 }
 
@@ -1375,19 +1417,13 @@ function requireAuth(req, res, next) {
 function buildUsersSnapshot() {
   return DB.users.map((user) => {
     pruneStaleConnections(user.id, ACTIVE_CONNECTION_STALE_MS);
-    const map = activeConnections.get(user.id);
-    const now = Date.now();
-    const aliveConnections = map ? Array.from(map.values()).filter((conn) => now - Number(conn.lastSeen || 0) <= ACTIVE_CONNECTION_STALE_MS) : [];
-    const aliveIps = new Set(aliveConnections.map((conn) => conn.ip).filter(Boolean));
-    const aliveClientSlots = new Set(aliveConnections.map((conn) => conn.clientKey || conn.ip).filter(Boolean));
+    pruneClientSlots(user.id);
     return {
       ...user,
       used_bytes: getEffectiveUsedBytes(user),
       last_seen: getEffectiveLastSeen(user),
-      online: aliveConnections.length > 0,
-      connections: aliveConnections.length,
-      active_ips: aliveIps.size,
-      active_clients: aliveClientSlots.size
+      connections: activeConnections.get(user.id)?.size || 0,
+      active_clients: getClientSlotCount(user.id)
     };
   });
 }
@@ -1395,7 +1431,8 @@ function buildUsersSnapshot() {
 function buildStatsSnapshot() {
   const memory = process.memoryUsage();
   const totalTraffic = DB.users.reduce((sum, u) => sum + getEffectiveUsedBytes(u), 0);
-  const activeConnectionCount = Array.from(activeConnections.values()).reduce((sum, map) => sum + map.size, 0);
+  let activeClientCount = 0;
+  for (const user of DB.users) activeClientCount += getClientSlotCount(user.id);
   return {
     ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
     cpu_usage: getCpuUsagePercent(),
@@ -1403,8 +1440,9 @@ function buildStatsSnapshot() {
     total_traffic: totalTraffic,
     users_count: DB.users.length,
     active_count: DB.users.filter((u) => u.is_active === 1 && !isUserExpiredEffective(u)).length,
-    online_users: activeConnections.size,
-    ws_connections: activeConnectionCount,
+    active_clients: activeClientCount,
+    online_users: activeClientCount,
+    ws_connections: Array.from(activeConnections.values()).reduce((sum, map) => sum + map.size, 0),
     xhttp_sessions: xhttpSessions.size,
     traffic_chart: getTrafficChart()
   };
@@ -2170,7 +2208,9 @@ setInterval(() => {
         removeConnection(userId, conn.id, 'stale cleaner');
       }
     }
+    pruneClientSlots(userId);
   }
+  for (const userId of Array.from(clientSlots.keys())) pruneClientSlots(userId);
 }, CONNECTION_CLEANUP_INTERVAL_MS);
 
 setInterval(() => {
