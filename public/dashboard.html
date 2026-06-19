@@ -251,8 +251,8 @@
         <input type="number" id="limitInput" placeholder="e.g. 50" value="0">
         <label>Expiry (Days) - 0 for Never</label>
         <input type="number" id="expiryInput" placeholder="e.g. 30" value="0">
-        <label>IP Limit - 0 for Unlimited</label>
-        <input type="number" id="ipLimitInput" placeholder="e.g. 1" value="0">
+        <label>Connection Limit - 0 for Unlimited</label>
+        <input type="number" id="connectionLimitInput" placeholder="e.g. 3" value="0">
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeModal()">Cancel</button>
             <button class="btn-gold" onclick="addUser()">Create</button>
@@ -301,8 +301,8 @@
         <input type="number" id="editLimitInput" placeholder="e.g. 50" value="0" step="0.01">
         <label>New Expiry From Today (Days) - 0 for Never</label>
         <input type="number" id="editExpiryInput" placeholder="e.g. 30" value="0">
-        <label>IP Limit - 0 for Unlimited</label>
-        <input type="number" id="editIpLimitInput" placeholder="e.g. 1" value="0">
+        <label>Connection Limit - 0 for Unlimited</label>
+        <input type="number" id="editConnectionLimitInput" placeholder="e.g. 3" value="0">
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeEditModal()">Cancel</button>
             <button class="btn-gold" onclick="saveEditUser()">Save</button>
@@ -701,7 +701,7 @@
             daysLeft = Math.max(1, Math.ceil((user.expiry_time - Date.now()) / (1000 * 60 * 60 * 24)));
         }
         document.getElementById('editExpiryInput').value = daysLeft;
-        document.getElementById('editIpLimitInput').value = user.ip_limit || 0;
+        document.getElementById('editConnectionLimitInput').value = user.connection_limit || user.ip_limit || 0;
 
         var m = document.getElementById('editModal');
         m.style.display = 'flex';
@@ -719,7 +719,7 @@
         var remark = document.getElementById('editRemarkInput').value;
         var traffic_limit_gb = document.getElementById('editLimitInput').value;
         var expiry_days = document.getElementById('editExpiryInput').value;
-        var ip_limit = document.getElementById('editIpLimitInput').value;
+        var connection_limit = document.getElementById('editConnectionLimitInput').value;
         var btn = document.querySelector('#editModal .btn-gold');
         btn.textContent = 'Saving...';
 
@@ -727,7 +727,7 @@
             var res = await fetch('/api/users/' + id, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ remark: remark, traffic_limit_gb: traffic_limit_gb, expiry_days: expiry_days, ip_limit: ip_limit })
+                body: JSON.stringify({ remark: remark, traffic_limit_gb: traffic_limit_gb, expiry_days: expiry_days, connection_limit: connection_limit })
             });
             var data = await res.json();
             btn.textContent = 'Save';
@@ -748,7 +748,7 @@
         var remark = document.getElementById('remarkInput').value;
         var traffic_limit_gb = document.getElementById('limitInput').value;
         var expiry_days = document.getElementById('expiryInput').value;
-        var ip_limit = document.getElementById('ipLimitInput').value;
+        var connection_limit = document.getElementById('connectionLimitInput').value;
         var btn = document.querySelector('.modal-content .btn-gold');
         btn.textContent = 'Processing...';
 
@@ -756,7 +756,7 @@
             var res = await fetch('/api/users', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ remark: remark, traffic_limit_gb: traffic_limit_gb, expiry_days: expiry_days, ip_limit: ip_limit })
+                body: JSON.stringify({ remark: remark, traffic_limit_gb: traffic_limit_gb, expiry_days: expiry_days, connection_limit: connection_limit })
             });
             var data = await res.json();
             btn.textContent = 'Create';
