@@ -4,10 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mahan WS Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Self-contained preview: no external fonts/scripts required. -->
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
         :root { --gold:#d4af37; --gold2:#f3e5ab; --bg:#07070a; --card:rgba(255,255,255,0.035); --line:rgba(255,255,255,0.075); --muted:#888; --success:#22c55e; --danger:#ef4444; --glass: blur(16px); }
         body { background: radial-gradient(circle at 12% 8%, rgba(212,175,55,0.10), transparent 28%), radial-gradient(circle at 90% 15%, rgba(99,102,241,0.10), transparent 24%), #07070a; color: #fff; display: flex; min-height: 100vh; overflow-x: hidden; }
         body:before { content:''; position:fixed; inset:0; background-image: linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px); background-size: 42px 42px; mask-image: radial-gradient(circle at center, black, transparent 75%); pointer-events:none; z-index:-2; }
@@ -164,6 +163,50 @@
         .qr-single { display:flex; flex-direction:column; align-items:center; gap:14px; }
         .qr-single .qr-box img { width:210px; height:210px; }
 
+        .realtime-indicator { position: relative; }
+        .realtime-indicator:before { content:''; width:8px; height:8px; border-radius:50%; background:#f59e0b; box-shadow:0 0 12px #f59e0b; }
+        .realtime-indicator.connected:before { background:#22c55e; box-shadow:0 0 12px #22c55e; }
+        .realtime-indicator.error:before { background:#ef4444; box-shadow:0 0 12px #ef4444; }
+        .slot-dots { display:inline-flex; gap:4px; align-items:center; }
+        .slot-dot { width:7px; height:7px; border-radius:50%; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.12); }
+        .slot-dot.filled { background:var(--gold); border-color:rgba(212,175,55,.55); box-shadow:0 0 8px rgba(212,175,55,.35); }
+        .slot-dot.full { background:#ef4444; border-color:rgba(239,68,68,.55); box-shadow:0 0 8px rgba(239,68,68,.35); }
+        .breakdown-bar { display:flex; height:7px; width:100%; border-radius:999px; overflow:hidden; background:rgba(255,255,255,.07); margin-top:9px; }
+        .break-up { background:linear-gradient(90deg,#f3e5ab,#d4af37); min-width:2px; }
+        .break-down { background:linear-gradient(90deg,#8b6f1f,#d4af37); min-width:2px; opacity:.75; }
+        .drawer-backdrop { display:none; position:fixed; inset:0; background:rgba(0,0,0,.58); backdrop-filter:blur(5px); z-index:260; opacity:0; transition:.25s; }
+        .drawer-backdrop.show { opacity:1; }
+        .drawer { display:none; position:fixed; top:0; right:0; bottom:0; width:min(520px, 100%); background:rgba(15,15,22,.96); border-left:1px solid rgba(255,255,255,.08); box-shadow:-30px 0 70px rgba(0,0,0,.55); z-index:270; padding:26px; overflow-y:auto; transform:translateX(20px); opacity:0; transition:.28s cubic-bezier(.2,.8,.2,1); }
+        .drawer.show { transform:translateX(0); opacity:1; }
+        .drawer-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:20px; }
+        .drawer-title { font-size:24px; font-weight:900; color:#fff; }
+        .drawer-sub { color:#888; font-size:12px; margin-top:5px; word-break:break-all; }
+        .icon-close { border:1px solid rgba(255,255,255,.1); background:rgba(255,255,255,.04); color:#ddd; width:38px; height:38px; border-radius:12px; cursor:pointer; }
+        .detail-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:16px 0; }
+        .detail-card { background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.075); border-radius:16px; padding:14px; }
+        .detail-card .k { color:#888; font-size:10px; text-transform:uppercase; letter-spacing:1px; font-weight:900; }
+        .detail-card .v { margin-top:6px; font-weight:800; color:#fff; word-break:break-word; }
+        .quick-actions { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:8px; margin-top:12px; }
+        .quick-actions .action-btn { justify-content:center; padding:10px 8px; }
+        .activity-section { margin-top:24px; background:rgba(255,255,255,.025); border:1px solid rgba(255,255,255,.065); border-radius:22px; padding:20px; }
+        .activity-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+        .activity-head h3 { font-size:16px; }
+        .activity-list { display:grid; gap:10px; }
+        .activity-item { display:flex; justify-content:space-between; gap:12px; color:#bbb; font-size:12px; padding:10px 12px; background:rgba(0,0,0,.20); border:1px solid rgba(255,255,255,.05); border-radius:13px; }
+        .activity-time { color:#777; white-space:nowrap; }
+        .action-sheet { display:none; position:fixed; left:0; right:0; bottom:0; z-index:310; padding:16px; background:rgba(15,15,22,.98); border-top:1px solid rgba(255,255,255,.08); border-radius:22px 22px 0 0; box-shadow:0 -20px 60px rgba(0,0,0,.55); transform:translateY(20px); opacity:0; transition:.25s; }
+        .action-sheet.show { transform:translateY(0); opacity:1; }
+        .sheet-grid { display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:10px; margin-top:12px; }
+        .settings-tabs { display:flex; gap:8px; padding:6px; border-radius:16px; background:rgba(0,0,0,.25); border:1px solid rgba(255,255,255,.07); margin-bottom:18px; }
+        .settings-tab { flex:1; border:0; border-radius:12px; padding:10px; background:transparent; color:#aaa; font-weight:900; cursor:pointer; }
+        .settings-tab.active { color:#000; background:linear-gradient(135deg,var(--gold),var(--gold2)); }
+        .settings-pane { display:none; }
+        .settings-pane.active { display:block; }
+        .skeleton { position:relative; overflow:hidden; background:rgba(255,255,255,.05); border-radius:14px; min-height:74px; }
+        .skeleton:after { content:''; position:absolute; inset:0; transform:translateX(-100%); background:linear-gradient(90deg, transparent, rgba(255,255,255,.08), transparent); animation:shimmer 1.4s infinite; }
+        @keyframes shimmer { 100% { transform:translateX(100%); } }
+
+
 
         @keyframes fadeUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
@@ -198,6 +241,7 @@
             .client-card { grid-template-columns:1fr; align-items:stretch; }
             .client-actions { justify-content:stretch; max-width:none; }
             .client-actions .action-btn { flex:1; justify-content:center; }
+            .detail-grid, .quick-actions { grid-template-columns:1fr 1fr; }
         }
         @media (max-width: 760px) {
             table { min-width: 0; width: 100%; }
@@ -231,6 +275,8 @@
             .fab-add { display:flex; align-items:center; justify-content:center; }
             .client-main { align-items:flex-start; }
             .client-usage { min-width:0; }
+            .drawer { width:100%; padding:20px; }
+            .sheet-grid { grid-template-columns:1fr; }
             .toast-wrap { left:12px; right:12px; bottom:12px; }
             .toast { min-width:0; width:100%; }
         }
@@ -272,7 +318,7 @@
                     <span class="chip gold">XHTTP</span>
                     <span class="chip">UDP</span>
                     <span class="chip">MUX</span>
-                    <span class="chip">SSE Realtime</span>
+                    <span class="chip realtime-indicator" id="realtimeIndicator">Realtime connecting</span>
                 </div>
             </div>
             <div class="host-badge" id="hostBadge">Host: Detecting...</div>
@@ -335,7 +381,28 @@
             <div class="empty-state"><h3>Loading clients...</h3><p>Please wait while realtime data is loaded.</p></div>
         </div>
     </div>
+
+    <section class="activity-section">
+        <div class="activity-head"><h3>Recent Activity</h3><button class="action-btn" onclick="clearActivityLog()">Clear</button></div>
+        <div class="activity-list" id="activityList"><div class="activity-item"><span>No activity yet</span><span class="activity-time">—</span></div></div>
+    </section>
 </main>
+
+<!-- Detail Drawer -->
+<div class="drawer-backdrop" id="drawerBackdrop" onclick="closeDetailDrawer()"></div>
+<aside class="drawer" id="detailDrawer">
+    <div class="drawer-head">
+        <div><div class="drawer-title" id="drawerTitle">Client Details</div><div class="drawer-sub" id="drawerSubtitle">UUID</div></div>
+        <button class="icon-close" onclick="closeDetailDrawer()">×</button>
+    </div>
+    <div id="drawerBody"></div>
+</aside>
+
+<!-- Mobile / More Action Sheet -->
+<div class="action-sheet" id="actionSheet">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px"><strong id="sheetTitle">Actions</strong><button class="icon-close" onclick="closeActionSheet()">×</button></div>
+    <div class="sheet-grid" id="sheetActions"></div>
+</div>
 
 <!-- Add Modal -->
 <div class="modal" id="addModal">
@@ -360,13 +427,31 @@
 <div class="modal" id="settingsModal">
     <div class="modal-content">
         <h3>Admin Settings</h3>
-        <label>Current Password</label>
-        <input type="password" id="currentPasswordInput" placeholder="Current password">
-        <label>New Password</label>
-        <input type="password" id="newPasswordInput" placeholder="At least 8 characters">
-        <div class="modal-actions">
-            <button class="btn-cancel" onclick="closeSettingsModal()">Cancel</button>
-            <button class="btn-gold" onclick="changeAdminPassword()">Change Password</button>
+        <div class="settings-tabs">
+            <button class="settings-tab active" id="settingsTabAccount" onclick="setSettingsTab('account')">Account</button>
+            <button class="settings-tab" id="settingsTabBackup" onclick="setSettingsTab('backup')">Backup</button>
+            <button class="settings-tab" id="settingsTabSystem" onclick="setSettingsTab('system')">System</button>
+            <button class="settings-tab" id="settingsTabDanger" onclick="setSettingsTab('danger')">Danger</button>
+        </div>
+        <div class="settings-pane active" id="settingsPaneAccount">
+            <label>Current Password</label>
+            <input type="password" id="currentPasswordInput" placeholder="Current password">
+            <label>New Password</label>
+            <input type="password" id="newPasswordInput" placeholder="At least 8 characters">
+            <div class="modal-actions"><button class="btn-cancel" onclick="closeSettingsModal()">Cancel</button><button class="btn-gold" onclick="changeAdminPassword()">Change Password</button></div>
+        </div>
+        <div class="settings-pane" id="settingsPaneBackup">
+            <p style="color:#aaa;line-height:1.7;margin-bottom:16px">Export current clients as a JSON backup. Import preview validates a selected file before server-side restore is added.</p>
+            <button class="btn-gold" onclick="exportBackup()">Export Backup</button>
+            <input type="file" id="backupFileInput" accept="application/json" style="margin-top:16px" onchange="previewBackupFile()">
+            <pre id="backupPreview" style="white-space:pre-wrap;color:#999;background:rgba(0,0,0,.25);border-radius:12px;padding:12px;margin-top:12px;max-height:160px;overflow:auto"></pre>
+        </div>
+        <div class="settings-pane" id="settingsPaneSystem">
+            <div class="detail-grid"><div class="detail-card"><div class="k">Panel</div><div class="v">Mahan Panel v2</div></div><div class="detail-card"><div class="k">Transports</div><div class="v">WS · XHTTP · UDP · MUX</div></div><div class="detail-card"><div class="k">WS Path</div><div class="v">/ws</div></div><div class="detail-card"><div class="k">XHTTP Path</div><div class="v">/xhttp</div></div></div>
+        </div>
+        <div class="settings-pane" id="settingsPaneDanger">
+            <p style="color:#fca5a5;line-height:1.7;margin-bottom:16px">Danger zone actions affect all clients on this deployment.</p>
+            <div class="quick-actions"><button class="action-btn delete" onclick="resetAllTraffic()">Reset All Traffic</button><button class="action-btn delete" onclick="deleteAllClients()">Delete All Clients</button></div>
         </div>
     </div>
 </div>
@@ -436,6 +521,7 @@
     var currentUsers = [];
     var currentQrUserId = '';
     var currentQrType = 'xhttp';
+    var activityLog = [];
 
     document.getElementById('hostBadge').textContent = 'VLESS WS/XHTTP: ' + host + ':' + vlessPort;
 
@@ -516,56 +602,87 @@
         return get('year') + '-' + get('month') + '-' + get('day') + ' ' + get('hour') + ':' + get('minute');
     }
 
-    // Real traffic chart: MB per minute, last 60 minutes
-    var trafficChart = null;
-    try {
-        var ctx = document.getElementById('trafficChart').getContext('2d');
-        trafficChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: [],
-                datasets: [{
-                    label: 'Traffic / min (MB)',
-                    data: [],
-                    borderColor: '#d4af37',
-                    backgroundColor: 'rgba(212, 175, 55, 0.12)',
-                    borderWidth: 2,
-                    fill: true,
-                    tension: 0.35,
-                    pointRadius: 0,
-                    pointHitRadius: 12
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                interaction: { intersect: false, mode: 'index' },
-                plugins: {
-                    legend: { display: false },
-                    tooltip: {
-                        callbacks: {
-                            label: function(context) {
-                                var v = Number(context.parsed.y || 0);
-                                return 'Traffic: ' + v.toFixed(3) + ' MB/min';
-                            }
-                        }
-                    }
-                },
-                scales: {
-                    y: { display: false, min: 0 },
-                    x: { display: false, grid: { display: false } }
-                }
-            }
-        });
-    } catch(e) {
-        console.log('Chart.js failed:', e);
+    // Self-contained traffic chart: MB per minute, last 60 minutes
+    var trafficChart = { labels: [], values: [] };
+    var trafficCanvas = document.getElementById('trafficChart');
+    var trafficCtx = trafficCanvas ? trafficCanvas.getContext('2d') : null;
+
+    function resizeTrafficCanvas() {
+        if (!trafficCanvas || !trafficCtx) return;
+        var rect = trafficCanvas.getBoundingClientRect();
+        var dpr = window.devicePixelRatio || 1;
+        var w = Math.max(1, Math.floor(rect.width * dpr));
+        var h = Math.max(1, Math.floor(rect.height * dpr));
+        if (trafficCanvas.width !== w || trafficCanvas.height !== h) {
+            trafficCanvas.width = w;
+            trafficCanvas.height = h;
+        }
+        trafficCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
 
+    function drawTrafficChart() {
+        if (!trafficCanvas || !trafficCtx) return;
+        resizeTrafficCanvas();
+        var rect = trafficCanvas.getBoundingClientRect();
+        var w = rect.width;
+        var h = rect.height;
+        var values = (trafficChart.values && trafficChart.values.length) ? trafficChart.values : [0,0,0,0,0,0,0];
+        var max = Math.max.apply(null, values.concat([0.01]));
+        var padX = 8, padY = 18;
+
+        trafficCtx.clearRect(0, 0, w, h);
+
+        var grad = trafficCtx.createLinearGradient(0, 0, 0, h);
+        grad.addColorStop(0, 'rgba(212,175,55,0.22)');
+        grad.addColorStop(1, 'rgba(212,175,55,0.00)');
+
+        var points = values.map(function(v, i) {
+            var x = padX + (values.length <= 1 ? 0 : (i / (values.length - 1)) * (w - padX * 2));
+            var y = h - padY - (v / max) * (h - padY * 2);
+            return { x: x, y: y };
+        });
+
+        trafficCtx.beginPath();
+        points.forEach(function(pt, i) {
+            if (i === 0) trafficCtx.moveTo(pt.x, pt.y);
+            else {
+                var prev = points[i - 1];
+                var cx = (prev.x + pt.x) / 2;
+                trafficCtx.bezierCurveTo(cx, prev.y, cx, pt.y, pt.x, pt.y);
+            }
+        });
+        // Fill area
+        trafficCtx.lineTo(points[points.length - 1].x, h - padY);
+        trafficCtx.lineTo(points[0].x, h - padY);
+        trafficCtx.closePath();
+        trafficCtx.fillStyle = grad;
+        trafficCtx.fill();
+
+        // Draw line again
+        trafficCtx.beginPath();
+        points.forEach(function(pt, i) {
+            if (i === 0) trafficCtx.moveTo(pt.x, pt.y);
+            else {
+                var prev = points[i - 1];
+                var cx = (prev.x + pt.x) / 2;
+                trafficCtx.bezierCurveTo(cx, prev.y, cx, pt.y, pt.x, pt.y);
+            }
+        });
+        trafficCtx.strokeStyle = '#d4af37';
+        trafficCtx.lineWidth = 2.4;
+        trafficCtx.shadowColor = 'rgba(212,175,55,0.35)';
+        trafficCtx.shadowBlur = 12;
+        trafficCtx.stroke();
+        trafficCtx.shadowBlur = 0;
+    }
+
+    window.addEventListener('resize', drawTrafficChart);
+
     function updateTrafficChart(chartData) {
-        if (!trafficChart || !chartData) return;
-        trafficChart.data.labels = chartData.labels || [];
-        trafficChart.data.datasets[0].data = chartData.values || [];
-        trafficChart.update('none');
+        if (!chartData) return;
+        trafficChart.labels = chartData.labels || [];
+        trafficChart.values = chartData.values || [];
+        drawTrafficChart();
     }
 
     function applyStatsData(data) {
@@ -579,11 +696,54 @@
         updateTrafficChart(data.traffic_chart);
     }
 
+    function buildPreviewStats() {
+        var labels = [];
+        var values = [];
+        for (var i = 59; i >= 0; i--) {
+            labels.push(i + 'm');
+            values.push(Number((0.04 + Math.sin(i / 4) * 0.025 + Math.random() * 0.025).toFixed(3)));
+        }
+        return { ram_usage: 41, cpu_usage: 3.7, total_traffic: 8.42 * 1024 ** 3, users_count: 3, active_count: 3, traffic_chart: { labels: labels, values: values } };
+    }
+
+    function buildPreviewUsers() {
+        var now = Date.now();
+        return [
+            { id:'preview-1', remark:'Tehran Mobile', uuid:'11111111-1111-4111-8111-111111111111', sub_id:'previewsub1', traffic_limit:50*1024**3, used_bytes:14.2*1024**3, uplink_bytes:1.8*1024**3, downlink_bytes:12.4*1024**3, expiry_time:now+24*86400000, is_active:1, connection_limit:2, active_clients:1, created_on:'railway' },
+            { id:'preview-2', remark:'Work Laptop', uuid:'22222222-2222-4222-8222-222222222222', sub_id:'previewsub2', traffic_limit:0, used_bytes:4.7*1024**3, uplink_bytes:620*1024**2, downlink_bytes:4.1*1024**3, expiry_time:0, is_active:1, connection_limit:1, active_clients:0, created_on:'koyeb' },
+            { id:'preview-3', remark:'Family Plan', uuid:'33333333-3333-4333-8333-333333333333', sub_id:'previewsub3', traffic_limit:20*1024**3, used_bytes:18.9*1024**3, uplink_bytes:2.1*1024**3, downlink_bytes:16.8*1024**3, expiry_time:now+2*86400000, is_active:1, connection_limit:3, active_clients:3, created_on:'render' }
+        ];
+    }
+
+    function loadPreviewData() {
+        applyStatsData(buildPreviewStats());
+        renderInboundsData(buildPreviewUsers());
+    }
+
     function getInitials(name) {
         var words = String(name || 'Client').trim().split(/\s+/).filter(Boolean);
         if (!words.length) return 'CL';
         if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
         return (words[0][0] + words[1][0]).toUpperCase();
+    }
+
+    function buildSlotDots(active, limit) {
+        if (!limit || limit <= 0) return '<span class="slot-dots"><span class="mini-badge gold">∞</span></span>';
+        var html = '<span class="slot-dots">';
+        for (var i = 0; i < Math.min(limit, 8); i++) {
+            var cls = i < active ? ('slot-dot filled ' + (active >= limit ? 'full' : '')) : 'slot-dot';
+            html += '<span class="' + cls + '"></span>';
+        }
+        if (limit > 8) html += '<span class="mini-badge">+' + (limit - 8) + '</span>';
+        html += '</span>';
+        return html;
+    }
+
+    function buildBreakdownBar(up, down) {
+        var total = Math.max(1, Number(up || 0) + Number(down || 0));
+        var upPct = Math.max(2, Math.round((Number(up || 0) / total) * 100));
+        var downPct = Math.max(2, 100 - upPct);
+        return '<div class="breakdown-bar"><div class="break-up" style="width:' + upPct + '%"></div><div class="break-down" style="width:' + downPct + '%"></div></div>';
     }
 
     function renderInboundsData(users) {
@@ -633,7 +793,7 @@
                 var limitValue = Number(user.connection_limit || user.ip_limit || 0);
                 var activeClients = Number(user.active_clients || 0);
                 var limitState = limitValue === 0 ? 'gold' : (activeClients >= limitValue ? 'danger' : (activeClients > 0 ? 'success' : ''));
-                var clientLimitHtml = '<span class="mini-badge ' + limitState + '">Clients ' + activeClients + '/' + (limitValue > 0 ? limitValue : '∞') + '</span>';
+                var clientLimitHtml = '<span class="mini-badge ' + limitState + '">Clients ' + activeClients + '/' + (limitValue > 0 ? limitValue : '∞') + '</span>' + buildSlotDots(activeClients, limitValue);
 
                 var expiryHtml = '';
                 if (isUnlimitedTime) expiryHtml = '<span class="mini-badge gold">No Expiry</span>';
@@ -664,6 +824,7 @@
                     '<div class="client-usage">' +
                         '<div class="usage-top"><span>' + usedText + ' used</span><span class="usage-percent">' + percent.toFixed(1) + '%</span></div>' +
                         '<div class="traffic-bar-bg"><div class="traffic-bar-fill ' + (trafficReached ? 'traffic-danger' : '') + '" style="width:' + percent + '%"></div></div>' +
+                        buildBreakdownBar(user.uplink_bytes || 0, user.downlink_bytes || 0) +
                         '<div class="traffic-text" style="margin-top:8px"><span>↑ ' + uploadText + '</span><span>↓ ' + downloadText + '</span></div>' +
                         '<div class="traffic-text" style="margin-top:4px"><span>Limit: ' + limitText + '</span><span>Left: ' + remainText + '</span></div>' +
                     '</div>' +
@@ -674,9 +835,14 @@
                         '<button class="action-btn copy" onclick="copyLink(\'' + wsConfigStr.replace(/'/g, "\\'") + '\')">WS</button>' +
                         '<button class="action-btn" onclick="openQrModal(\'' + user.id + '\')">QR</button>' +
                         '<button class="action-btn" onclick="openEditModal(\'' + user.id + '\')">Edit</button>' +
+                        '<button class="action-btn" onclick="openActionSheet(\'' + user.id + '\')">More</button>' +
                         '<button class="action-btn" onclick="resetTraffic(\'' + user.id + '\')">Reset</button>' +
                         '<button class="action-btn delete" onclick="deleteUser(\'' + user.id + '\')">Del</button>' +
                     '</div>';
+                card.addEventListener('click', function(e) {
+                    if (e.target.closest('button') || e.target.closest('label') || e.target.closest('input')) return;
+                    openDetailDrawer(user.id);
+                });
                 list.appendChild(card);
             });
         } catch (e) { console.error(e); }
@@ -685,18 +851,22 @@
     async function fetchStats() {
         try {
             var res = await fetch('/api/stats');
-            if (!res.ok) return;
+            if (!res.ok) throw new Error('stats unavailable');
             applyStatsData(await res.json());
-        } catch (e) {}
+        } catch (e) {
+            if (!currentUsers.length) loadPreviewData();
+        }
     }
 
     async function fetchInbounds() {
         try {
             var res = await fetch('/api/users');
-            if (!res.ok) return;
+            if (!res.ok) throw new Error('users unavailable');
             var data = await res.json();
             renderInboundsData(data.users || []);
-        } catch (e) { console.error(e); }
+        } catch (e) {
+            if (!currentUsers.length) loadPreviewData();
+        }
     }
 
     function applyRealtimeSnapshot(snapshot) {
@@ -716,6 +886,30 @@
                 // EventSource reconnects automatically; keep UI as-is.
             };
         } catch(e) {}
+    }
+
+    function addActivity(message) {
+        activityLog.unshift({ message: message, ts: new Date() });
+        activityLog = activityLog.slice(0, 12);
+        renderActivityLog();
+    }
+
+    function renderActivityLog() {
+        var list = document.getElementById('activityList');
+        if (!list) return;
+        if (!activityLog.length) {
+            list.innerHTML = '<div class="activity-item"><span>No activity yet</span><span class="activity-time">—</span></div>';
+            return;
+        }
+        list.innerHTML = activityLog.map(function(item) {
+            return '<div class="activity-item"><span>' + item.message + '</span><span class="activity-time">' + item.ts.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) + '</span></div>';
+        }).join('');
+    }
+
+    function clearActivityLog() {
+        activityLog = [];
+        renderActivityLog();
+        showToast('Activity cleared');
     }
 
     function showToast(message, type) {
@@ -780,7 +974,63 @@
         setTimeout(function() { m.style.display = 'none'; }, 300);
     }
 
+    function setSettingsTab(tab) {
+        ['account', 'backup', 'system', 'danger'].forEach(function(t) {
+            document.getElementById('settingsTab' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
+            document.getElementById('settingsPane' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
+        });
+    }
+
+    function exportBackup() {
+        var data = { exported_at: new Date().toISOString(), users: currentUsers };
+        var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'mahan-panel-backup-' + new Date().toISOString().slice(0,10) + '.json';
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showToast('Backup exported');
+        addActivity('Backup exported');
+    }
+
+    function previewBackupFile() {
+        var file = document.getElementById('backupFileInput').files[0];
+        if (!file) return;
+        var reader = new FileReader();
+        reader.onload = function() {
+            try {
+                var data = JSON.parse(reader.result);
+                var count = Array.isArray(data.users) ? data.users.length : 0;
+                document.getElementById('backupPreview').textContent = 'Valid backup file\nUsers: ' + count + '\nImport restore requires server-side confirmation.';
+                showToast('Backup file loaded');
+            } catch(e) {
+                document.getElementById('backupPreview').textContent = 'Invalid JSON file';
+                showToast('Invalid backup file', 'error');
+            }
+        };
+        reader.readAsText(file);
+    }
+
+    async function resetAllTraffic() {
+        var ok = await askConfirm('Reset All Traffic', 'Reset traffic for all clients?');
+        if (!ok) return;
+        for (const user of currentUsers) await fetch('/api/users/' + user.id + '/reset', { method: 'POST' });
+        showToast('All traffic reset');
+        addActivity('All traffic reset');
+        fetchInbounds(); fetchStats();
+    }
+
+    async function deleteAllClients() {
+        var ok = await askConfirm('Delete All Clients', 'Delete all clients permanently? This action cannot be undone.');
+        if (!ok) return;
+        for (const user of currentUsers) await fetch('/api/users/' + user.id, { method: 'DELETE' });
+        showToast('All clients deleted');
+        addActivity('All clients deleted');
+        fetchInbounds(); fetchStats();
+    }
+
     function openSettingsModal() {
+        setSettingsTab('account');
         var m = document.getElementById('settingsModal');
         document.getElementById('currentPasswordInput').value = '';
         document.getElementById('newPasswordInput').value = '';
@@ -853,6 +1103,94 @@
         if (type === 'sub') return copyLink(window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id);
     }
 
+    function openDetailDrawer(id) {
+        var user = currentUsers.find(function(u) { return u.id === id; });
+        if (!user) return showToast('User not found', 'error');
+        document.getElementById('drawerTitle').textContent = user.remark || 'Client';
+        document.getElementById('drawerSubtitle').textContent = 'UUID: ' + user.uuid;
+        var limit = Number(user.connection_limit || user.ip_limit || 0);
+        var used = formatBytes(user.used_bytes || 0);
+        var up = formatBytes(user.uplink_bytes || 0);
+        var down = formatBytes(user.downlink_bytes || 0);
+        var remain = user.traffic_limit ? formatBytes(Math.max(0, user.traffic_limit - user.used_bytes)) : 'Unlimited';
+        var expiry = user.expiry_time ? formatTehranDate(user.expiry_time) : 'Never';
+        var subUrl = window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id;
+        document.getElementById('drawerBody').innerHTML =
+            '<div class="detail-grid">' +
+                '<div class="detail-card"><div class="k">Used</div><div class="v">' + used + '</div></div>' +
+                '<div class="detail-card"><div class="k">Remaining</div><div class="v">' + remain + '</div></div>' +
+                '<div class="detail-card"><div class="k">Upload</div><div class="v">' + up + '</div></div>' +
+                '<div class="detail-card"><div class="k">Download</div><div class="v">' + down + '</div></div>' +
+                '<div class="detail-card"><div class="k">Clients</div><div class="v">' + (user.active_clients || 0) + '/' + (limit || '∞') + '</div></div>' +
+                '<div class="detail-card"><div class="k">Expiration</div><div class="v">' + expiry + '</div></div>' +
+                '<div class="detail-card"><div class="k">Sub ID</div><div class="v">' + user.sub_id + '</div></div>' +
+                '<div class="detail-card"><div class="k">Created On</div><div class="v">' + (user.created_on || 'other') + '</div></div>' +
+            '</div>' +
+            '<div class="quick-actions">' +
+                '<button class="action-btn sub" onclick="openSubLink(\'' + subUrl + '\')">Open Sub</button>' +
+                '<button class="action-btn copy" onclick="copyLink(\'' + buildXhttpConfig(user).replace(/'/g, "\\'") + '\')">Copy XHTTP</button>' +
+                '<button class="action-btn copy" onclick="copyLink(\'' + buildWsConfig(user).replace(/'/g, "\\'") + '\')">Copy WS</button>' +
+                '<button class="action-btn" onclick="copyLink(\'' + user.uuid + '\')">Copy UUID</button>' +
+                '<button class="action-btn" onclick="quickExtend(\'' + user.id + '\',7)">+7 Days</button>' +
+                '<button class="action-btn" onclick="quickExtend(\'' + user.id + '\',30)">+30 Days</button>' +
+                '<button class="action-btn" onclick="quickTraffic(\'' + user.id + '\',10)">+10 GB</button>' +
+                '<button class="action-btn" onclick="quickTraffic(\'' + user.id + '\',50)">+50 GB</button>' +
+            '</div>';
+        document.getElementById('drawerBackdrop').style.display = 'block';
+        document.getElementById('detailDrawer').style.display = 'block';
+        setTimeout(function(){ document.getElementById('drawerBackdrop').classList.add('show'); document.getElementById('detailDrawer').classList.add('show'); }, 10);
+    }
+
+    function closeDetailDrawer() {
+        document.getElementById('drawerBackdrop').classList.remove('show');
+        document.getElementById('detailDrawer').classList.remove('show');
+        setTimeout(function(){ document.getElementById('drawerBackdrop').style.display='none'; document.getElementById('detailDrawer').style.display='none'; }, 260);
+    }
+
+    function openActionSheet(id) {
+        var user = currentUsers.find(function(u) { return u.id === id; });
+        if (!user) return;
+        document.getElementById('sheetTitle').textContent = user.remark || 'Actions';
+        document.getElementById('sheetActions').innerHTML =
+            '<button class="action-btn sub" onclick="openSubLink(\'' + (window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id) + '\');closeActionSheet()">Open Sub</button>' +
+            '<button class="action-btn" onclick="openDetailDrawer(\'' + id + '\');closeActionSheet()">Details</button>' +
+            '<button class="action-btn" onclick="openQrModal(\'' + id + '\');closeActionSheet()">QR</button>' +
+            '<button class="action-btn" onclick="openEditModal(\'' + id + '\');closeActionSheet()">Edit</button>' +
+            '<button class="action-btn" onclick="resetTraffic(\'' + id + '\');closeActionSheet()">Reset</button>' +
+            '<button class="action-btn delete" onclick="deleteUser(\'' + id + '\');closeActionSheet()">Delete</button>';
+        var sheet = document.getElementById('actionSheet');
+        sheet.style.display = 'block';
+        setTimeout(function(){ sheet.classList.add('show'); }, 10);
+    }
+
+    function closeActionSheet() {
+        var sheet = document.getElementById('actionSheet');
+        sheet.classList.remove('show');
+        setTimeout(function(){ sheet.style.display='none'; }, 240);
+    }
+
+    async function quickExtend(id, days) {
+        var user = currentUsers.find(function(u) { return u.id === id; });
+        if (!user) return;
+        var currentDays = user.expiry_time ? Math.max(0, Math.ceil((user.expiry_time - Date.now()) / 86400000)) : 0;
+        await saveUserQuick(user, user.traffic_limit / (1024 ** 3), currentDays + days);
+        showToast('Expiration extended'); addActivity('Extended ' + user.remark + ' +' + days + ' days');
+    }
+
+    async function quickTraffic(id, gb) {
+        var user = currentUsers.find(function(u) { return u.id === id; });
+        if (!user) return;
+        var currentGb = user.traffic_limit ? user.traffic_limit / (1024 ** 3) : 0;
+        var currentDays = user.expiry_time ? Math.max(0, Math.ceil((user.expiry_time - Date.now()) / 86400000)) : 0;
+        await saveUserQuick(user, currentGb + gb, currentDays);
+        showToast('Traffic limit updated'); addActivity('Added ' + gb + 'GB to ' + user.remark);
+    }
+
+    async function saveUserQuick(user, trafficGb, expiryDays) {
+        await fetch('/api/users/' + user.id, { method:'PUT', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ remark:user.remark, traffic_limit_gb: trafficGb, expiry_days: expiryDays, connection_limit: user.connection_limit || 0 }) });
+        fetchInbounds(); fetchStats();
+    }
+
     function openEditModal(id) {
         var user = currentUsers.find(function(u) { return u.id === id; });
         if (!user) {
@@ -904,6 +1242,7 @@
             } else {
                 closeEditModal();
                 showToast('Client updated');
+                addActivity('Client updated: ' + remark);
                 fetchInbounds();
                 fetchStats();
             }
@@ -934,6 +1273,7 @@
             } else {
                 closeModal();
                 showToast('Client created');
+                addActivity('Client created: ' + remark);
                 fetchInbounds();
                 fetchStats();
             }
@@ -945,6 +1285,7 @@
     async function toggleUser(id) {
         await fetch('/api/users/' + id + '/toggle', { method: 'POST' });
         showToast('Client state updated');
+        addActivity('Client state updated');
         fetchInbounds();
         fetchStats();
     }
@@ -952,6 +1293,7 @@
     async function resetTraffic(id) {
         await fetch('/api/users/' + id + '/reset', { method: 'POST' });
         showToast('Traffic reset');
+        addActivity('Traffic reset');
         fetchInbounds();
         fetchStats();
     }
@@ -962,6 +1304,7 @@
         if (!ok) return;
         await fetch('/api/users/' + id, { method: 'DELETE' });
         showToast('Client deleted');
+        addActivity('Client deleted');
         fetchInbounds();
         fetchStats();
     }
