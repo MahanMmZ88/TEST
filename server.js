@@ -2031,15 +2031,15 @@ app.get('/sub/:sub_id', (req, res) => {
     .shell { width:100%; max-width:1060px; }
     .card { position:relative; overflow:hidden; background:linear-gradient(135deg, rgba(255,255,255,.06), rgba(255,255,255,.025)); border:1px solid var(--line); border-radius:32px; padding:30px; box-shadow:0 30px 90px rgba(0,0,0,.58); backdrop-filter:blur(18px); }
     .card:after { content:''; position:absolute; width:320px; height:320px; border-radius:50%; background:radial-gradient(circle, rgba(212,175,55,.16), transparent 68%); top:-150px; right:-120px; pointer-events:none; }
-    .hero { position:relative; z-index:1; display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:26px; }
-    .kicker { color:var(--gold); font-size:11px; font-weight:900; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px; }
-    h1 { font-size:34px; line-height:1.1; letter-spacing:.4px; background:linear-gradient(90deg,#fff,var(--gold2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-    .desc { color:#a3a3ad; margin-top:10px; line-height:1.7; max-width:650px; font-size:14px; }
-    .chips { display:flex; flex-wrap:nowrap; gap:8px; margin-top:18px; overflow-x:auto; padding-bottom:4px; scrollbar-width:none; }
+    .hero { position:relative; z-index:1; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; gap:14px; margin-bottom:26px; }
+    .brand-title { color:var(--gold); font-size:12px; font-weight:950; letter-spacing:5px; text-transform:uppercase; margin-bottom:12px; opacity:.95; text-shadow:0 0 22px rgba(212,175,55,.18); }
+    h1 { font-size:38px; line-height:1.1; letter-spacing:.6px; text-align:center; background:linear-gradient(90deg,#fff,var(--gold2),#fff); background-size:220% auto; -webkit-background-clip:text; -webkit-text-fill-color:transparent; animation:titleShine 4.5s ease-in-out infinite alternate; filter:drop-shadow(0 0 18px rgba(212,175,55,.10)); }@keyframes titleShine{from{background-position:0% center; transform:translateY(0)}to{background-position:100% center; transform:translateY(-2px)}}
+    .desc { display:none; }
+    .chips { display:flex; flex-wrap:nowrap; justify-content:center; max-width:100%; gap:8px; margin-top:18px; overflow-x:auto; padding-bottom:4px; scrollbar-width:none; }
     .chip { display:inline-flex; flex:0 0 auto; align-items:center; gap:7px; padding:8px 12px; border-radius:999px; background:rgba(0,0,0,.25); border:1px solid rgba(255,255,255,.08); color:#bbb; font-size:11px; font-weight:900; letter-spacing:.7px; text-transform:uppercase; white-space:nowrap; }
     .chips::-webkit-scrollbar{display:none}.chip.ok { color:#4ade80; background:rgba(34,197,94,.09); border-color:rgba(34,197,94,.26); }
     .chip.gold { color:var(--gold); background:rgba(212,175,55,.08); border-color:rgba(212,175,55,.28); }
-    .status-box { min-width:160px; text-align:right; color:#aaa; font-size:12px; }
+    .status-box { min-width:160px; text-align:center; color:#aaa; font-size:12px; }
     .status-pill { display:inline-flex; align-items:center; gap:7px; padding:9px 13px; border-radius:999px; border:1px solid rgba(34,197,94,.28); background:rgba(34,197,94,.09); color:#4ade80; font-weight:900; letter-spacing:.8px; text-transform:uppercase; }
     .status-pill.expired { border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.10); color:#f87171; }
     .status-pill:before { content:''; width:8px; height:8px; border-radius:50%; background:#22c55e; box-shadow:0 0 14px #22c55e; }
@@ -2081,7 +2081,7 @@ app.get('/sub/:sub_id', (req, res) => {
     .guide { color:#777; text-align:center; font-size:12px; line-height:1.7; margin-top:16px; }
     .show-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0}.show-btn{border:1px solid rgba(212,175,55,.22);background:rgba(212,175,55,.07);color:#d4af37;border-radius:12px;padding:10px;font-weight:900;cursor:pointer}.qr-full{display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);backdrop-filter:blur(8px);z-index:900;align-items:center;justify-content:center;padding:20px}.qr-full-card{background:#111119;border:1px solid rgba(255,255,255,.1);border-radius:26px;padding:24px;width:min(420px,100%);text-align:center;box-shadow:0 30px 80px rgba(0,0,0,.6)}.qr-full-card .qr{width:300px;height:300px}.qr-full-card .qr img{width:276px;height:276px}.toast { position:fixed; right:20px; bottom:20px; background:#15151d; color:#fff; border:1px solid rgba(212,175,55,.35); padding:12px 16px; border-radius:14px; z-index:999; box-shadow:0 15px 35px rgba(0,0,0,.42); animation:toastIn .22s ease; }
     @keyframes toastIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
-    @media(max-width:850px){ body{padding:14px}.card{padding:20px;border-radius:24px}.hero{flex-direction:column}.status-box{text-align:left}.main-grid{grid-template-columns:1fr}.usage-head{flex-direction:column;text-align:center}.stat-grid{grid-template-columns:1fr}.qr{width:190px;height:190px}.qr-tabs{flex-direction:column} }
+    @media(max-width:850px){ body{padding:14px}.card{padding:20px;border-radius:24px}.hero{flex-direction:column}.status-box{text-align:center}.main-grid{grid-template-columns:1fr}.usage-head{flex-direction:column;text-align:center}.stat-grid{grid-template-columns:1fr}.qr{width:190px;height:190px}.qr-tabs{flex-direction:column}h1{font-size:30px}.brand-title{font-size:11px;letter-spacing:4px} }
   </style>
 </head>
 <body>
@@ -2090,16 +2090,15 @@ app.get('/sub/:sub_id', (req, res) => {
     <section class="card">
       <div class="hero">
         <div>
-          <div class="kicker">Subscription</div>
+          <div class="brand-title">MAHAN PANEL</div>
           <h1>${remarkSafe}</h1>
-          <p class="desc">VLESS subscription with realtime usage, QR import options, upload/download details and transport information.</p>
           <div class="chips"><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
         </div>
         <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${statusText}</div></div>
       </div>
       <div class="main-grid">
         <section class="panel">
-          <div class="usage-head"><div class="usage-title"><h2>Traffic Usage</h2><p>Usage values update in realtime while this page is open.</p></div><div class="ring" id="usageRing"><span id="ringValue">${percent}%</span></div></div>
+          <div class="usage-head"><div class="usage-title"><h2>Traffic Usage</h2></div><div class="ring" id="usageRing"><span id="ringValue">${percent}%</span></div></div>
           <div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : (unlimitedTraffic ? 'greenfill' : '')}"></div></div>
           <div class="stat-grid">
             <div class="stat"><div class="label">Used</div><div class="value" id="usedValue">${usedFormatted}</div></div>
@@ -2111,8 +2110,8 @@ app.get('/sub/:sub_id', (req, res) => {
         </section>
         <section class="panel">
           <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div>
-          <div class="qr-stage"><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" id="showQrBtn" onclick="showFullQr(ACTIVE_QR)">Show QR</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
-          <button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button>
+          <div class="qr-stage"><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" id="showQrBtn" onclick="showFullQr(ACTIVE_QR)">Show QR</button></div>
+          <button class="btn primary" onclick="copyAll()">Copy All Configs</button>
           <p class="guide">VPN clients receive both configs automatically. Browser users see this page.</p>
         </section>
       </div>
@@ -2521,8 +2520,4 @@ process.on('unhandledRejection', (err) => log('[ERROR] Unhandled:', err && err.s
 
 loadDB();
 server.listen(PORT, '0.0.0.0', () => {
-  log('[INFO] Mahan Panel VLESS-WS/XHTTP active on port', String(PORT));
-  log('[INFO] WS path:', WS_PATH);
-  log('[INFO] XHTTP path:', XHTTP_PATH);
-  log('[INFO] Default admin:', 'admin / admin');
-});
+  log('[INFO] Mahan Panel VLESS-
