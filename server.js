@@ -46,6 +46,7 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
 const ACTIVE_CONNECTION_STALE_MS = 45 * 1000;
 const IP_LIMIT_STALE_MS = 20 * 1000;
+const ONLINE_ACTIVITY_WINDOW_MS = 2500;
 const WS_PING_INTERVAL_MS = 15 * 1000;
 
 let DB = { admin: null, users: [] };
@@ -358,7 +359,8 @@ function registerConnection(userId, closeFn, meta = {}) {
     kind: String(meta.kind || 'unknown'),
     closeFn,
     createdAt: Date.now(),
-    lastSeen: Date.now()
+    lastSeen: Date.now(),
+    lastDataAt: 0
   };
   map.set(id, conn);
   scheduleRealtimeBroadcast();
@@ -370,6 +372,15 @@ function registerConnection(userId, closeFn, meta = {}) {
     const current = activeConnections.get(userId);
     const item = current?.get(id);
     if (item) item.lastSeen = Date.now();
+  };
+  unregister.touchData = () => {
+    const current = activeConnections.get(userId);
+    const item = current?.get(id);
+    if (item) {
+      const now = Date.now();
+      item.lastSeen = now;
+      item.lastDataAt = now;
+    }
   };
   unregister.id = id;
   return unregister;
@@ -384,8 +395,19 @@ function closeUserConnections(userId, reason = 'user disabled') {
   }
 }
 
+function markUserDataActivity(userId) {
+  const map = activeConnections.get(userId);
+  if (!map) return;
+  const now = Date.now();
+  for (const conn of map.values()) {
+    conn.lastSeen = now;
+    conn.lastDataAt = now;
+  }
+}
+
 function updateTraffic(user, bytes) {
   if (!user || !bytes || bytes <= 0) return;
+  markUserDataActivity(user.id);
 
   // Fast data-plane path: only increment in-memory counters here.
   // Expensive UI/DB/quota work is committed in a 1s batch by flushTrafficBuffers().
@@ -1319,14 +1341,16 @@ function buildUsersSnapshot() {
   return DB.users.map((user) => {
     const map = activeConnections.get(user.id);
     const connections = map?.size || 0;
-    const activeIps = getActiveIpSet(user.id);
+    const now = Date.now();
+    const recentConnections = map ? Array.from(map.values()).filter((conn) => now - Number(conn.lastDataAt || 0) <= ONLINE_ACTIVITY_WINDOW_MS) : [];
+    const recentIps = new Set(recentConnections.map((conn) => conn.ip).filter(Boolean));
     return {
       ...user,
       used_bytes: getEffectiveUsedBytes(user),
       last_seen: getEffectiveLastSeen(user),
-      online: connections > 0,
+      online: recentConnections.length > 0,
       connections,
-      active_ips: activeIps.size
+      active_ips: recentIps.size
     };
   });
 }
