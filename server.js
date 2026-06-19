@@ -1705,6 +1705,30 @@ app.post('/api/admin/change-password', requireAuth, (req, res) => {
   res.json({ success: true, relogin: true });
 });
 
+app.post('/api/backup/restore', requireAuth, (req, res) => {
+  const incomingUsers = Array.isArray(req.body?.users) ? req.body.users : null;
+  if (!incomingUsers) return res.status(400).json({ error: 'Invalid backup: users array is required' });
+  if (incomingUsers.length > 10000) return res.status(400).json({ error: 'Invalid backup: too many users' });
+
+  const restoredUsers = incomingUsers.map(normalizeUser).filter(Boolean);
+  if (restoredUsers.length !== incomingUsers.length) {
+    return res.status(400).json({ error: 'Invalid backup: one or more users are malformed' });
+  }
+
+  for (const userId of Array.from(activeConnections.keys())) forceClearUserConnections(userId, 'backup restored');
+  pendingTrafficBytes.clear();
+  pendingUplinkBytes.clear();
+  pendingDownlinkBytes.clear();
+  pendingLastSeen.clear();
+  clientSlots.clear();
+
+  DB.users = restoredUsers;
+  scheduleRealtimeBroadcast();
+  scheduleSaveDB(false);
+  log('[Backup] Restored users:', String(restoredUsers.length));
+  res.json({ success: true, users_count: restoredUsers.length });
+});
+
 app.get('/api/stats', requireAuth, (req, res) => {
   res.json(buildStatsSnapshot());
 });
@@ -1942,18 +1966,115 @@ app.get('/sub/:sub_id', (req, res) => {
   const subUrlJSON = JSON.stringify(buildSubUrl(req, user));
   const qrBase = `/qr/${user.sub_id}`;
 
+  const ringDeg = Math.max(0, Math.min(100, Number(percent))) * 3.6;
+
   res.send(`<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>${remarkSafe} - Subscription</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:radial-gradient(circle at top right,#1a1a2e,#08080d 70%);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}.shell{width:100%;max-width:980px}.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:28px;padding:30px;box-shadow:0 25px 70px rgba(0,0,0,.55);backdrop-filter:blur(18px)}.hero{text-align:center;margin-bottom:26px}h1{color:#d4af37;margin-bottom:8px;font-size:32px}.sub{color:#888;letter-spacing:2px;font-size:12px;text-transform:uppercase}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.stat{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;text-align:center}.label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px}.value{font-size:22px;font-weight:800;margin-top:6px}.progress{height:9px;background:rgba(255,255,255,.08);border-radius:10px;overflow:hidden;margin:12px 0 22px}.fill{height:100%;background:linear-gradient(90deg,#d4af37,#eab308);width:${progressWidth}%}.danger{background:linear-gradient(90deg,#ef4444,#f87171)}.info{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;margin:18px 0}.row{display:flex;justify-content:space-between;gap:14px;margin:12px 0;color:#ddd}.row span:first-child{color:#888}.badge{white-space:nowrap;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:800}.active{background:rgba(34,197,94,.13);color:#4ade80}.expired{background:rgba(239,68,68,.13);color:#f87171}.qr-tabs{display:flex;gap:8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:6px;margin-top:18px}.qr-tab{flex:1;border:0;border-radius:12px;padding:12px;background:transparent;color:#aaa;font-weight:900;cursor:pointer}.qr-tab.active{background:linear-gradient(45deg,#d4af37,#f3e5ab);color:#000}.qr-panel{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:20px;padding:20px;margin-top:14px;text-align:center}.qr{background:#fff;border-radius:16px;padding:12px;width:220px;height:220px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center}.qr img{width:196px;height:196px}.transport-info{color:#aaa;font-size:12px;line-height:1.7;margin:8px 0 10px}.btn{width:100%;background:linear-gradient(45deg,#d4af37,#b2891d);color:#000;border:0;padding:14px;border-radius:12px;font-weight:900;cursor:pointer;margin-top:9px}.btn.secondary{background:rgba(255,255,255,.06);color:#d4af37;border:1px solid rgba(212,175,55,.35)}.btn.dark{background:rgba(0,0,0,.28);color:#ddd;border:1px solid rgba(255,255,255,.1)}.guide{text-align:center;margin-top:18px;color:#777;font-size:12px;line-height:1.6}@media(max-width:760px){.card{padding:22px;border-radius:22px}.grid{grid-template-columns:1fr}h1{font-size:26px}.row{font-size:13px}.qr{width:180px;height:180px}.qr img{width:156px;height:156px}.qr-tabs{flex-direction:column}}
-</style></head><body><main class="shell"><div class="card"><div class="hero"><h1>${remarkSafe}</h1><div class="sub">Smart VLESS Subscription</div></div>
-<div class="grid"><div class="stat"><div class="label">Used Traffic</div><div class="value" id="usedValue">${usedFormatted}</div></div><div class="stat"><div class="label">Remaining</div><div class="value" id="remainingValue">${remainingFormatted}</div></div><div class="stat"><div class="label">Upload</div><div class="value" id="uploadValue">${uplinkFormatted}</div></div><div class="stat"><div class="label">Download</div><div class="value" id="downloadValue">${downlinkFormatted}</div></div></div>
-<div style="display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:18px"><span>Traffic Usage</span><span id="percentValue">${percent}%</span></div><div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : ''}"></div></div>
-<div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
-<div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div><div class="qr-panel"><div class="qr"><img id="qrImage" alt="QR Code" src="${qrBase}/xhttp"></div><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
-<button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button><div class="guide">VPN clients get both configs automatically. Browsers see this smart page with QR codes and copy buttons.</div></div></main>
-<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.textContent=t;e.style.cssText='position:fixed;right:20px;bottom:20px;background:#15151d;color:#fff;border:1px solid rgba(212,175,55,.35);padding:12px 16px;border-radius:12px;z-index:999;box-shadow:0 15px 35px rgba(0,0,0,.4)';document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});document.getElementById('qrImage').src=QR_BASE+'/'+t+'?ts='+Date.now();var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function downloadQr(){var a=document.createElement('a');a.href=QR_BASE+'/'+ACTIVE_QR;a.download='qr-'+ACTIVE_QR+'.svg';a.click()}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('percentValue').textContent=d.percent+'%';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':'');var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+(d.expired?'expired':'active');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);});
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${remarkSafe} - Subscription</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    :root { --gold:#d4af37; --gold2:#f3e5ab; --bg:#07070a; --line:rgba(255,255,255,.085); --muted:#8a8a94; --success:#22c55e; --danger:#ef4444; }
+    body { min-height:100vh; color:#fff; background: radial-gradient(circle at 12% 8%, rgba(212,175,55,.13), transparent 28%), radial-gradient(circle at 88% 12%, rgba(99,102,241,.13), transparent 24%), radial-gradient(circle at 50% 110%, rgba(34,197,94,.08), transparent 28%), #07070a; display:flex; align-items:center; justify-content:center; padding:22px; overflow-x:hidden; }
+    body:before { content:''; position:fixed; inset:0; background-image: linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.02) 1px, transparent 1px); background-size:42px 42px; mask-image:radial-gradient(circle at center, #000, transparent 75%); pointer-events:none; z-index:-2; }
+    .orb { position:fixed; filter:blur(80px); opacity:.45; z-index:-1; animation:float 9s ease-in-out infinite alternate; }
+    .orb.one { width:320px; height:320px; background:#d4af37; top:-120px; right:-90px; }
+    .orb.two { width:260px; height:260px; background:#6366f1; bottom:-110px; left:-80px; animation-delay:-4s; }
+    @keyframes float { from { transform:translate3d(0,0,0) scale(1); } to { transform:translate3d(24px,28px,0) scale(1.08); } }
+    .shell { width:100%; max-width:1060px; }
+    .card { position:relative; overflow:hidden; background:linear-gradient(135deg, rgba(255,255,255,.06), rgba(255,255,255,.025)); border:1px solid var(--line); border-radius:32px; padding:30px; box-shadow:0 30px 90px rgba(0,0,0,.58); backdrop-filter:blur(18px); }
+    .card:after { content:''; position:absolute; width:320px; height:320px; border-radius:50%; background:radial-gradient(circle, rgba(212,175,55,.16), transparent 68%); top:-150px; right:-120px; pointer-events:none; }
+    .hero { position:relative; z-index:1; display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:26px; }
+    .kicker { color:var(--gold); font-size:11px; font-weight:900; letter-spacing:3px; text-transform:uppercase; margin-bottom:8px; }
+    h1 { font-size:34px; line-height:1.1; letter-spacing:.4px; background:linear-gradient(90deg,#fff,var(--gold2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+    .desc { color:#a3a3ad; margin-top:10px; line-height:1.7; max-width:650px; font-size:14px; }
+    .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+    .chip { display:inline-flex; align-items:center; gap:7px; padding:8px 12px; border-radius:999px; background:rgba(0,0,0,.25); border:1px solid rgba(255,255,255,.08); color:#bbb; font-size:11px; font-weight:900; letter-spacing:.7px; text-transform:uppercase; white-space:nowrap; }
+    .chip.ok { color:#4ade80; background:rgba(34,197,94,.09); border-color:rgba(34,197,94,.26); }
+    .chip.gold { color:var(--gold); background:rgba(212,175,55,.08); border-color:rgba(212,175,55,.28); }
+    .status-box { min-width:160px; text-align:right; color:#aaa; font-size:12px; }
+    .status-pill { display:inline-flex; align-items:center; gap:7px; padding:9px 13px; border-radius:999px; border:1px solid rgba(34,197,94,.28); background:rgba(34,197,94,.09); color:#4ade80; font-weight:900; letter-spacing:.8px; text-transform:uppercase; }
+    .status-pill.expired { border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.10); color:#f87171; }
+    .status-pill:before { content:''; width:8px; height:8px; border-radius:50%; background:#22c55e; box-shadow:0 0 14px #22c55e; }
+    .status-pill.expired:before { background:#ef4444; box-shadow:0 0 14px #ef4444; }
+    .main-grid { display:grid; grid-template-columns: 1.05fr .95fr; gap:18px; align-items:stretch; position:relative; z-index:1; }
+    .panel { background:rgba(0,0,0,.24); border:1px solid rgba(255,255,255,.075); border-radius:24px; padding:20px; }
+    .usage-head { display:flex; justify-content:space-between; align-items:center; gap:14px; margin-bottom:18px; }
+    .ring { width:132px; height:132px; border-radius:50%; display:grid; place-items:center; background: conic-gradient(var(--gold) 0 ${ringDeg}deg, rgba(255,255,255,.09) ${ringDeg}deg 360deg); box-shadow:0 0 34px rgba(212,175,55,.10); position:relative; flex:0 0 auto; }
+    .ring:before { content:''; position:absolute; inset:11px; border-radius:50%; background:#111119; border:1px solid rgba(255,255,255,.06); }
+    .ring span { position:relative; z-index:1; font-size:28px; font-weight:900; color:#fff; }
+    .usage-title h2 { font-size:22px; margin-bottom:6px; }
+    .usage-title p { color:#888; font-size:13px; line-height:1.6; }
+    .progress { height:10px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; margin:14px 0 18px; }
+    .fill { height:100%; width:${progressWidth}%; background:linear-gradient(90deg,var(--gold),#eab308); border-radius:999px; box-shadow:0 0 18px rgba(212,175,55,.25); }
+    .danger { background:linear-gradient(90deg,#ef4444,#f87171)!important; }
+    .stat-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+    .stat { background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.065); border-radius:18px; padding:15px; }
+    .label { color:#888; font-size:10px; text-transform:uppercase; letter-spacing:1.2px; font-weight:900; }
+    .value { margin-top:6px; font-size:20px; font-weight:900; color:#fff; }
+    .value.gold { color:var(--gold); }
+    .info { display:grid; gap:10px; margin-top:14px; }
+    .row { display:flex; justify-content:space-between; gap:14px; color:#ddd; padding:10px 0; border-bottom:1px solid rgba(255,255,255,.055); }
+    .row:last-child { border-bottom:0; }
+    .row span:first-child { color:#888; }
+    .badge { white-space:nowrap; padding:5px 12px; border-radius:999px; font-size:11px; font-weight:900; }
+    .active { background:rgba(34,197,94,.13); color:#4ade80; border:1px solid rgba(34,197,94,.22); }
+    .expired { background:rgba(239,68,68,.13); color:#f87171; border:1px solid rgba(239,68,68,.22); }
+    .qr-tabs { display:flex; gap:8px; padding:6px; border-radius:17px; background:rgba(0,0,0,.28); border:1px solid rgba(255,255,255,.075); margin-bottom:16px; }
+    .qr-tab { flex:1; border:0; border-radius:12px; padding:12px 8px; cursor:pointer; color:#aaa; background:transparent; font-weight:900; letter-spacing:.7px; transition:.22s; }
+    .qr-tab.active { background:linear-gradient(135deg,var(--gold),var(--gold2)); color:#000; }
+    .qr-stage { text-align:center; padding:20px; border-radius:22px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.06); }
+    .qr { width:224px; height:224px; background:#fff; border-radius:20px; display:inline-flex; align-items:center; justify-content:center; padding:12px; margin-bottom:14px; }
+    .qr img { width:100%; height:100%; display:block; }
+    .transport-info { color:#aaa; font-size:12px; line-height:1.7; margin-bottom:12px; }
+    .btn { width:100%; border:0; cursor:pointer; border-radius:14px; padding:14px 16px; font-weight:900; letter-spacing:.3px; margin-top:9px; transition:.22s; }
+    .btn:hover { transform:translateY(-1px); filter:brightness(1.05); }
+    .btn.primary { background:linear-gradient(135deg,var(--gold),#b2891d); color:#000; box-shadow:0 12px 26px rgba(212,175,55,.16); }
+    .btn.dark { background:rgba(0,0,0,.32); color:#ddd; border:1px solid rgba(255,255,255,.095); }
+    .guide { color:#777; text-align:center; font-size:12px; line-height:1.7; margin-top:16px; }
+    .toast { position:fixed; right:20px; bottom:20px; background:#15151d; color:#fff; border:1px solid rgba(212,175,55,.35); padding:12px 16px; border-radius:14px; z-index:999; box-shadow:0 15px 35px rgba(0,0,0,.42); animation:toastIn .22s ease; }
+    @keyframes toastIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+    @media(max-width:850px){ body{padding:14px}.card{padding:20px;border-radius:24px}.hero{flex-direction:column}.status-box{text-align:left}.main-grid{grid-template-columns:1fr}.usage-head{flex-direction:column;text-align:center}.stat-grid{grid-template-columns:1fr}.qr{width:190px;height:190px}.qr-tabs{flex-direction:column} }
+  </style>
+</head>
+<body>
+  <div class="orb one"></div><div class="orb two"></div>
+  <main class="shell">
+    <section class="card">
+      <div class="hero">
+        <div>
+          <div class="kicker">Subscription</div>
+          <h1>${remarkSafe}</h1>
+          <p class="desc">VLESS subscription with realtime usage, QR import options, upload/download details and transport information.</p>
+          <div class="chips"><span class="chip ${expired ? '' : 'ok'}">${expired ? 'Expired' : 'Active'}</span><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
+        </div>
+        <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${expired ? 'Expired' : 'Ready'}</div><p style="margin-top:10px">Asia/Tehran time</p></div>
+      </div>
+      <div class="main-grid">
+        <section class="panel">
+          <div class="usage-head"><div class="usage-title"><h2>Traffic Usage</h2><p>Usage values update in realtime while this page is open.</p></div><div class="ring" id="usageRing"><span id="ringValue">${percent}%</span></div></div>
+          <div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : ''}"></div></div>
+          <div class="stat-grid">
+            <div class="stat"><div class="label">Used</div><div class="value" id="usedValue">${usedFormatted}</div></div>
+            <div class="stat"><div class="label">Remaining</div><div class="value gold" id="remainingValue">${remainingFormatted}</div></div>
+            <div class="stat"><div class="label">Upload</div><div class="value" id="uploadValue">${uplinkFormatted}</div></div>
+            <div class="stat"><div class="label">Download</div><div class="value" id="downloadValue">${downlinkFormatted}</div></div>
+          </div>
+          <div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
+        </section>
+        <section class="panel">
+          <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div>
+          <div class="qr-stage"><div class="qr"><img id="qrImage" alt="QR Code" src="${qrBase}/xhttp"></div><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
+          <button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button>
+          <p class="guide">VPN clients receive both configs automatically. Browser users see this page.</p>
+        </section>
+      </div>
+    </section>
+  </main>
+  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});document.getElementById('qrImage').src=QR_BASE+'/'+t+'?ts='+Date.now();var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function downloadQr(){var a=document.createElement('a');a.href=QR_BASE+'/'+ACTIVE_QR;a.download='qr-'+ACTIVE_QR+'.svg';a.click()}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent+'%';var deg=(Number(d.percent)||0)*3.6;document.getElementById('usageRing').style.background='conic-gradient(var(--gold) 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':'');var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+(d.expired?'expired':'active');var p=document.getElementById('statusPill');p.textContent=d.expired?'Expired':'Ready';p.className='status-pill '+(d.expired?'expired':'');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
+});
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 app.get('/panel', (req, res) => {
