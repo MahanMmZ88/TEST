@@ -56,7 +56,9 @@ let lastCpuCheck = process.hrtime.bigint();
 let cachedCpuUsage = 0;
 let trafficCurrentMinuteBytes = 0;
 let trafficHistory = [];
-const pendingTrafficBytes = new Map(); // user.id -> bytes waiting for batched commit
+const pendingTrafficBytes = new Map(); // user.id -> total bytes waiting for batched commit
+const pendingUplinkBytes = new Map(); // user.id -> upload/uplink bytes waiting for commit
+const pendingDownlinkBytes = new Map(); // user.id -> download/downlink bytes waiting for commit
 const pendingLastSeen = new Map(); // user.id -> latest timestamp waiting for batched commit
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
@@ -182,6 +184,8 @@ function normalizeUser(u) {
     traffic_limit: Number(u.traffic_limit || 0),
     connection_limit: Number(u.connection_limit || u.ip_limit || 0),
     used_bytes: Number(u.used_bytes || 0),
+    uplink_bytes: Number(u.uplink_bytes || 0),
+    downlink_bytes: Number(u.downlink_bytes !== undefined ? u.downlink_bytes : (u.used_bytes || 0)),
     expiry_time: Number(u.expiry_time || 0),
     last_seen: Number(u.last_seen || 0),
     is_active: Number(u.is_active === 0 ? 0 : 1),
@@ -234,9 +238,27 @@ function getPendingTraffic(userId) {
   return Number(pendingTrafficBytes.get(userId) || 0);
 }
 
+function getPendingUplink(userId) {
+  return Number(pendingUplinkBytes.get(userId) || 0);
+}
+
+function getPendingDownlink(userId) {
+  return Number(pendingDownlinkBytes.get(userId) || 0);
+}
+
 function getEffectiveUsedBytes(user) {
   if (!user) return 0;
   return Number(user.used_bytes || 0) + getPendingTraffic(user.id);
+}
+
+function getEffectiveUplinkBytes(user) {
+  if (!user) return 0;
+  return Number(user.uplink_bytes || 0) + getPendingUplink(user.id);
+}
+
+function getEffectiveDownlinkBytes(user) {
+  if (!user) return 0;
+  return Number(user.downlink_bytes !== undefined ? user.downlink_bytes : (user.used_bytes || 0)) + getPendingDownlink(user.id);
 }
 
 function getEffectiveLastSeen(user) {
@@ -261,22 +283,28 @@ function isUserExpiredEffective(user) {
 }
 
 function flushTrafficBuffers() {
-  if (pendingTrafficBytes.size === 0 && pendingLastSeen.size === 0) return false;
+  if (pendingTrafficBytes.size === 0 && pendingUplinkBytes.size === 0 && pendingDownlinkBytes.size === 0 && pendingLastSeen.size === 0) return false;
 
   let changed = false;
-  const ids = new Set([...pendingTrafficBytes.keys(), ...pendingLastSeen.keys()]);
+  const ids = new Set([...pendingTrafficBytes.keys(), ...pendingUplinkBytes.keys(), ...pendingDownlinkBytes.keys(), ...pendingLastSeen.keys()]);
 
   for (const userId of ids) {
     const user = DB.users.find((u) => u.id === userId);
     const bytes = Number(pendingTrafficBytes.get(userId) || 0);
+    const uplink = Number(pendingUplinkBytes.get(userId) || 0);
+    const downlink = Number(pendingDownlinkBytes.get(userId) || 0);
     const seen = Number(pendingLastSeen.get(userId) || 0);
 
     pendingTrafficBytes.delete(userId);
+    pendingUplinkBytes.delete(userId);
+    pendingDownlinkBytes.delete(userId);
     pendingLastSeen.delete(userId);
 
     if (!user) continue;
     if (bytes > 0) {
       user.used_bytes = Number(user.used_bytes || 0) + bytes;
+      user.uplink_bytes = Number(user.uplink_bytes || 0) + uplink;
+      user.downlink_bytes = Number(user.downlink_bytes !== undefined ? user.downlink_bytes : 0) + downlink;
       changed = true;
     }
     if (seen > Number(user.last_seen || 0)) {
@@ -488,7 +516,7 @@ function markUserDataActivity(userId) {
   }
 }
 
-function updateTraffic(user, bytes) {
+function updateTraffic(user, bytes, direction = 'total') {
   if (!user || !bytes || bytes <= 0) return;
   markUserDataActivity(user.id);
 
@@ -496,6 +524,8 @@ function updateTraffic(user, bytes) {
   // Expensive UI/DB/quota work is committed in a 1s batch by flushTrafficBuffers().
   trafficCurrentMinuteBytes += bytes;
   pendingTrafficBytes.set(user.id, getPendingTraffic(user.id) + bytes);
+  if (direction === 'uplink') pendingUplinkBytes.set(user.id, getPendingUplink(user.id) + bytes);
+  else if (direction === 'downlink') pendingDownlinkBytes.set(user.id, getPendingDownlink(user.id) + bytes);
   pendingLastSeen.set(user.id, Date.now());
 
   // Enforce quota promptly when the buffered total crosses the limit.
@@ -1018,7 +1048,7 @@ class XHttpSession {
       this.udpSocket = dgram.createSocket(udpType);
       this.udpSocket.on('message', (msg) => {
         this.refresh();
-        updateTraffic(this.user, msg.length);
+        updateTraffic(this.user, msg.length, 'downlink');
         try {
           this.sendDownlink(encodeUdpPacket(msg));
         } catch (err) {
@@ -1076,7 +1106,7 @@ class XHttpSession {
 
       this.remote.on('data', (chunk) => {
         this.refresh();
-        updateTraffic(this.user, chunk.length);
+        updateTraffic(this.user, chunk.length, 'downlink');
         this.sendDownlink(chunk);
       });
       this.remote.on('drain', () => this.flushRemoteWrites());
@@ -1114,7 +1144,7 @@ class XHttpSession {
       return;
     }
 
-    updateTraffic(this.user, chunk.length);
+    updateTraffic(this.user, chunk.length, 'uplink');
     if (!this.remote.write(chunk)) {
       // Let Node socket backpressure work; later packets remain queued if needed.
     }
@@ -1123,7 +1153,7 @@ class XHttpSession {
   sendUdpPacket(packet) {
     if (this.closed || !this.udpSocket || !this.udpTargetHost || !this.udpTargetPort) return;
     if (this.udpIdleTimer && this.udpIdleTimer.refresh) this.udpIdleTimer.refresh();
-    updateTraffic(this.user, packet.length);
+    updateTraffic(this.user, packet.length, 'uplink');
     this.udpSocket.send(packet, this.udpTargetPort, this.udpTargetHost, (err) => {
       if (err) {
         log('[XHTTP UDP] Send failed:', err.message);
@@ -1140,7 +1170,7 @@ class XHttpSession {
     if (!this.remote || !this.established || this.remote.destroyed) return;
     while (this.pendingRemoteWrites.length) {
       const chunk = this.pendingRemoteWrites.shift();
-      updateTraffic(this.user, chunk.length);
+      updateTraffic(this.user, chunk.length, 'uplink');
       if (!this.remote.write(chunk)) break;
     }
   }
@@ -1289,7 +1319,7 @@ class MuxHandler {
       session.udp = dgram.createSocket(udpType);
       session.connected = true;
       session.udp.on('message', (msg) => {
-        updateTraffic(this.user, msg.length);
+        updateTraffic(this.user, msg.length, 'downlink');
         this.sendData(sessionId, msg);
       });
       session.udp.on('error', (err) => {
@@ -1308,12 +1338,12 @@ class MuxHandler {
       session.connected = true;
       while (session.pending.length && session.remote && !session.remote.destroyed) {
         const p = session.pending.shift();
-        updateTraffic(this.user, p.length);
+        updateTraffic(this.user, p.length, 'uplink');
         if (!session.remote.write(p)) break;
       }
     });
     session.remote.on('data', (data) => {
-      updateTraffic(this.user, data.length);
+      updateTraffic(this.user, data.length, 'downlink');
       this.sendData(sessionId, data);
     });
     session.remote.once('error', (err) => {
@@ -1337,7 +1367,7 @@ class MuxHandler {
     if (!session || session.closed) return;
 
     if (session.target.network === 'udp') {
-      updateTraffic(this.user, data.length);
+      updateTraffic(this.user, data.length, 'uplink');
       session.udp?.send(data, session.target.port, session.target.host, (err) => {
         if (err) {
           log(`[${this.label}] UDP send failed:`, err.message);
@@ -1352,7 +1382,7 @@ class MuxHandler {
       session.pending.push(Buffer.from(data));
       return;
     }
-    updateTraffic(this.user, data.length);
+    updateTraffic(this.user, data.length, 'uplink');
     session.remote.write(data);
   }
 
@@ -1439,6 +1469,8 @@ function buildUsersSnapshot() {
     return {
       ...user,
       used_bytes: getEffectiveUsedBytes(user),
+      uplink_bytes: getEffectiveUplinkBytes(user),
+      downlink_bytes: getEffectiveDownlinkBytes(user),
       last_seen: getEffectiveLastSeen(user),
       connections: activeConnections.get(user.id)?.size || 0,
       active_clients: getClientSlotCount(user.id)
@@ -1475,6 +1507,10 @@ function buildSubSnapshot(user) {
   return {
     used_bytes: used,
     used_formatted: formatBytes(used),
+    uplink_bytes: getEffectiveUplinkBytes(user),
+    uplink_formatted: formatBytes(getEffectiveUplinkBytes(user)),
+    downlink_bytes: getEffectiveDownlinkBytes(user),
+    downlink_formatted: formatBytes(getEffectiveDownlinkBytes(user)),
     remaining_bytes: remaining,
     remaining_formatted: remaining === null ? 'Unlimited' : formatBytes(remaining),
     percent,
@@ -1710,6 +1746,8 @@ app.post('/api/users', requireAuth, (req, res) => {
     traffic_limit: limitGB > 0 ? Math.floor(limitGB * 1024 * 1024 * 1024) : 0,
     connection_limit: connectionLimit,
     used_bytes: 0,
+    uplink_bytes: 0,
+    downlink_bytes: 0,
     expiry_time: expiryDays > 0 ? Date.now() + Math.floor(expiryDays * 24 * 60 * 60 * 1000) : 0,
     last_seen: 0,
     is_active: 1,
@@ -1729,6 +1767,8 @@ app.delete('/api/users/:id', requireAuth, (req, res) => {
   const before = DB.users.length;
   const user = DB.users.find((u) => u.id === req.params.id);
   pendingTrafficBytes.delete(req.params.id);
+  pendingUplinkBytes.delete(req.params.id);
+  pendingDownlinkBytes.delete(req.params.id);
   pendingLastSeen.delete(req.params.id);
   DB.users = DB.users.filter((u) => u.id !== req.params.id);
   if (DB.users.length < before) {
@@ -1756,8 +1796,12 @@ app.post('/api/users/:id/reset', requireAuth, (req, res) => {
   const user = DB.users.find((u) => u.id === req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   pendingTrafficBytes.delete(user.id);
+  pendingUplinkBytes.delete(user.id);
+  pendingDownlinkBytes.delete(user.id);
   pendingLastSeen.delete(user.id);
   user.used_bytes = 0;
+  user.uplink_bytes = 0;
+  user.downlink_bytes = 0;
   user.is_active = 1;
   user.last_seen = 0;
   scheduleRealtimeBroadcast();
@@ -1881,6 +1925,8 @@ app.get('/sub/:sub_id', (req, res) => {
   const effectiveUsed = getEffectiveUsedBytes(user);
   const effectiveLastSeen = getEffectiveLastSeen(user);
   const usedFormatted = formatBytes(effectiveUsed);
+  const uplinkFormatted = formatBytes(getEffectiveUplinkBytes(user));
+  const downlinkFormatted = formatBytes(getEffectiveDownlinkBytes(user));
   const remainingFormatted = user.traffic_limit === 0 ? 'Unlimited' : formatBytes(Math.max(0, user.traffic_limit - effectiveUsed));
   const percent = calcPercent(effectiveUsed, user.traffic_limit).toFixed(1);
   const progressWidth = calcPercent(effectiveUsed, user.traffic_limit).toFixed(2);
@@ -1900,14 +1946,14 @@ app.get('/sub/:sub_id', (req, res) => {
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>${remarkSafe} - Subscription</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:radial-gradient(circle at top right,#1a1a2e,#08080d 70%);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}.shell{width:100%;max-width:980px}.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:28px;padding:30px;box-shadow:0 25px 70px rgba(0,0,0,.55);backdrop-filter:blur(18px)}.hero{text-align:center;margin-bottom:26px}h1{color:#d4af37;margin-bottom:8px;font-size:32px}.sub{color:#888;letter-spacing:2px;font-size:12px;text-transform:uppercase}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.stat{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;text-align:center}.label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px}.value{font-size:22px;font-weight:800;margin-top:6px}.progress{height:9px;background:rgba(255,255,255,.08);border-radius:10px;overflow:hidden;margin:12px 0 22px}.fill{height:100%;background:linear-gradient(90deg,#d4af37,#eab308);width:${progressWidth}%}.danger{background:linear-gradient(90deg,#ef4444,#f87171)}.info{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;margin:18px 0}.row{display:flex;justify-content:space-between;gap:14px;margin:12px 0;color:#ddd}.row span:first-child{color:#888}.badge{white-space:nowrap;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:800}.active{background:rgba(34,197,94,.13);color:#4ade80}.expired{background:rgba(239,68,68,.13);color:#f87171}.configs{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:18px}.cfg{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:20px;padding:18px}.cfg h3{font-size:16px;margin-bottom:12px;color:#d4af37}.qr{background:#fff;border-radius:14px;padding:10px;width:148px;height:148px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center}.qr img{width:128px;height:128px}.btn{width:100%;background:linear-gradient(45deg,#d4af37,#b2891d);color:#000;border:0;padding:14px;border-radius:12px;font-weight:900;cursor:pointer;margin-top:9px}.btn.secondary{background:rgba(255,255,255,.06);color:#d4af37;border:1px solid rgba(212,175,55,.35)}.btn.dark{background:rgba(0,0,0,.28);color:#ddd;border:1px solid rgba(255,255,255,.1)}.guide{text-align:center;margin-top:18px;color:#777;font-size:12px;line-height:1.6}@media(max-width:760px){.card{padding:22px;border-radius:22px}.grid,.configs{grid-template-columns:1fr}h1{font-size:26px}.row{font-size:13px}.qr{width:136px;height:136px}.qr img{width:116px;height:116px}}
+*{box-sizing:border-box;margin:0;padding:0;font-family:Arial,sans-serif}body{background:radial-gradient(circle at top right,#1a1a2e,#08080d 70%);color:#fff;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}.shell{width:100%;max-width:980px}.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.08);border-radius:28px;padding:30px;box-shadow:0 25px 70px rgba(0,0,0,.55);backdrop-filter:blur(18px)}.hero{text-align:center;margin-bottom:26px}h1{color:#d4af37;margin-bottom:8px;font-size:32px}.sub{color:#888;letter-spacing:2px;font-size:12px;text-transform:uppercase}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.stat{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;text-align:center}.label{color:#888;font-size:11px;text-transform:uppercase;letter-spacing:1px}.value{font-size:22px;font-weight:800;margin-top:6px}.progress{height:9px;background:rgba(255,255,255,.08);border-radius:10px;overflow:hidden;margin:12px 0 22px}.fill{height:100%;background:linear-gradient(90deg,#d4af37,#eab308);width:${progressWidth}%}.danger{background:linear-gradient(90deg,#ef4444,#f87171)}.info{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.06);border-radius:18px;padding:18px;margin:18px 0}.row{display:flex;justify-content:space-between;gap:14px;margin:12px 0;color:#ddd}.row span:first-child{color:#888}.badge{white-space:nowrap;padding:5px 12px;border-radius:20px;font-size:11px;font-weight:800}.active{background:rgba(34,197,94,.13);color:#4ade80}.expired{background:rgba(239,68,68,.13);color:#f87171}.qr-tabs{display:flex;gap:8px;background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:6px;margin-top:18px}.qr-tab{flex:1;border:0;border-radius:12px;padding:12px;background:transparent;color:#aaa;font-weight:900;cursor:pointer}.qr-tab.active{background:linear-gradient(45deg,#d4af37,#f3e5ab);color:#000}.qr-panel{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.07);border-radius:20px;padding:20px;margin-top:14px;text-align:center}.qr{background:#fff;border-radius:16px;padding:12px;width:220px;height:220px;margin:0 auto 14px;display:flex;align-items:center;justify-content:center}.qr img{width:196px;height:196px}.transport-info{color:#aaa;font-size:12px;line-height:1.7;margin:8px 0 10px}.btn{width:100%;background:linear-gradient(45deg,#d4af37,#b2891d);color:#000;border:0;padding:14px;border-radius:12px;font-weight:900;cursor:pointer;margin-top:9px}.btn.secondary{background:rgba(255,255,255,.06);color:#d4af37;border:1px solid rgba(212,175,55,.35)}.btn.dark{background:rgba(0,0,0,.28);color:#ddd;border:1px solid rgba(255,255,255,.1)}.guide{text-align:center;margin-top:18px;color:#777;font-size:12px;line-height:1.6}@media(max-width:760px){.card{padding:22px;border-radius:22px}.grid{grid-template-columns:1fr}h1{font-size:26px}.row{font-size:13px}.qr{width:180px;height:180px}.qr img{width:156px;height:156px}.qr-tabs{flex-direction:column}}
 </style></head><body><main class="shell"><div class="card"><div class="hero"><h1>${remarkSafe}</h1><div class="sub">Smart VLESS Subscription</div></div>
-<div class="grid"><div class="stat"><div class="label">Used Traffic</div><div class="value" id="usedValue">${usedFormatted}</div></div><div class="stat"><div class="label">Remaining</div><div class="value" id="remainingValue">${remainingFormatted}</div></div></div>
+<div class="grid"><div class="stat"><div class="label">Used Traffic</div><div class="value" id="usedValue">${usedFormatted}</div></div><div class="stat"><div class="label">Remaining</div><div class="value" id="remainingValue">${remainingFormatted}</div></div><div class="stat"><div class="label">Upload</div><div class="value" id="uploadValue">${uplinkFormatted}</div></div><div class="stat"><div class="label">Download</div><div class="value" id="downloadValue">${downlinkFormatted}</div></div></div>
 <div style="display:flex;justify-content:space-between;color:#aaa;font-size:12px;margin-top:18px"><span>Traffic Usage</span><span id="percentValue">${percent}%</span></div><div class="progress"><div id="trafficFill" class="fill ${isDanger ? 'danger' : ''}"></div></div>
 <div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
-<div class="configs"><section class="cfg"><h3>XHTTP Config</h3><div class="qr"><img alt="XHTTP QR" src="${qrBase}/xhttp"></div><button class="btn" onclick="copyXhttp()">Copy XHTTP Config</button></section><section class="cfg"><h3>WebSocket Config</h3><div class="qr"><img alt="WebSocket QR" src="${qrBase}/ws"></div><button class="btn secondary" onclick="copyWs()">Copy WebSocket Config</button></section></div>
-<button class="btn dark" onclick="copySub()">Copy Subscription URL</button><button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button><div class="guide">VPN clients get both configs automatically. Browsers see this smart page with separate QR codes and copy buttons.</div></div></main>
-<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};function copyText(t){navigator.clipboard.writeText(t).then(function(){alert('Copied!')}).catch(function(){prompt('Copy:',t)})}function copyXhttp(){copyText(XHTTP_LINK)}function copyWs(){copyText(WS_LINK)}function copyAll(){copyText(ALL_LINKS)}function copySub(){copyText(SUB_URL)}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('percentValue').textContent=d.percent+'%';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':'');var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+(d.expired?'expired':'active');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);});
+<div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div><div class="qr-panel"><div class="qr"><img id="qrImage" alt="QR Code" src="${qrBase}/xhttp"></div><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" onclick="downloadQr()">Download QR</button></div>
+<button class="btn dark" onclick="copyAll()">Copy Both Raw Configs</button><div class="guide">VPN clients get both configs automatically. Browsers see this smart page with QR codes and copy buttons.</div></div></main>
+<script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.textContent=t;e.style.cssText='position:fixed;right:20px;bottom:20px;background:#15151d;color:#fff;border:1px solid rgba(212,175,55,.35);padding:12px 16px;border-radius:12px;z-index:999;box-shadow:0 15px 35px rgba(0,0,0,.4)';document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});document.getElementById('qrImage').src=QR_BASE+'/'+t+'?ts='+Date.now();var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function downloadQr(){var a=document.createElement('a');a.href=QR_BASE+'/'+ACTIVE_QR;a.download='qr-'+ACTIVE_QR+'.svg';a.click()}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('percentValue').textContent=d.percent+'%';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':'');var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+(d.expired?'expired':'active');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);});
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 app.get('/panel', (req, res) => {
@@ -2015,7 +2061,7 @@ wss.on('connection', (ws, req) => {
     if (!remote || remote.destroyed || !established) return;
     while (pendingClientChunks.length) {
       const chunk = pendingClientChunks.shift();
-      updateTraffic(user, chunk.length);
+      updateTraffic(user, chunk.length, 'uplink');
       if (!remote.write(chunk)) break;
     }
   }
@@ -2023,7 +2069,7 @@ wss.on('connection', (ws, req) => {
   function sendUdpPacket(packet) {
     if (closed || !udpSocket || !udpTargetHost || !udpTargetPort) return;
     if (udpIdleTimer && udpIdleTimer.refresh) udpIdleTimer.refresh();
-    updateTraffic(user, packet.length);
+    updateTraffic(user, packet.length, 'uplink');
     udpSocket.send(packet, udpTargetPort, udpTargetHost, (err) => {
       if (err) {
         log('[UDP] Send failed:', err.message);
@@ -2090,7 +2136,7 @@ wss.on('connection', (ws, req) => {
         udpSocket = dgram.createSocket(udpType);
         udpSocket.on('message', (msg) => {
           refreshIdleTimer();
-          updateTraffic(user, msg.length);
+          updateTraffic(user, msg.length, 'downlink');
           try {
             sendToWs(encodeUdpPacket(msg));
           } catch (err) {
@@ -2127,7 +2173,7 @@ wss.on('connection', (ws, req) => {
         established = true;
         sendVlessResponseHeader(request.version);
         if (request.payload.length) {
-          updateTraffic(user, request.payload.length);
+          updateTraffic(user, request.payload.length, 'uplink');
           if (!remote.write(request.payload)) {
             try { req.socket.pause(); } catch (_) {}
           }
@@ -2142,7 +2188,7 @@ wss.on('connection', (ws, req) => {
 
       remote.on('data', (remoteChunk) => {
         refreshIdleTimer();
-        updateTraffic(user, remoteChunk.length);
+        updateTraffic(user, remoteChunk.length, 'downlink');
         sendToWs(remoteChunk);
       });
 
@@ -2186,7 +2232,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    updateTraffic(user, chunk.length);
+    updateTraffic(user, chunk.length, 'uplink');
     if (!remote.write(chunk)) {
       try { req.socket.pause(); } catch (_) {}
     }
