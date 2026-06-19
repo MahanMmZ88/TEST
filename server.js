@@ -44,7 +44,9 @@ const DB_SAVE_DEBOUNCE_MS = 5000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
-const ACTIVE_CONNECTION_STALE_MS = 90 * 1000;
+const ACTIVE_CONNECTION_STALE_MS = 45 * 1000;
+const IP_LIMIT_STALE_MS = 20 * 1000;
+const WS_PING_INTERVAL_MS = 15 * 1000;
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
@@ -303,7 +305,32 @@ function getActiveUserByUuid(uuidBytes) {
   return user;
 }
 
+function removeConnection(userId, connectionId, reason = 'removed') {
+  const map = activeConnections.get(userId);
+  if (!map) return false;
+  const existed = map.delete(connectionId);
+  if (map.size === 0) activeConnections.delete(userId);
+  if (existed) scheduleRealtimeBroadcast();
+  return existed;
+}
+
+function pruneStaleConnections(userId, maxAge = ACTIVE_CONNECTION_STALE_MS) {
+  const map = activeConnections.get(userId);
+  if (!map) return 0;
+
+  const now = Date.now();
+  let removed = 0;
+  for (const conn of Array.from(map.values())) {
+    if (now - conn.lastSeen > maxAge) {
+      try { conn.closeFn('connection stale'); } catch (_) {}
+      if (removeConnection(userId, conn.id, 'stale')) removed += 1;
+    }
+  }
+  return removed;
+}
+
 function getActiveIpSet(userId) {
+  pruneStaleConnections(userId, ACTIVE_CONNECTION_STALE_MS);
   const map = activeConnections.get(userId);
   if (!map) return new Set();
   return new Set(Array.from(map.values()).map((conn) => conn.ip).filter(Boolean));
@@ -312,6 +339,11 @@ function getActiveIpSet(userId) {
 function canAcceptUserIp(user, ip) {
   const limit = Number(user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
+
+  // Before rejecting a new IP, aggressively prune silent/stuck sessions.
+  // This prevents a disconnected phone from reserving the user's only IP forever.
+  pruneStaleConnections(user.id, IP_LIMIT_STALE_MS);
+
   const ips = getActiveIpSet(user.id);
   return ips.has(ip) || ips.size < limit;
 }
@@ -332,11 +364,7 @@ function registerConnection(userId, closeFn, meta = {}) {
   scheduleRealtimeBroadcast();
 
   const unregister = () => {
-    const current = activeConnections.get(userId);
-    if (!current) return;
-    current.delete(id);
-    if (current.size === 0) activeConnections.delete(userId);
-    scheduleRealtimeBroadcast();
+    removeConnection(userId, id, 'unregister');
   };
   unregister.touch = () => {
     const current = activeConnections.get(userId);
@@ -352,6 +380,7 @@ function closeUserConnections(userId, reason = 'user disabled') {
   if (!map) return;
   for (const conn of Array.from(map.values())) {
     try { conn.closeFn(reason); } catch (_) {}
+    removeConnection(userId, conn.id, reason);
   }
 }
 
@@ -1806,7 +1835,7 @@ wss.on('connection', (ws, req) => {
     }
     wsAlive = false;
     try { ws.ping(); } catch (_) { closeAll(1011, 'websocket ping failed'); }
-  }, 30000);
+  }, WS_PING_INTERVAL_MS);
 
   const idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), IDLE_TIMEOUT_MS);
   const connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), CONNECT_TIMEOUT_MS);
