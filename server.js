@@ -23,15 +23,15 @@ const PASSWORD_SALT = 'MAHAN_PANEL_NODE_WS_SALT_v2';
 const CONNECT_TIMEOUT_MS = 15000;
 const IDLE_TIMEOUT_MS = 120000;
 const MAX_FIRST_PACKET = 128 * 1024;
-const MAX_WS_PAYLOAD = 16 * 1024 * 1024;
-const WS_BACKPRESSURE_LIMIT = 8 * 1024 * 1024;
-const WS_BACKPRESSURE_RESUME = 2 * 1024 * 1024;
+const MAX_WS_PAYLOAD = 8 * 1024 * 1024;
+const WS_BACKPRESSURE_LIMIT = 4 * 1024 * 1024;
+const WS_BACKPRESSURE_RESUME = 1 * 1024 * 1024;
 const MAX_UDP_PACKET_SIZE = 64 * 1024;
 const UDP_IDLE_TIMEOUT_MS = 60000;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
-const MAX_XHTTP_POST_SIZE = 2 * 1024 * 1024;
-const MAX_XHTTP_BUFFERED_POSTS = 64;
-const MAX_XHTTP_DOWNLINK_BUFFER = 8 * 1024 * 1024;
+const MAX_XHTTP_POST_SIZE = 4 * 1024 * 1024;
+const MAX_XHTTP_BUFFERED_POSTS = 32;
+const MAX_XHTTP_DOWNLINK_BUFFER = 4 * 1024 * 1024;
 const XHTTP_SESSION_TIMEOUT_MS = 300000;
 const XHTTP_RESPONSE_HEADERS = {
   'content-type': 'application/octet-stream',
@@ -689,6 +689,8 @@ class XHttpSession {
     this.pendingRemoteWrites = [];
     this.pendingDownlinkChunks = [];
     this.pendingDownlinkBytes = 0;
+    this.streamInitBuffer = Buffer.alloc(0);
+    this.streamQueue = Promise.resolve();
     this.lastActivity = Date.now();
     this.connectTimer = null;
     this.cleanupTimer = setTimeout(() => this.close('session timeout'), XHTTP_SESSION_TIMEOUT_MS);
@@ -755,14 +757,48 @@ class XHttpSession {
     }
   }
 
-  initialize(firstPacket) {
+  processStreamChunk(chunk) {
+    this.streamQueue = this.streamQueue.then(() => this._processStreamChunk(chunk));
+    return this.streamQueue;
+  }
+
+  async _processStreamChunk(chunk) {
+    if (this.closed || !chunk || chunk.length === 0) return;
+    this.refresh();
+
+    if (this.established || this.remote || this.udpMode || this.muxMode) {
+      this.writeToRemote(chunk);
+      return;
+    }
+
+    this.streamInitBuffer = this.streamInitBuffer.length ? Buffer.concat([this.streamInitBuffer, chunk]) : Buffer.from(chunk);
+    if (this.streamInitBuffer.length > MAX_FIRST_PACKET) throw new Error('stream-up first packet too large');
+
+    try {
+      await this.initialize(this.streamInitBuffer, { allowIncomplete: true });
+      this.streamInitBuffer = Buffer.alloc(0);
+    } catch (err) {
+      const msg = err && err.message ? err.message : '';
+      const incomplete = msg.includes('too short') || msg.includes('invalid options length') ||
+        msg.includes('invalid ipv4') || msg.includes('invalid domain length') ||
+        msg.includes('invalid domain') || msg.includes('invalid ipv6');
+      if (incomplete && !this.closed) return;
+      throw err;
+    }
+  }
+
+  initialize(firstPacket, options = {}) {
     if (this.remote || this.udpMode || this.muxMode) return Promise.resolve();
 
     let request;
     try {
       request = parseVlessRequest(firstPacket, { allowUdp: true, allowMux: true });
     } catch (err) {
-      this.close('bad vless request');
+      const msg = err && err.message ? err.message : '';
+      const incomplete = msg.includes('too short') || msg.includes('invalid options length') ||
+        msg.includes('invalid ipv4') || msg.includes('invalid domain length') ||
+        msg.includes('invalid domain') || msg.includes('invalid ipv6');
+      if (!options.allowIncomplete || !incomplete) this.close('bad vless request');
       throw err;
     }
 
@@ -968,6 +1004,7 @@ class XHttpSession {
       try { this.downlinkRes.end(); } catch (_) {}
     }
     this.pendingPackets.clear();
+    this.streamInitBuffer = Buffer.alloc(0);
     this.pendingRemoteWrites = [];
     this.pendingDownlinkChunks = [];
     this.pendingDownlinkBytes = 0;
@@ -1315,6 +1352,50 @@ app.get([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =>
   }
   const session = getXHttpSession(sessionId);
   session.attachDownlink(req, res);
+});
+
+// XHTTP stream-up upload channel: one long-lived POST carrying ordered VLESS bytes.
+app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
+  const sessionId = String(req.params.sessionId || '').trim();
+  if (sessionId.length < 1 || sessionId.length > 256) {
+    res.writeHead(400, XHTTP_RESPONSE_HEADERS);
+    res.end();
+    return;
+  }
+
+  const session = getXHttpSession(sessionId);
+  let failed = false;
+  req.setTimeout(0);
+  res.setTimeout(0);
+  res.writeHead(200, XHTTP_RESPONSE_HEADERS);
+
+  req.on('data', (chunk) => {
+    if (failed) return;
+    req.pause();
+    session.processStreamChunk(chunk).then(() => {
+      if (!failed) req.resume();
+    }).catch((err) => {
+      failed = true;
+      log('[XHTTP stream-up] failed:', err && err.message ? err.message : 'unknown');
+      session.close('stream-up failed');
+      try { res.end(); } catch (_) {}
+    });
+  });
+
+  req.on('end', () => {
+    session.streamQueue.finally(() => {
+      if (!res.writableEnded) res.end();
+    });
+  });
+  req.on('error', () => {
+    failed = true;
+    session.close('stream-up request error');
+    try { res.end(); } catch (_) {}
+  });
+  req.on('aborted', () => {
+    failed = true;
+    session.close('stream-up aborted');
+  });
 });
 
 app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], async (req, res) => {
