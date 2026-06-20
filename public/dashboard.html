@@ -124,7 +124,7 @@
         .chart-title p { color:#777; font-size:11px; margin-top:3px; }
         .chart-section canvas { margin-top:28px; width:100%; height:calc(100% - 28px); display:block; }
         .toolbar { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom:22px; flex-wrap:wrap; }
-        .toolbar-left { display:flex; gap:10px; align-items:center; flex:1; min-width:260px; }
+        .toolbar-left { display:grid; grid-template-columns:minmax(260px, 1fr) max-content; gap:10px; align-items:center; flex:1; min-width:260px; }
         .search-box, .filter-select { background: rgba(0,0,0,0.28); border:1px solid rgba(255,255,255,0.09); color:#fff; border-radius:14px; padding:13px 14px; outline:none; transition:.25s; }
         .search-box { width:100%; min-width:220px; }
         .search-box:focus, .filter-select:focus { border-color:rgba(212,175,55,.55); box-shadow:0 0 0 4px rgba(212,175,55,.08); }
@@ -204,7 +204,10 @@
         .settings-tab.active { color:#000; background:linear-gradient(135deg,var(--gold),var(--gold2)); }
         .settings-pane { display:none; }
         .settings-pane.active { display:block; }
-        .filter-pills { display:flex; gap:8px; flex-wrap:wrap; padding:6px; border-radius:16px; background:rgba(0,0,0,.24); border:1px solid rgba(255,255,255,.075); }
+        #settingsPaneDanger .quick-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        #settingsPaneDanger .action-btn { width: 100%; min-width: 0; white-space: normal; justify-content: center; text-align: center; line-height: 1.35; }
+        .filter-pills { display:grid; grid-template-columns:repeat(4, max-content); gap:8px; padding:6px; border-radius:16px; background:rgba(0,0,0,.24); border:1px solid rgba(255,255,255,.075); overflow-x:auto; scrollbar-width:none; }
+        .filter-pills::-webkit-scrollbar { display:none; }
         .filter-pill { border:0; cursor:pointer; padding:10px 13px; border-radius:12px; background:transparent; color:#aaa; font-size:12px; font-weight:900; letter-spacing:.7px; text-transform:uppercase; transition:.22s; }
         .filter-pill:hover { color:#fff; background:rgba(255,255,255,.055); }
         .filter-pill.active { color:#000; background:linear-gradient(135deg,var(--gold),var(--gold2)); box-shadow:0 10px 24px rgba(212,175,55,.15); }
@@ -250,7 +253,7 @@
             .hero-top { flex-direction:column; }
             .hero-title { font-size:28px; }
             .toolbar { align-items:stretch; }
-            .toolbar-left { flex-direction:column; align-items:stretch; width:100%; }
+            .toolbar-left { grid-template-columns:1fr; align-items:stretch; width:100%; }
             .header h1 { font-size: 26px; }
             .host-badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
             .stats-grid { grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 28px; }
@@ -873,7 +876,7 @@
                     '<div class="client-usage">' +
                         '<div class="usage-top"><span>' + usedText + ' used</span><span class="usage-percent">' + percentLabel + '</span></div>' +
                         '<div class="traffic-bar-bg"><div class="traffic-bar-fill ' + barClass + '" style="width:' + percent + '%"></div></div>' +
-                        '<div class="traffic-text" style="margin-top:8px"><span>↑ ' + uploadText + '</span><span>↓ ' + downloadText + '</span></div>' +
+                        '<div class="traffic-text" style="margin-top:8px"><span>↓ ' + downloadText + '</span><span>↑ ' + uploadText + '</span></div>' +
                         '<div class="traffic-text" style="margin-top:4px"><span>Limit: ' + limitText + '</span><span>Left: ' + remainText + '</span></div>' +
                     '</div>' +
                     '<div class="client-actions">' +
