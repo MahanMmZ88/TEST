@@ -551,7 +551,12 @@ function markUserDataActivity(userId) {
 
 function updateTraffic(user, bytes, direction = 'total', touchActivity = null) {
   if (!user || !bytes || bytes <= 0) return;
+
+  // Touch only the connection/session that actually moved bytes. Previously we
+  // refreshed every connection for the user, which could keep disconnected
+  // client slots alive while another device was still passing traffic.
   if (typeof touchActivity === 'function') touchActivity();
+  else markUserDataActivity(user.id);
 
   // Fast data-plane path: only increment in-memory counters here.
   // Expensive UI/DB/quota work is committed in a 1s batch by flushTrafficBuffers().
@@ -1644,7 +1649,7 @@ function scheduleRealtimeBroadcast() {
   realtimeBroadcastTimer = setTimeout(() => {
     realtimeBroadcastTimer = null;
     broadcastRealtimeNow();
-  }, 1000);
+  }, 100);
 }
 
 app.get('/health', (req, res) => res.type('text/plain').send(`ok - ${BUILD_ID}\n`));
