@@ -15,7 +15,7 @@ const app = express();
 app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide PORT automatically.
-const BUILD_ID = 'sub-ui-final-edit-2026-06-19-b';
+const BUILD_ID = 'server-only-subscription-layout-2026-06-20-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 const DB_PATH = path.join(__dirname, 'db.json');
@@ -2043,7 +2043,7 @@ app.get('/sub/:sub_id', (req, res) => {
     .orb.one { width:320px; height:320px; background:#d4af37; top:-120px; right:-90px; }
     .orb.two { width:260px; height:260px; background:#6366f1; bottom:-110px; left:-80px; animation-delay:-4s; }
     @keyframes float { from { transform:translate3d(0,0,0) scale(1); } to { transform:translate3d(24px,28px,0) scale(1.08); } }
-    .shell { width:100%; max-width:1060px; }
+    .shell { width:100%; max-width:1280px; }
     .card { position:relative; overflow:hidden; background:linear-gradient(135deg, rgba(255,255,255,.06), rgba(255,255,255,.025)); border:1px solid var(--line); border-radius:32px; padding:30px; box-shadow:0 30px 90px rgba(0,0,0,.58); backdrop-filter:blur(18px); }
     .card:after { content:''; position:absolute; width:320px; height:320px; border-radius:50%; background:radial-gradient(circle, rgba(212,175,55,.16), transparent 68%); top:-150px; right:-120px; pointer-events:none; }
     .hero { position:relative; z-index:1; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; gap:14px; margin-bottom:26px; }
@@ -2059,7 +2059,7 @@ app.get('/sub/:sub_id', (req, res) => {
     .status-pill.expired { border-color:rgba(239,68,68,.35); background:rgba(239,68,68,.10); color:#f87171; }
     .status-pill:before { content:''; width:8px; height:8px; border-radius:50%; background:#22c55e; box-shadow:0 0 14px #22c55e; }
     .status-pill.expired:before { background:#ef4444; box-shadow:0 0 14px #ef4444; }
-    .main-grid { display:grid; grid-template-columns: 1.05fr .95fr; gap:18px; align-items:stretch; position:relative; z-index:1; }
+    .main-grid { display:grid; grid-template-columns:minmax(0,1.12fr) minmax(360px,.88fr); gap:18px; align-items:stretch; position:relative; z-index:1; }
     .panel { background:rgba(0,0,0,.24); border:1px solid rgba(255,255,255,.075); border-radius:24px; padding:20px; }
     .usage-head { display:flex; justify-content:space-between; align-items:center; gap:14px; margin-bottom:18px; }
     .ring { width:132px; height:132px; border-radius:50%; display:grid; place-items:center; background: conic-gradient(${ringColor} 0 ${ringDeg}deg, rgba(255,255,255,.09) ${ringDeg}deg 360deg); box-shadow:0 0 34px rgba(212,175,55,.10); position:relative; flex:0 0 auto; }
