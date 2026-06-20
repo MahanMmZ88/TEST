@@ -142,6 +142,19 @@ function getCpuUsagePercent() {
   return cachedCpuUsage;
 }
 
+function parseUserNumber(value, fallback = 0) {
+  if (value === null || value === undefined) return fallback;
+  const fa = '۰۱۲۳۴۵۶۷۸۹';
+  const ar = '٠١٢٣٤٥٦٧٨٩';
+  let s = String(value).trim();
+  s = s.replace(/[۰-۹]/g, (d) => String(fa.indexOf(d)));
+  s = s.replace(/[٠-٩]/g, (d) => String(ar.indexOf(d)));
+  s = s.replace(/,/g, '.');
+  s = s.replace(/[^0-9.+-]/g, '');
+  const n = Number(s);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 function formatBytes(bytes) {
   if (!bytes || bytes <= 0) return '0 B';
   const k = 1024;
@@ -1795,9 +1808,9 @@ app.post('/api/users', requireAuth, (req, res) => {
   if (!cleanRemark) return res.status(400).json({ error: 'Remark is required' });
   if (DB.users.some((u) => u.remark === cleanRemark)) return res.status(400).json({ error: 'Username must be unique' });
 
-  const limitGB = Number(traffic_limit_gb || 0);
-  const expiryDays = Number(expiry_days || 0);
-  const connectionLimit = Math.max(0, Math.floor(Number(connection_limit ?? ip_limit ?? 0)));
+  const limitGB = parseUserNumber(traffic_limit_gb, 0);
+  const expiryDays = parseUserNumber(expiry_days, 0);
+  const connectionLimit = Math.max(0, Math.floor(parseUserNumber(connection_limit ?? ip_limit, 0)));
   const host = req.get('host') || '';
   let createdOn = 'other';
   if (host.includes('railway.app')) createdOn = 'railway';
@@ -1897,9 +1910,9 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Username must be unique' });
   }
 
-  const limitGB = Number(traffic_limit_gb || 0);
-  const expiryDays = Number(expiry_days || 0);
-  const connectionLimit = Math.max(0, Math.floor(Number(connection_limit ?? ip_limit ?? 0)));
+  const limitGB = parseUserNumber(traffic_limit_gb, 0);
+  const expiryDays = parseUserNumber(expiry_days, 0);
+  const connectionLimit = Math.max(0, Math.floor(parseUserNumber(connection_limit ?? ip_limit, 0)));
   const oldConnectionLimit = Number(user.connection_limit || user.ip_limit || 0);
 
   user.remark = cleanRemark;
