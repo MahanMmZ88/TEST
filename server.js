@@ -47,7 +47,7 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
 const ACTIVE_CONNECTION_STALE_MS = 60 * 1000;
 const CONNECTION_CLEANUP_INTERVAL_MS = 500;
-const CLIENT_SLOT_TTL_MS = 2 * 1000; // client slot lease TTL; renewed only by real traffic bytes
+const ACTIVE_CLIENT_WINDOW_MS = 5 * 1000; // Xray-like client activity window for Client Limit
 const WS_PING_INTERVAL_MS = 2000;
 
 let DB = { admin: null, users: [] };
@@ -66,7 +66,7 @@ let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clientKey, kind, closeFn, lastSeen })
-const clientSlots = new Map(); // user.id -> Map(clientKey, { firstSeen, lastSeen })
+const clientSlots = new Map(); // user.id -> Map(clientKey, { firstSeen, lastSeen }) - Mahan Xray-like Client Tracker
 const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
 let realtimeBroadcastTimer = null;
@@ -406,22 +406,13 @@ function pruneClientSlots(userId) {
   const slots = clientSlots.get(userId);
   if (!slots) return 0;
   const now = Date.now();
-  const active = activeConnections.get(userId);
   let removed = 0;
 
   for (const [key, slot] of Array.from(slots.entries())) {
-    // Keep only connection ids that still exist in activeConnections and still
-    // belong to the same clientKey. This makes the displayed count drop from
-    // 3→2→1 immediately when each client disconnects.
-    if (slot.connectionIds && active) {
-      for (const id of Array.from(slot.connectionIds)) {
-        const conn = active.get(id);
-        if (!conn || conn.clientKey !== key) slot.connectionIds.delete(id);
-      }
-    }
-
-    const refCount = slot.connectionIds ? slot.connectionIds.size : 0;
-    if (refCount === 0 || now - Number(slot.lastSeen || 0) > CLIENT_SLOT_TTL_MS) {
+    // Mahan Xray-like Client Tracker:
+    // Count active clients from recent connection/traffic activity, not raw
+    // socket lifetime. This prevents stuck sockets from keeping counts forever.
+    if (now - Number(slot.lastSeen || 0) > ACTIVE_CLIENT_WINDOW_MS) {
       slots.delete(key);
       removed += 1;
     }
@@ -435,6 +426,10 @@ function pruneClientSlots(userId) {
 function getClientSlotCount(userId) {
   pruneClientSlots(userId);
   return clientSlots.get(userId)?.size || 0;
+}
+
+function makeClientKey(ip) {
+  return `ip:${normalizeIpAddress(ip) || 'unknown'}`;
 }
 
 function canAcceptUserSession(user, clientKey) {
@@ -473,7 +468,9 @@ function releaseClientSlotIfUnused(userId, clientKey, connectionId) {
     slots.delete(clientKey);
     if (slots.size === 0) clientSlots.delete(userId);
     scheduleRealtimeBroadcast();
+    return;
   }
+  pruneClientSlots(userId);
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -916,7 +913,7 @@ class XHttpSession {
     this.udpState = { buffer: Buffer.alloc(0) };
     this.udpIdleTimer = null;
     this.clientIp = 'unknown';
-    this.clientKey = `xhttp:${sessionId}`;
+    this.clientKey = 'ip:unknown';
     this.version = 0;
     this.downlinkRes = null;
     this.nextSeq = 0;
@@ -952,6 +949,7 @@ class XHttpSession {
 
     this.refresh();
     this.clientIp = getClientIp(req);
+    this.clientKey = makeClientKey(this.clientIp);
     this.downlinkRes = res;
     req.setTimeout(0);
     res.setTimeout(0);
@@ -1669,7 +1667,10 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
   }
 
   const session = getXHttpSession(sessionId);
-  if (!session.clientIp || session.clientIp === 'unknown') session.clientIp = getClientIp(req);
+  if (!session.clientIp || session.clientIp === 'unknown') {
+    session.clientIp = getClientIp(req);
+    session.clientKey = makeClientKey(session.clientIp);
+  }
   let failed = false;
   req.setTimeout(0);
   res.setTimeout(0);
@@ -1716,7 +1717,10 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
   try {
     const body = await readRequestBody(req, MAX_XHTTP_POST_SIZE);
     const session = getXHttpSession(sessionId);
-    if (!session.clientIp || session.clientIp === 'unknown') session.clientIp = getClientIp(req);
+    if (!session.clientIp || session.clientIp === 'unknown') {
+      session.clientIp = getClientIp(req);
+      session.clientKey = makeClientKey(session.clientIp);
+    }
     await session.processPacket(seq, body);
     res.writeHead(200, XHTTP_RESPONSE_HEADERS);
     res.end();
@@ -2323,7 +2327,7 @@ wss.on('connection', (ws, req) => {
 
       user = request.user;
       const clientIp = getClientIp(req);
-      const clientKey = `ws:${clientIp}`;
+      const clientKey = makeClientKey(clientIp);
       if (!canAcceptUserSession(user, clientKey)) {
         log('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
         closeAll(1008, 'client limit exceeded');
@@ -2502,9 +2506,9 @@ setInterval(() => {
       const noTrafficFor = now - Number(conn.lastDataAt || conn.createdAt || 0);
 
       // For limited users, a client slot is considered gone when absolutely no
-      // traffic bytes pass for CLIENT_SLOT_TTL_MS. Close the stale raw sockets too
+      // traffic bytes pass for ACTIVE_CLIENT_WINDOW_MS. Close the stale raw sockets too
       // so they cannot reserve/revive a slot later and cause EOF/limit confusion.
-      if (hasClientLimit && noTrafficFor > CLIENT_SLOT_TTL_MS) {
+      if (hasClientLimit && noTrafficFor > ACTIVE_CLIENT_WINDOW_MS) {
         try { conn.closeFn('client traffic idle'); } catch (_) {}
         removeConnection(userId, conn.id, 'traffic idle');
         continue;
