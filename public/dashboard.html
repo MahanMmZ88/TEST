@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mahan WS Dashboard</title>
-    <!-- Self-contained preview: no external fonts/scripts required. -->
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
         :root { --gold:#d4af37; --gold2:#f3e5ab; --bg:#07070a; --card:rgba(255,255,255,0.035); --line:rgba(255,255,255,0.075); --muted:#888; --success:#22c55e; --danger:#ef4444; --glass: blur(16px); }
@@ -98,7 +98,7 @@
         .modal.show .modal-content { transform: scale(1) translateY(0); }
         .modal-content h3 { margin-bottom: 25px; font-size: 22px; font-weight: 700; color: #fff; }
         .modal label { display: block; color: #888; font-size: 11px; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 1px; font-weight: 600; }
-        .modal input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 15px; border-radius: 12px; margin-bottom: 25px; outline: none; font-size: 14px; transition: 0.3s; }
+        .modal input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 15px; border-radius: 12px; margin-bottom: 25px; outline: none; font-size: 14px; transition: 0.3s; font-family: 'Outfit', Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
         .modal input:focus { border-color: #d4af37; background: rgba(0,0,0,0.5); box-shadow: 0 0 0 4px rgba(212, 175, 55, 0.1); }
         .modal-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 10px; }
         .btn-cancel { background: transparent; border: 1px solid rgba(255,255,255,0.1); color: #aaa; padding: 12px 24px; border-radius: 12px; font-weight: 600; cursor: pointer; transition: 0.3s; }
@@ -433,11 +433,11 @@
         <label>Remark (Client Name)</label>
         <input type="text" id="remarkInput" placeholder="e.g. VIP User 1">
         <label>Data Limit (GB) - 0 for Unlimited</label>
-        <input type="number" id="limitInput" placeholder="e.g. 50" value="0">
+        <input type="text" inputmode="decimal" id="limitInput" placeholder="e.g. 50" value="0">
         <label>Expiry (Days) - 0 for Never</label>
-        <input type="number" id="expiryInput" placeholder="e.g. 30" value="0">
+        <input type="text" inputmode="numeric" id="expiryInput" placeholder="e.g. 30" value="0">
         <label>Connection Limit - 0 for Unlimited</label>
-        <input type="number" id="connectionLimitInput" placeholder="e.g. 3" value="0">
+        <input type="text" inputmode="numeric" id="connectionLimitInput" placeholder="e.g. 3" value="0">
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeModal()">Cancel</button>
             <button class="btn-gold" onclick="addUser()">Create</button>
@@ -543,11 +543,11 @@
         <label>Remark (Client Name)</label>
         <input type="text" id="editRemarkInput" placeholder="e.g. VIP User 1">
         <label>Data Limit (GB) - 0 for Unlimited</label>
-        <input type="number" id="editLimitInput" placeholder="e.g. 50" value="0" step="0.01">
+        <input type="text" inputmode="decimal" id="editLimitInput" placeholder="e.g. 50" value="0">
         <label>New Expiry From Today (Days) - 0 for Never</label>
-        <input type="number" id="editExpiryInput" placeholder="e.g. 30" value="0">
+        <input type="text" inputmode="numeric" id="editExpiryInput" placeholder="e.g. 30" value="0">
         <label>Connection Limit - 0 for Unlimited</label>
-        <input type="number" id="editConnectionLimitInput" placeholder="e.g. 3" value="0">
+        <input type="text" inputmode="numeric" id="editConnectionLimitInput" placeholder="e.g. 3" value="0">
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeEditModal()">Cancel</button>
             <button class="btn-gold" onclick="saveEditUser()">Save</button>
@@ -630,6 +630,22 @@
         var k = 1024, dm = 2, sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
         var i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    }
+
+    function parseNumberInputValue(value) {
+        var fa = '۰۱۲۳۴۵۶۷۸۹';
+        var ar = '٠١٢٣٤٥٦٧٨٩';
+        var s = String(value || '0').trim();
+        s = s.replace(/[۰-۹]/g, function(d) { return String(fa.indexOf(d)); });
+        s = s.replace(/[٠-٩]/g, function(d) { return String(ar.indexOf(d)); });
+        s = s.replace(/,/g, '.').replace(/[^0-9.+-]/g, '');
+        var n = Number(s);
+        return Number.isFinite(n) ? n : 0;
+    }
+
+    function getNumberInput(id) {
+        var el = document.getElementById(id);
+        return parseNumberInputValue(el ? el.value : 0);
     }
 
     function formatTehranDate(timestamp) {
@@ -1345,9 +1361,9 @@
     async function saveEditUser() {
         var id = document.getElementById('editUserId').value;
         var remark = document.getElementById('editRemarkInput').value;
-        var traffic_limit_gb = document.getElementById('editLimitInput').value;
-        var expiry_days = document.getElementById('editExpiryInput').value;
-        var connection_limit = document.getElementById('editConnectionLimitInput').value;
+        var traffic_limit_gb = getNumberInput('editLimitInput');
+        var expiry_days = getNumberInput('editExpiryInput');
+        var connection_limit = getNumberInput('editConnectionLimitInput');
         var btn = document.querySelector('#editModal .btn-gold');
         btn.textContent = 'Saving...';
 
@@ -1376,9 +1392,9 @@
 
     async function addUser() {
         var remark = document.getElementById('remarkInput').value;
-        var traffic_limit_gb = document.getElementById('limitInput').value;
-        var expiry_days = document.getElementById('expiryInput').value;
-        var connection_limit = document.getElementById('connectionLimitInput').value;
+        var traffic_limit_gb = getNumberInput('limitInput');
+        var expiry_days = getNumberInput('expiryInput');
+        var connection_limit = getNumberInput('connectionLimitInput');
         var btn = document.querySelector('.modal-content .btn-gold');
         btn.textContent = 'Processing...';
 
