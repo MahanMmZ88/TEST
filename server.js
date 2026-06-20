@@ -362,7 +362,7 @@ function removeConnection(userId, connectionId, reason = 'removed') {
   const existed = map.delete(connectionId);
   if (map.size === 0) activeConnections.delete(userId);
   if (existed) {
-    releaseClientSlotIfUnused(userId, conn?.clientKey);
+    releaseClientSlotIfUnused(userId, conn?.clientKey, connectionId);
     scheduleRealtimeBroadcast();
   }
   return existed;
@@ -399,22 +399,29 @@ function refreshClientSlot(userId, clientKey) {
   if (!clientKey) return;
   const slots = clientSlots.get(userId);
   const slot = slots?.get(clientKey);
-  if (slot) {
-    slot.lastSeen = Date.now();
-  }
+  if (slot) slot.lastSeen = Date.now();
 }
 
 function pruneClientSlots(userId) {
   const slots = clientSlots.get(userId);
   if (!slots) return 0;
   const now = Date.now();
+  const active = activeConnections.get(userId);
   let removed = 0;
 
   for (const [key, slot] of Array.from(slots.entries())) {
-    // Lease-based client slots expire only by their own lastSeen timestamp.
-    // We intentionally do NOT keep a slot alive just because a raw socket still
-    // exists; mobile clients/PaaS proxies can leave half-open sockets behind.
-    if (now - Number(slot.lastSeen || 0) > CLIENT_SLOT_TTL_MS) {
+    // Keep only connection ids that still exist in activeConnections and still
+    // belong to the same clientKey. This makes the displayed count drop from
+    // 3→2→1 immediately when each client disconnects.
+    if (slot.connectionIds && active) {
+      for (const id of Array.from(slot.connectionIds)) {
+        const conn = active.get(id);
+        if (!conn || conn.clientKey !== key) slot.connectionIds.delete(id);
+      }
+    }
+
+    const refCount = slot.connectionIds ? slot.connectionIds.size : 0;
+    if (refCount === 0 || now - Number(slot.lastSeen || 0) > CLIENT_SLOT_TTL_MS) {
       slots.delete(key);
       removed += 1;
     }
@@ -441,23 +448,32 @@ function canAcceptUserSession(user, clientKey) {
   return (slots?.size || 0) < limit;
 }
 
-function acquireClientSlot(userId, clientKey) {
+function acquireClientSlot(userId, clientKey, connectionId) {
   if (!clientKey) return;
   if (!clientSlots.has(userId)) clientSlots.set(userId, new Map());
   const slots = clientSlots.get(userId);
   const now = Date.now();
   const existing = slots.get(clientKey);
-  slots.set(clientKey, { firstSeen: existing?.firstSeen || now, lastSeen: now });
+  const connectionIds = existing?.connectionIds || new Set();
+  if (connectionId) connectionIds.add(connectionId);
+  slots.set(clientKey, { firstSeen: existing?.firstSeen || now, lastSeen: now, connectionIds });
   scheduleRealtimeBroadcast();
 }
 
-function releaseClientSlotIfUnused(userId, clientKey) {
-  // Lease-based slots are not deleted immediately on socket close.
-  // Keeping the lease until CLIENT_SLOT_TTL_MS prevents reconnect flapping and
-  // makes limit behavior independent from unreliable close events. The periodic
-  // pruner will release it shortly if the client does not renew activity.
+function releaseClientSlotIfUnused(userId, clientKey, connectionId) {
   if (!clientKey) return;
-  pruneClientSlots(userId);
+  const slots = clientSlots.get(userId);
+  const slot = slots?.get(clientKey);
+  if (!slot) return;
+  if (connectionId && slot.connectionIds) slot.connectionIds.delete(connectionId);
+
+  const active = activeConnections.get(userId);
+  const stillUsed = active && Array.from(active.values()).some((conn) => conn.clientKey === clientKey);
+  if (!stillUsed || !slot.connectionIds || slot.connectionIds.size === 0) {
+    slots.delete(clientKey);
+    if (slots.size === 0) clientSlots.delete(userId);
+    scheduleRealtimeBroadcast();
+  }
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -475,7 +491,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     lastDataAt: 0
   };
   map.set(id, conn);
-  acquireClientSlot(userId, conn.clientKey);
+  acquireClientSlot(userId, conn.clientKey, id);
   scheduleRealtimeBroadcast();
 
   const unregister = () => {
@@ -900,6 +916,7 @@ class XHttpSession {
     this.udpState = { buffer: Buffer.alloc(0) };
     this.udpIdleTimer = null;
     this.clientIp = 'unknown';
+    this.clientKey = `xhttp:${sessionId}`;
     this.version = 0;
     this.downlinkRes = null;
     this.nextSeq = 0;
@@ -1035,11 +1052,11 @@ class XHttpSession {
 
     this.user = request.user;
     this.version = request.version;
-    if (!canAcceptUserSession(this.user, this.clientIp)) {
+    if (!canAcceptUserSession(this.user, this.clientKey)) {
       this.close('client limit exceeded');
       throw new Error('client limit exceeded');
     }
-    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientIp, kind: 'xhttp' });
+    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp' });
     log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId}`);
 
     if (request.command === 0x03) {
@@ -1435,12 +1452,43 @@ class MuxHandler {
   }
 }
 
+function normalizeIpAddress(ip) {
+  let value = String(ip || '').trim();
+  if (!value) return '';
+  value = value.replace(/^::ffff:/i, '');
+  value = value.replace(/^\[/, '').replace(/\]$/, '');
+  const zoneIndex = value.indexOf('%');
+  if (zoneIndex >= 0) value = value.slice(0, zoneIndex);
+  return value;
+}
+
+function isPrivateOrProxyIp(ip) {
+  const h = normalizeIpAddress(ip).toLowerCase();
+  if (!h) return true;
+  if (h === 'unknown' || h === 'localhost' || h === '::1') return true;
+  if (/^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) || /^169\.254\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(h)) return true;
+  if (h === '0.0.0.0' || h === '::') return true;
+  if (/^(fc|fd)[0-9a-f]{2}:/i.test(h) || /^fe80:/i.test(h)) return true;
+  return false;
+}
+
 function getClientIp(req) {
-  const cfIp = req.headers['cf-connecting-ip'];
-  if (cfIp) return String(cfIp).trim();
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) return String(xff).split(',')[0].trim();
-  return String(req.ip || req.socket.remoteAddress || 'unknown');
+  const cfIp = normalizeIpAddress(req.headers['cf-connecting-ip']);
+  if (cfIp && !isPrivateOrProxyIp(cfIp)) return cfIp;
+
+  const realIp = normalizeIpAddress(req.headers['x-real-ip']);
+  if (realIp && !isPrivateOrProxyIp(realIp)) return realIp;
+
+  const xff = String(req.headers['x-forwarded-for'] || '')
+    .split(',')
+    .map((x) => normalizeIpAddress(x))
+    .filter(Boolean);
+  const publicForwarded = xff.find((ip) => !isPrivateOrProxyIp(ip));
+  if (publicForwarded) return publicForwarded;
+  if (xff[0]) return xff[0];
+
+  return normalizeIpAddress(req.ip || req.socket.remoteAddress || 'unknown') || 'unknown';
 }
 
 function getLoginState(ip) {
@@ -2275,12 +2323,13 @@ wss.on('connection', (ws, req) => {
 
       user = request.user;
       const clientIp = getClientIp(req);
-      if (!canAcceptUserSession(user, clientIp)) {
+      const clientKey = `ws:${clientIp}`;
+      if (!canAcceptUserSession(user, clientKey)) {
         log('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
         closeAll(1008, 'client limit exceeded');
         return;
       }
-      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey: clientIp, kind: 'ws' });
+      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws' });
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port}`);
 
       if (request.command === 0x03) {
