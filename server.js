@@ -549,9 +549,9 @@ function markUserDataActivity(userId) {
   }
 }
 
-function updateTraffic(user, bytes, direction = 'total') {
+function updateTraffic(user, bytes, direction = 'total', touchActivity = null) {
   if (!user || !bytes || bytes <= 0) return;
-  markUserDataActivity(user.id);
+  if (typeof touchActivity === 'function') touchActivity();
 
   // Fast data-plane path: only increment in-memory counters here.
   // Expensive UI/DB/quota work is committed in a 1s batch by flushTrafficBuffers().
@@ -935,6 +935,12 @@ class XHttpSession {
     if (this.cleanupTimer && this.cleanupTimer.refresh) this.cleanupTimer.refresh();
   }
 
+  touchData() {
+    this.lastActivity = Date.now();
+    this.unregisterConnection?.touchData?.();
+    if (this.cleanupTimer && this.cleanupTimer.refresh) this.cleanupTimer.refresh();
+  }
+
   attachDownlink(req, res) {
     if (this.closed) {
       if (!res.headersSent) res.writeHead(410, XHTTP_RESPONSE_HEADERS);
@@ -1064,6 +1070,7 @@ class XHttpSession {
       this.muxHandler = new MuxHandler({
         user: this.user,
         label: 'XHTTP MUX',
+        touch: () => this.touchData(),
         send: (chunk) => this.sendDownlink(chunk),
         close: (reason) => this.close(reason || 'mux closed')
       });
@@ -1082,8 +1089,8 @@ class XHttpSession {
       const udpType = request.host.includes(':') ? 'udp6' : 'udp4';
       this.udpSocket = dgram.createSocket(udpType);
       this.udpSocket.on('message', (msg) => {
-        this.refresh();
-        updateTraffic(this.user, msg.length, 'downlink');
+        this.touchData();
+        updateTraffic(this.user, msg.length, 'downlink', () => this.touchData());
         try {
           this.sendDownlink(encodeUdpPacket(msg));
         } catch (err) {
@@ -1140,8 +1147,8 @@ class XHttpSession {
       });
 
       this.remote.on('data', (chunk) => {
-        this.refresh();
-        updateTraffic(this.user, chunk.length, 'downlink');
+        this.touchData();
+        updateTraffic(this.user, chunk.length, 'downlink', () => this.touchData());
         this.sendDownlink(chunk);
       });
       this.remote.on('drain', () => this.flushRemoteWrites());
@@ -1179,7 +1186,7 @@ class XHttpSession {
       return;
     }
 
-    updateTraffic(this.user, chunk.length, 'uplink');
+    updateTraffic(this.user, chunk.length, 'uplink', () => this.touchData());
     if (!this.remote.write(chunk)) {
       // Let Node socket backpressure work; later packets remain queued if needed.
     }
@@ -1188,7 +1195,7 @@ class XHttpSession {
   sendUdpPacket(packet) {
     if (this.closed || !this.udpSocket || !this.udpTargetHost || !this.udpTargetPort) return;
     if (this.udpIdleTimer && this.udpIdleTimer.refresh) this.udpIdleTimer.refresh();
-    updateTraffic(this.user, packet.length, 'uplink');
+    updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
     this.udpSocket.send(packet, this.udpTargetPort, this.udpTargetHost, (err) => {
       if (err) {
         log('[XHTTP UDP] Send failed:', err.message);
@@ -1205,7 +1212,7 @@ class XHttpSession {
     if (!this.remote || !this.established || this.remote.destroyed) return;
     while (this.pendingRemoteWrites.length) {
       const chunk = this.pendingRemoteWrites.shift();
-      updateTraffic(this.user, chunk.length, 'uplink');
+      updateTraffic(this.user, chunk.length, 'uplink', () => this.touchData());
       if (!this.remote.write(chunk)) break;
     }
   }
@@ -1276,10 +1283,11 @@ function getXHttpSession(sessionId) {
 }
 
 class MuxHandler {
-  constructor({ user, send, close, label = 'MUX' }) {
+  constructor({ user, send, close, touch = null, label = 'MUX' }) {
     this.user = user;
     this.send = send;
     this.closeTransport = close;
+    this.touch = touch;
     this.label = label;
     this.buffer = Buffer.alloc(0);
     this.sessions = new Map();
@@ -1354,7 +1362,7 @@ class MuxHandler {
       session.udp = dgram.createSocket(udpType);
       session.connected = true;
       session.udp.on('message', (msg) => {
-        updateTraffic(this.user, msg.length, 'downlink');
+        updateTraffic(this.user, msg.length, 'downlink', this.touch);
         this.sendData(sessionId, msg);
       });
       session.udp.on('error', (err) => {
@@ -1373,12 +1381,12 @@ class MuxHandler {
       session.connected = true;
       while (session.pending.length && session.remote && !session.remote.destroyed) {
         const p = session.pending.shift();
-        updateTraffic(this.user, p.length, 'uplink');
+        updateTraffic(this.user, p.length, 'uplink', this.touch);
         if (!session.remote.write(p)) break;
       }
     });
     session.remote.on('data', (data) => {
-      updateTraffic(this.user, data.length, 'downlink');
+      updateTraffic(this.user, data.length, 'downlink', this.touch);
       this.sendData(sessionId, data);
     });
     session.remote.once('error', (err) => {
@@ -1402,7 +1410,7 @@ class MuxHandler {
     if (!session || session.closed) return;
 
     if (session.target.network === 'udp') {
-      updateTraffic(this.user, data.length, 'uplink');
+      updateTraffic(this.user, data.length, 'uplink', this.touch);
       session.udp?.send(data, session.target.port, session.target.host, (err) => {
         if (err) {
           log(`[${this.label}] UDP send failed:`, err.message);
@@ -1417,7 +1425,7 @@ class MuxHandler {
       session.pending.push(Buffer.from(data));
       return;
     }
-    updateTraffic(this.user, data.length, 'uplink');
+    updateTraffic(this.user, data.length, 'uplink', this.touch);
     session.remote.write(data);
   }
 
@@ -2293,7 +2301,7 @@ wss.on('connection', (ws, req) => {
     if (!remote || remote.destroyed || !established) return;
     while (pendingClientChunks.length) {
       const chunk = pendingClientChunks.shift();
-      updateTraffic(user, chunk.length, 'uplink');
+      updateTraffic(user, chunk.length, 'uplink', () => unregisterConnection?.touchData?.());
       if (!remote.write(chunk)) break;
     }
   }
@@ -2301,7 +2309,7 @@ wss.on('connection', (ws, req) => {
   function sendUdpPacket(packet) {
     if (closed || !udpSocket || !udpTargetHost || !udpTargetPort) return;
     if (udpIdleTimer && udpIdleTimer.refresh) udpIdleTimer.refresh();
-    updateTraffic(user, packet.length, 'uplink');
+    updateTraffic(user, packet.length, 'uplink', () => unregisterConnection?.touchData?.());
     udpSocket.send(packet, udpTargetPort, udpTargetHost, (err) => {
       if (err) {
         log('[UDP] Send failed:', err.message);
@@ -2344,6 +2352,7 @@ wss.on('connection', (ws, req) => {
         muxHandler = new MuxHandler({
           user,
           label: 'WS MUX',
+          touch: () => unregisterConnection?.touchData?.(),
           send: (chunk) => sendToWs(chunk),
           close: (reason) => closeAll(1000, reason || 'mux closed')
         });
@@ -2369,7 +2378,7 @@ wss.on('connection', (ws, req) => {
         udpSocket = dgram.createSocket(udpType);
         udpSocket.on('message', (msg) => {
           refreshIdleTimer();
-          updateTraffic(user, msg.length, 'downlink');
+          updateTraffic(user, msg.length, 'downlink', () => unregisterConnection?.touchData?.());
           try {
             sendToWs(encodeUdpPacket(msg));
           } catch (err) {
@@ -2406,7 +2415,7 @@ wss.on('connection', (ws, req) => {
         established = true;
         sendVlessResponseHeader(request.version);
         if (request.payload.length) {
-          updateTraffic(user, request.payload.length, 'uplink');
+          updateTraffic(user, request.payload.length, 'uplink', () => unregisterConnection?.touchData?.());
           if (!remote.write(request.payload)) {
             try { req.socket.pause(); } catch (_) {}
           }
@@ -2421,7 +2430,7 @@ wss.on('connection', (ws, req) => {
 
       remote.on('data', (remoteChunk) => {
         refreshIdleTimer();
-        updateTraffic(user, remoteChunk.length, 'downlink');
+        updateTraffic(user, remoteChunk.length, 'downlink', () => unregisterConnection?.touchData?.());
         sendToWs(remoteChunk);
       });
 
@@ -2465,7 +2474,7 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    updateTraffic(user, chunk.length, 'uplink');
+    updateTraffic(user, chunk.length, 'uplink', () => unregisterConnection?.touchData?.());
     if (!remote.write(chunk)) {
       try { req.socket.pause(); } catch (_) {}
     }
