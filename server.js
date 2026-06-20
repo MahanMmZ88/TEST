@@ -15,7 +15,7 @@ const app = express();
 app.set('trust proxy', true);
 
 const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide PORT automatically.
-const BUILD_ID = 'sub-ui-marker-2026-06-19-a';
+const BUILD_ID = 'sub-ui-final-edit-2026-06-19-b';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 const DB_PATH = path.join(__dirname, 'db.json');
