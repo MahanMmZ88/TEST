@@ -57,6 +57,8 @@ const DEVICE_PASSIVE_DRAIN_MS = Math.max(800, Number(process.env.DEVICE_PASSIVE_
 const DEVICE_CLUSTER_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_CLUSTER_WINDOW_MS || 30000));
 const DEVICE_RECENT_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_RECENT_WINDOW_MS || 12000));
 const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90000));
+// MDIE v3: Active Client is recent client-side activity/heartbeat, not raw open sockets.
+const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIVITY_WINDOW_MS || 7000));
 const WS_PING_INTERVAL_MS = 2000;
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -509,21 +511,28 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
   const ipGroup = getIpGroup(normalizedIp);
   const uaNorm = normalizeUserAgent(ua);
   const uaFamily = getUserAgentFamily(uaNorm);
+  const uaHash = shortHash(uaNorm || uaFamily || 'unknown', 12);
   const command = Number(target.command || 0);
   const host = String(target.host || '').toLowerCase();
   const port = Number(target.port || 0);
+  const category = detectDestinationCategory({ command, host, port });
+  const role = String(target.role || 'active');
+  const identityBase = uaFamily && uaFamily !== 'unknown'
+    ? `${ipGroup}|${uaFamily}`
+    : `${normalizedIp}|${uaHash || 'unknown'}`;
   return {
     ip: normalizedIp,
     ipGroup,
     ua: uaNorm,
-    uaHash: shortHash(uaNorm || uaFamily || 'unknown', 12),
+    uaHash,
     uaFamily,
     transport: String(transport || 'unknown'),
     command,
     host,
     port,
-    category: detectDestinationCategory({ command, host, port }),
-    role: String(target.role || (transport === 'ws' ? 'active' : 'active')),
+    category,
+    role,
+    endpointKey: `ep_${shortHash(identityBase, 18)}`,
     createdAt: Date.now()
   };
 }
@@ -594,7 +603,7 @@ function findBestDeviceCandidate(userId, meta) {
 
 function createDeviceState(userId, meta) {
   const now = Date.now();
-  const id = `dev_${crypto.randomBytes(8).toString('hex')}`;
+  const id = meta?.endpointKey || `dev_${crypto.randomBytes(8).toString('hex')}`;
   return {
     id,
     userId,
@@ -652,7 +661,12 @@ function updateDeviceState(device, meta, connectionId = '') {
 
 function attachDeviceConnection(userId, connectionId, meta = {}, preferredDeviceId = '') {
   const map = getDeviceMap(userId, true);
-  let device = preferredDeviceId ? map.get(preferredDeviceId) : null;
+  const stableKey = preferredDeviceId || meta?.endpointKey || '';
+  let device = stableKey ? map.get(stableKey) : null;
+  if (!device && stableKey && meta?.endpointKey) {
+    device = createDeviceState(userId, meta);
+    map.set(device.id, device);
+  }
   if (!device) device = findBestDeviceCandidate(userId, meta)?.device || null;
   if (!device) {
     device = createDeviceState(userId, meta);
@@ -721,9 +735,11 @@ function getClientSlotCount(userId) {
   const map = getDeviceMap(userId, false);
   if (!map) return 0;
   let count = 0;
+  const now = Date.now();
   for (const device of map.values()) {
     if (device.state === 'offline') continue;
-    if ((device.anchorConnections?.size || 0) > 0 || device.state === 'draining') count += 1;
+    const recentlyAlive = now - Number(device.lastSeen || 0) <= DEVICE_ACTIVITY_WINDOW_MS;
+    if (recentlyAlive && ((device.anchorConnections?.size || 0) > 0 || device.state === 'draining')) count += 1;
   }
   return count;
 }
@@ -805,7 +821,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     category: 'general',
     createdAt: Date.now()
   };
-  const deviceKey = attachDeviceConnection(userId, id, deviceMeta, meta.clientKey || '');
+  const deviceKey = attachDeviceConnection(userId, id, deviceMeta, meta.clientKey || deviceMeta.endpointKey || '');
   const conn = {
     id,
     ip: String(deviceMeta.ip || meta.ip || 'unknown'),
@@ -1652,7 +1668,8 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      this.unregisterConnection?.touch?.();
+      // MDIE v3: do not renew active-client state from server-only downlink pings.
+      // Only client-originated traffic/requests or WS pong should keep a device active.
     }, 1000);
 
     res.on('close', () => {
@@ -1739,7 +1756,7 @@ class XHttpSession {
     this.boosterProfile = chooseBoosterProfile(request, 'xhttp');
     const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, 'xhttp', request);
     const candidate = findBestDeviceCandidate(this.user.id, deviceMeta);
-    this.clientKey = candidate?.device?.id || '';
+    this.clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
     if (!canAcceptUserSession(this.user, this.clientKey)) {
       this.close('client limit exceeded');
       throw new Error('client limit exceeded');
@@ -3109,7 +3126,7 @@ wss.on('connection', (ws, req) => {
       const clientIp = getClientIp(req);
       const deviceMeta = getConnectionDeviceMeta(req, clientIp, 'ws', request);
       const candidate = findBestDeviceCandidate(user.id, deviceMeta);
-      const clientKey = candidate?.device?.id || '';
+      const clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
       if (!canAcceptUserSession(user, clientKey)) {
         log('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
         closeAll(1008, 'client limit exceeded');
