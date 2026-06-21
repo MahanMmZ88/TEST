@@ -59,6 +59,8 @@ const DEVICE_RECENT_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_RECENT_
 const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90000));
 // MDIE v3: Active Client is recent client-side activity/heartbeat, not raw open sockets.
 const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIVITY_WINDOW_MS || 7000));
+// Mahan Active Client Tracker v3: fast traffic/heartbeat based online counter.
+const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 2500));
 const WS_PING_INTERVAL_MS = 2000;
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -140,7 +142,8 @@ const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clientKey, kind, closeFn, lastSeen })
 const clientSlots = new Map(); // legacy placeholder; active client accounting is handled by Mahan Device Intelligence Engine.
-const activeDevices = new Map(); // user.id -> Map(deviceId, Mahan Device Intelligence Engine state)
+const activeDevices = new Map(); // kept for endpoint correlation; active count comes from activeClientActivity.
+const activeClientActivity = new Map(); // user.id -> Map(endpointKey, { lastActivity, ip, uaFamily, transports })
 const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
 const boosterDnsCache = new Map(); // hostname -> { expiresAt, addresses, next }
@@ -517,9 +520,9 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
   const port = Number(target.port || 0);
   const category = detectDestinationCategory({ command, host, port });
   const role = String(target.role || 'active');
-  const identityBase = uaFamily && uaFamily !== 'unknown'
-    ? `${ipGroup}|${uaFamily}`
-    : `${normalizedIp}|${uaHash || 'unknown'}`;
+  const identityBase = uaNorm
+    ? `${normalizedIp}|${uaHash}`
+    : `${normalizedIp}|${uaFamily || 'unknown'}`;
   return {
     ip: normalizedIp,
     ipGroup,
@@ -544,6 +547,56 @@ function getDeviceMap(userId, create = true) {
     activeDevices.set(userId, map);
   }
   return map || null;
+}
+
+function getActivityMap(userId, create = true) {
+  let map = activeClientActivity.get(userId);
+  if (!map && create) {
+    map = new Map();
+    activeClientActivity.set(userId, map);
+  }
+  return map || null;
+}
+
+function touchActiveClient(userId, endpointKey, meta = {}) {
+  if (!userId || !endpointKey) return;
+  const map = getActivityMap(userId, true);
+  const now = Date.now();
+  const existing = map.get(endpointKey) || {
+    firstActivity: now,
+    lastActivity: 0,
+    ip: meta.ip || 'unknown',
+    ipGroup: meta.ipGroup || 'unknown',
+    uaFamily: meta.uaFamily || 'unknown',
+    transports: new Set()
+  };
+  existing.lastActivity = now;
+  if (meta.ip) existing.ip = meta.ip;
+  if (meta.ipGroup) existing.ipGroup = meta.ipGroup;
+  if (meta.uaFamily) existing.uaFamily = meta.uaFamily;
+  if (meta.transport) existing.transports.add(meta.transport);
+  map.set(endpointKey, existing);
+}
+
+function pruneActiveClientActivity(userId) {
+  const map = getActivityMap(userId, false);
+  if (!map) return 0;
+  const now = Date.now();
+  let removed = 0;
+  for (const [key, item] of Array.from(map.entries())) {
+    if (now - Number(item.lastActivity || 0) > ACTIVE_CLIENT_TTL_MS) {
+      map.delete(key);
+      removed += 1;
+    }
+  }
+  if (map.size === 0) activeClientActivity.delete(userId);
+  if (removed) scheduleRealtimeBroadcast();
+  return removed;
+}
+
+function getActiveClientActivityCount(userId) {
+  pruneActiveClientActivity(userId);
+  return getActivityMap(userId, false)?.size || 0;
 }
 
 function scoreDeviceCandidate(device, meta, now = Date.now()) {
@@ -731,17 +784,9 @@ function pruneClientSlots(userId) {
 }
 
 function getClientSlotCount(userId) {
-  pruneClientSlots(userId);
-  const map = getDeviceMap(userId, false);
-  if (!map) return 0;
-  let count = 0;
-  const now = Date.now();
-  for (const device of map.values()) {
-    if (device.state === 'offline') continue;
-    const recentlyAlive = now - Number(device.lastSeen || 0) <= DEVICE_ACTIVITY_WINDOW_MS;
-    if (recentlyAlive && ((device.anchorConnections?.size || 0) > 0 || device.state === 'draining')) count += 1;
-  }
-  return count;
+  // Active Client v3: count only endpoints with very recent real activity or WS pong.
+  // This intentionally ignores long-open/stuck sockets so dashboard changes within ~2-3s.
+  return getActiveClientActivityCount(userId);
 }
 
 function makeClientKey(ip) {
@@ -751,10 +796,9 @@ function makeClientKey(ip) {
 function canAcceptUserSession(user, clientKey) {
   const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
-  pruneClientSlots(user.id);
-  const map = getDeviceMap(user.id, false);
-  if (clientKey && map?.has(clientKey)) return true;
-  return getClientSlotCount(user.id) < limit;
+  pruneActiveClientActivity(user.id);
+  if (clientKey && getActivityMap(user.id, false)?.has(clientKey)) return true;
+  return getActiveClientActivityCount(user.id) < limit;
 }
 
 function scheduleDeviceOffline(userId, clientKey, delayMs) {
@@ -822,6 +866,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     createdAt: Date.now()
   };
   const deviceKey = attachDeviceConnection(userId, id, deviceMeta, meta.clientKey || deviceMeta.endpointKey || '');
+  touchActiveClient(userId, deviceKey, deviceMeta);
   const conn = {
     id,
     ip: String(deviceMeta.ip || meta.ip || 'unknown'),
@@ -848,6 +893,7 @@ function registerConnection(userId, closeFn, meta = {}) {
       // when the VPN is connected but no user traffic is currently flowing.
       item.lastSeen = now;
       refreshClientSlot(userId, item.clientKey);
+      touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
     }
   };
   unregister.touchData = () => {
@@ -857,7 +903,8 @@ function registerConnection(userId, closeFn, meta = {}) {
       const now = Date.now();
       item.lastSeen = now;
       item.lastDataAt = now;
-      refreshClientSlot(userId, item.clientKey);
+      refreshClientSlot(userId, item.clientKey, true);
+      touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
     }
   };
   unregister.id = id;
@@ -887,6 +934,7 @@ function forceClearUserConnections(userId, reason = 'connections cleared') {
     for (const device of deviceMap.values()) clearTimeout(device.closeTimer);
   }
   activeDevices.delete(userId);
+  activeClientActivity.delete(userId);
   scheduleRealtimeBroadcast();
 }
 
@@ -897,7 +945,8 @@ function markUserDataActivity(userId) {
   for (const conn of map.values()) {
     conn.lastSeen = now;
     conn.lastDataAt = now;
-    refreshClientSlot(userId, conn.clientKey);
+    refreshClientSlot(userId, conn.clientKey, true);
+    touchActiveClient(userId, conn.clientKey, { ip: conn.ip, transport: conn.kind });
   }
 }
 
@@ -2588,6 +2637,7 @@ app.post('/api/backup/restore', requireAuth, (req, res) => {
     for (const device of deviceMap.values()) clearTimeout(device.closeTimer);
   }
   activeDevices.clear();
+  activeClientActivity.clear();
 
   scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
@@ -3312,6 +3362,7 @@ setInterval(() => {
     pruneClientSlots(userId);
   }
   for (const userId of Array.from(activeDevices.keys())) pruneClientSlots(userId);
+  for (const userId of Array.from(activeClientActivity.keys())) pruneActiveClientActivity(userId);
 }, CONNECTION_CLEANUP_INTERVAL_MS);
 
 setInterval(() => {
