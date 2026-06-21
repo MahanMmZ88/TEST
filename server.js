@@ -52,6 +52,9 @@ const CONNECTION_CLEANUP_INTERVAL_MS = 500;
 // not only from real traffic bytes. This prevents connected-but-idle VPN clients
 // from disappearing in the panel while still removing truly stale slots.
 const ACTIVE_CLIENT_SLOT_TTL_MS = Math.max(30000, Number(process.env.ACTIVE_CLIENT_SLOT_TTL_MS || 75000));
+const DEVICE_DRAINING_MS = Math.max(500, Number(process.env.DEVICE_DRAINING_MS || 1200));
+const DEVICE_RECENT_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_RECENT_WINDOW_MS || 12000));
+const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90000));
 const WS_PING_INTERVAL_MS = 2000;
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -132,7 +135,8 @@ let lastSelfPingUrlLog = '';
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clientKey, kind, closeFn, lastSeen })
-const clientSlots = new Map(); // user.id -> Map(clientKey, { firstSeen, lastSeen }) - Mahan Xray-like Client Tracker
+const clientSlots = new Map(); // legacy placeholder; active client accounting is handled by Mahan Device Intelligence Engine.
+const activeDevices = new Map(); // user.id -> Map(deviceId, Mahan Device Intelligence Engine state)
 const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
 const boosterDnsCache = new Map(); // hostname -> { expiresAt, addresses, next }
@@ -463,37 +467,226 @@ function getActiveSessionCount(userId) {
   return activeConnections.get(userId)?.size || 0;
 }
 
-function refreshClientSlot(userId, clientKey) {
+function shortHash(value, len = 16) {
+  return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, len);
+}
+
+function normalizeUserAgent(value) {
+  return String(value || '').toLowerCase().replace(/\s+/g, ' ').slice(0, 240);
+}
+
+function getUserAgentFamily(ua) {
+  const v = normalizeUserAgent(ua);
+  if (!v) return 'unknown';
+  const families = [
+    'hiddify', 'v2rayng', 'v2rayn', 'nekobox', 'nekoray', 'sing-box', 'singbox', 'shadowrocket',
+    'streisand', 'foxray', 'sagernet', 'sager', 'clash', 'mihomo', 'surge', 'quantumult', 'loon',
+    'curl', 'go-http-client', 'okhttp', 'python-requests'
+  ];
+  return families.find((x) => v.includes(x)) || v.split(/[\/\s(;]+/).filter(Boolean)[0] || 'unknown';
+}
+
+function getIpGroup(ip) {
+  const h = normalizeIpAddress(ip);
+  if (!h || h === 'unknown') return 'unknown';
+  if (net.isIP(h) === 4) {
+    const parts = h.split('.');
+    return parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.0/24` : h;
+  }
+  if (net.isIP(h) === 6) {
+    const clean = h.toLowerCase();
+    const expanded = clean.includes('::') ? clean : clean;
+    return expanded.split(':').slice(0, 4).join(':') + '::/64';
+  }
+  return h;
+}
+
+function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
+  const ua = String(req?.headers?.['user-agent'] || req?.headers?.['sec-ch-ua'] || '').slice(0, 300);
+  const normalizedIp = normalizeIpAddress(ip || getClientIp(req) || 'unknown') || 'unknown';
+  const ipGroup = getIpGroup(normalizedIp);
+  const uaNorm = normalizeUserAgent(ua);
+  const uaFamily = getUserAgentFamily(uaNorm);
+  const command = Number(target.command || 0);
+  const host = String(target.host || '').toLowerCase();
+  const port = Number(target.port || 0);
+  return {
+    ip: normalizedIp,
+    ipGroup,
+    ua: uaNorm,
+    uaHash: shortHash(uaNorm || uaFamily || 'unknown', 12),
+    uaFamily,
+    transport: String(transport || 'unknown'),
+    command,
+    host,
+    port,
+    category: detectDestinationCategory({ command, host, port }),
+    createdAt: Date.now()
+  };
+}
+
+function getDeviceMap(userId, create = true) {
+  let map = activeDevices.get(userId);
+  if (!map && create) {
+    map = new Map();
+    activeDevices.set(userId, map);
+  }
+  return map || null;
+}
+
+function scoreDeviceCandidate(device, meta, now = Date.now()) {
+  if (!device || !meta) return -999;
+  let score = 0;
+  const age = now - Number(device.lastSeen || device.firstSeen || 0);
+  const sinceFirst = now - Number(device.firstSeen || now);
+  const exactIp = device.ipSet?.has(meta.ip);
+  const groupIp = device.ipGroupSet?.has(meta.ipGroup);
+  const sameUa = device.uaHash && meta.uaHash && device.uaHash === meta.uaHash;
+  const sameUaFamily = device.uaFamily && meta.uaFamily && device.uaFamily === meta.uaFamily;
+
+  if (exactIp) score += 38;
+  else if (groupIp) score += 20;
+  else score -= 14;
+
+  if (sameUa) score += 38;
+  else if (sameUaFamily && meta.uaFamily !== 'unknown') score += 18;
+  else if (device.uaFamily !== 'unknown' && meta.uaFamily !== 'unknown') score -= 34;
+
+  if (device.transportSet?.has(meta.transport)) score += 8;
+  if (device.categorySet?.has(meta.category)) score += 8;
+  if (device.state === 'draining') score += 28;
+  if (age < 3000) score += 20;
+  else if (age < DEVICE_RECENT_WINDOW_MS) score += 12;
+  else if (age > DEVICE_STALE_MS) score -= 50;
+
+  // A burst of multiple streams during the first seconds is usually one app opening WS/XHTTP pipes.
+  if (sinceFirst < 8000 && (exactIp || groupIp) && (sameUa || sameUaFamily)) score += 14;
+
+  // If exact same UA/IP has active connections, strongly prefer grouping.
+  if ((device.connections?.size || 0) > 0 && exactIp && sameUa) score += 20;
+  return score;
+}
+
+function findBestDeviceCandidate(userId, meta) {
+  const map = getDeviceMap(userId, false);
+  if (!map || !meta) return null;
+  const now = Date.now();
+  let best = null;
+  for (const device of map.values()) {
+    if (device.state === 'offline') continue;
+    const score = scoreDeviceCandidate(device, meta, now);
+    if (!best || score > best.score) best = { device, score };
+  }
+  if (!best) return null;
+  const threshold = best.device.state === 'draining' ? 58 : 72;
+  return best.score >= threshold ? best : null;
+}
+
+function createDeviceState(userId, meta) {
+  const now = Date.now();
+  const id = `dev_${crypto.randomBytes(8).toString('hex')}`;
+  return {
+    id,
+    userId,
+    state: 'online',
+    connections: new Set(),
+    ipSet: new Set(meta?.ip ? [meta.ip] : []),
+    ipGroupSet: new Set(meta?.ipGroup ? [meta.ipGroup] : []),
+    uaHash: meta?.uaHash || 'unknown',
+    uaFamily: meta?.uaFamily || 'unknown',
+    transportSet: new Set(meta?.transport ? [meta.transport] : []),
+    categorySet: new Set(meta?.category ? [meta.category] : []),
+    recentDestinations: meta?.host ? [{ host: meta.host, port: meta.port, ts: now }] : [],
+    firstSeen: now,
+    lastSeen: now,
+    lastTrafficAt: 0,
+    confidence: 1,
+    closeTimer: null
+  };
+}
+
+function updateDeviceState(device, meta, connectionId = '') {
+  if (!device || !meta) return;
+  const now = Date.now();
+  clearTimeout(device.closeTimer);
+  device.closeTimer = null;
+  device.state = 'online';
+  device.lastSeen = now;
+  if (connectionId) device.connections.add(connectionId);
+  if (meta.ip) device.ipSet.add(meta.ip);
+  if (meta.ipGroup) device.ipGroupSet.add(meta.ipGroup);
+  if (meta.uaHash && device.uaHash === 'unknown') device.uaHash = meta.uaHash;
+  if (meta.uaFamily && device.uaFamily === 'unknown') device.uaFamily = meta.uaFamily;
+  if (meta.transport) device.transportSet.add(meta.transport);
+  if (meta.category) device.categorySet.add(meta.category);
+  if (meta.host) {
+    device.recentDestinations.unshift({ host: meta.host, port: meta.port, ts: now });
+    device.recentDestinations = device.recentDestinations.slice(0, 10);
+  }
+}
+
+function attachDeviceConnection(userId, connectionId, meta = {}, preferredDeviceId = '') {
+  const map = getDeviceMap(userId, true);
+  let device = preferredDeviceId ? map.get(preferredDeviceId) : null;
+  if (!device) device = findBestDeviceCandidate(userId, meta)?.device || null;
+  if (!device) {
+    device = createDeviceState(userId, meta);
+    map.set(device.id, device);
+  }
+  updateDeviceState(device, meta, connectionId);
+  scheduleRealtimeBroadcast();
+  return device.id;
+}
+
+function refreshClientSlot(userId, clientKey, traffic = false) {
   if (!clientKey) return;
-  const slots = clientSlots.get(userId);
-  const slot = slots?.get(clientKey);
-  if (slot) slot.lastSeen = Date.now();
+  const device = getDeviceMap(userId, false)?.get(clientKey);
+  if (!device) return;
+  const now = Date.now();
+  device.lastSeen = now;
+  if (traffic) device.lastTrafficAt = now;
+  if (device.state === 'draining') {
+    clearTimeout(device.closeTimer);
+    device.closeTimer = null;
+    device.state = 'online';
+    scheduleRealtimeBroadcast();
+  }
 }
 
 function pruneClientSlots(userId) {
-  const slots = clientSlots.get(userId);
-  if (!slots) return 0;
+  const map = getDeviceMap(userId, false);
+  if (!map) return 0;
   const now = Date.now();
   let removed = 0;
-
-  for (const [key, slot] of Array.from(slots.entries())) {
-    // Mahan Online Client Tracker:
-    // A client is online while its WS/XHTTP session heartbeat is alive. Real traffic
-    // is not required; otherwise idle-but-connected VPN clients disappear from UI.
-    if (now - Number(slot.lastSeen || 0) > ACTIVE_CLIENT_SLOT_TTL_MS) {
-      slots.delete(key);
+  for (const [id, device] of Array.from(map.entries())) {
+    if ((device.connections?.size || 0) === 0 && device.state !== 'draining') {
+      if (now - Number(device.lastSeen || 0) > DEVICE_DRAINING_MS) {
+        clearTimeout(device.closeTimer);
+        map.delete(id);
+        removed += 1;
+      }
+      continue;
+    }
+    if (now - Number(device.lastSeen || 0) > DEVICE_STALE_MS) {
+      clearTimeout(device.closeTimer);
+      map.delete(id);
       removed += 1;
     }
   }
-
-  if (slots.size === 0) clientSlots.delete(userId);
+  if (map.size === 0) activeDevices.delete(userId);
   if (removed) scheduleRealtimeBroadcast();
   return removed;
 }
 
 function getClientSlotCount(userId) {
   pruneClientSlots(userId);
-  return clientSlots.get(userId)?.size || 0;
+  const map = getDeviceMap(userId, false);
+  if (!map) return 0;
+  let count = 0;
+  for (const device of map.values()) {
+    if (device.state !== 'offline' && ((device.connections?.size || 0) > 0 || device.state === 'draining')) count += 1;
+  }
+  return count;
 }
 
 function makeClientKey(ip) {
@@ -503,60 +696,64 @@ function makeClientKey(ip) {
 function canAcceptUserSession(user, clientKey) {
   const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
-
   pruneClientSlots(user.id);
-
-  const slots = clientSlots.get(user.id);
-  if (slots?.has(clientKey)) return true;
-  return (slots?.size || 0) < limit;
-}
-
-function acquireClientSlot(userId, clientKey, connectionId) {
-  if (!clientKey) return;
-  if (!clientSlots.has(userId)) clientSlots.set(userId, new Map());
-  const slots = clientSlots.get(userId);
-  const now = Date.now();
-  const existing = slots.get(clientKey);
-  const connectionIds = existing?.connectionIds || new Set();
-  if (connectionId) connectionIds.add(connectionId);
-  slots.set(clientKey, { firstSeen: existing?.firstSeen || now, lastSeen: now, connectionIds });
-  scheduleRealtimeBroadcast();
+  const map = getDeviceMap(user.id, false);
+  if (clientKey && map?.has(clientKey)) return true;
+  return getClientSlotCount(user.id) < limit;
 }
 
 function releaseClientSlotIfUnused(userId, clientKey, connectionId) {
   if (!clientKey) return;
-  const slots = clientSlots.get(userId);
-  const slot = slots?.get(clientKey);
-  if (!slot) return;
-  if (connectionId && slot.connectionIds) slot.connectionIds.delete(connectionId);
-
-  const active = activeConnections.get(userId);
-  const stillUsed = active && Array.from(active.values()).some((conn) => conn.clientKey === clientKey);
-  if (!stillUsed || !slot.connectionIds || slot.connectionIds.size === 0) {
-    slots.delete(clientKey);
-    if (slots.size === 0) clientSlots.delete(userId);
-    scheduleRealtimeBroadcast();
+  const map = getDeviceMap(userId, false);
+  const device = map?.get(clientKey);
+  if (!device) return;
+  if (connectionId) device.connections.delete(connectionId);
+  device.lastSeen = Date.now();
+  if (device.connections.size === 0) {
+    clearTimeout(device.closeTimer);
+    device.state = 'draining';
+    device.closeTimer = setTimeout(() => {
+      const current = getDeviceMap(userId, false)?.get(clientKey);
+      if (!current || current.connections.size > 0) return;
+      const currentMap = getDeviceMap(userId, false);
+      currentMap?.delete(clientKey);
+      if (currentMap && currentMap.size === 0) activeDevices.delete(userId);
+      scheduleRealtimeBroadcast();
+    }, DEVICE_DRAINING_MS);
     return;
   }
-  pruneClientSlots(userId);
+  scheduleRealtimeBroadcast();
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
   if (!activeConnections.has(userId)) activeConnections.set(userId, new Map());
   const map = activeConnections.get(userId);
   const id = crypto.randomBytes(8).toString('hex');
+  const deviceMeta = meta.deviceMeta || {
+    ip: normalizeIpAddress(meta.ip || 'unknown') || 'unknown',
+    ipGroup: getIpGroup(meta.ip || 'unknown'),
+    ua: '',
+    uaHash: 'unknown',
+    uaFamily: 'unknown',
+    transport: String(meta.kind || 'unknown'),
+    command: 0,
+    host: '',
+    port: 0,
+    category: 'general',
+    createdAt: Date.now()
+  };
+  const deviceKey = attachDeviceConnection(userId, id, deviceMeta, meta.clientKey || '');
   const conn = {
     id,
-    ip: String(meta.ip || 'unknown'),
-    clientKey: String(meta.clientKey || meta.ip || 'unknown'),
-    kind: String(meta.kind || 'unknown'),
+    ip: String(deviceMeta.ip || meta.ip || 'unknown'),
+    clientKey: deviceKey,
+    kind: String(meta.kind || deviceMeta.transport || 'unknown'),
     closeFn,
     createdAt: Date.now(),
     lastSeen: Date.now(),
     lastDataAt: 0
   };
   map.set(id, conn);
-  acquireClientSlot(userId, conn.clientKey, id);
   scheduleRealtimeBroadcast();
 
   const unregister = () => {
@@ -585,6 +782,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     }
   };
   unregister.id = id;
+  unregister.clientKey = conn.clientKey;
   return unregister;
 }
 
@@ -605,7 +803,11 @@ function forceClearUserConnections(userId, reason = 'connections cleared') {
     }
   }
   activeConnections.delete(userId);
-  clientSlots.delete(userId);
+  const deviceMap = activeDevices.get(userId);
+  if (deviceMap) {
+    for (const device of deviceMap.values()) clearTimeout(device.closeTimer);
+  }
+  activeDevices.delete(userId);
   scheduleRealtimeBroadcast();
 }
 
@@ -1326,7 +1528,8 @@ class XHttpSession {
     this.udpDownlinkBurstState = createUdpBurstState();
     this.udpIdleTimer = null;
     this.clientIp = 'unknown';
-    this.clientKey = 'ip:unknown';
+    this.clientKey = '';
+    this.userAgent = '';
     this.version = 0;
     this.boosterProfile = BOOSTER_PROFILE_BALANCED;
     this.downlinkRes = null;
@@ -1369,7 +1572,7 @@ class XHttpSession {
 
     this.refresh();
     this.clientIp = getClientIp(req);
-    this.clientKey = makeClientKey(this.clientIp);
+    this.userAgent = String(req.headers['user-agent'] || this.userAgent || '');
     this.downlinkRes = res;
     req.setTimeout(0);
     res.setTimeout(0);
@@ -1471,12 +1674,16 @@ class XHttpSession {
     this.user = request.user;
     this.version = request.version;
     this.boosterProfile = chooseBoosterProfile(request, 'xhttp');
+    const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, 'xhttp', request);
+    const candidate = findBestDeviceCandidate(this.user.id, deviceMeta);
+    this.clientKey = candidate?.device?.id || '';
     if (!canAcceptUserSession(this.user, this.clientKey)) {
       this.close('client limit exceeded');
       throw new Error('client limit exceeded');
     }
-    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp' });
-    log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)}`);
+    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp', deviceMeta });
+    this.clientKey = this.unregisterConnection.clientKey || this.clientKey;
+    log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)} device=${this.clientKey}`);
 
     if (request.command === 0x03) {
       this.muxMode = true;
@@ -2139,7 +2346,7 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
   const session = getXHttpSession(sessionId);
   if (!session.clientIp || session.clientIp === 'unknown') {
     session.clientIp = getClientIp(req);
-    session.clientKey = makeClientKey(session.clientIp);
+    session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
   }
   let failed = false;
   req.setTimeout(0);
@@ -2189,7 +2396,7 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
     const session = getXHttpSession(sessionId);
     if (!session.clientIp || session.clientIp === 'unknown') {
       session.clientIp = getClientIp(req);
-      session.clientKey = makeClientKey(session.clientIp);
+      session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
     }
     await session.processPacket(seq, body);
     res.writeHead(200, XHTTP_RESPONSE_HEADERS);
@@ -2297,7 +2504,10 @@ app.post('/api/backup/restore', requireAuth, (req, res) => {
   pendingUplinkBytes.clear();
   pendingDownlinkBytes.clear();
   pendingLastSeen.clear();
-  clientSlots.clear();
+  for (const deviceMap of activeDevices.values()) {
+    for (const device of deviceMap.values()) clearTimeout(device.closeTimer);
+  }
+  activeDevices.clear();
 
   scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
@@ -2834,14 +3044,16 @@ wss.on('connection', (ws, req) => {
       resetConnectTimer();
       scheduleWsPing();
       const clientIp = getClientIp(req);
-      const clientKey = makeClientKey(clientIp);
+      const deviceMeta = getConnectionDeviceMeta(req, clientIp, 'ws', request);
+      const candidate = findBestDeviceCandidate(user.id, deviceMeta);
+      const clientKey = candidate?.device?.id || '';
       if (!canAcceptUserSession(user, clientKey)) {
         log('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
         closeAll(1008, 'client limit exceeded');
         return;
       }
-      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws' });
-      log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)}`);
+      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws', deviceMeta });
+      log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)} device=${unregisterConnection.clientKey || clientKey}`);
 
       if (request.command === 0x03) {
         muxMode = true;
@@ -3019,7 +3231,7 @@ setInterval(() => {
     }
     pruneClientSlots(userId);
   }
-  for (const userId of Array.from(clientSlots.keys())) pruneClientSlots(userId);
+  for (const userId of Array.from(activeDevices.keys())) pruneClientSlots(userId);
 }, CONNECTION_CLEANUP_INTERVAL_MS);
 
 setInterval(() => {
