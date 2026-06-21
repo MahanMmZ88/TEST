@@ -53,6 +53,8 @@ const CONNECTION_CLEANUP_INTERVAL_MS = 500;
 // from disappearing in the panel while still removing truly stale slots.
 const ACTIVE_CLIENT_SLOT_TTL_MS = Math.max(30000, Number(process.env.ACTIVE_CLIENT_SLOT_TTL_MS || 75000));
 const DEVICE_DRAINING_MS = Math.max(500, Number(process.env.DEVICE_DRAINING_MS || 1200));
+const DEVICE_PASSIVE_DRAIN_MS = Math.max(800, Number(process.env.DEVICE_PASSIVE_DRAIN_MS || 1800));
+const DEVICE_CLUSTER_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_CLUSTER_WINDOW_MS || 30000));
 const DEVICE_RECENT_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_RECENT_WINDOW_MS || 12000));
 const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90000));
 const WS_PING_INTERVAL_MS = 2000;
@@ -74,7 +76,7 @@ const BOOSTER_PROFILE_BALANCED = Object.freeze({
   idleTimeoutMs: 180000,
   udpIdleTimeoutMs: 90000,
   connectTimeoutMs: CONNECT_TIMEOUT_MS,
-  wsPingIntervalMs: 5000,
+  wsPingIntervalMs: 1500,
   autoSelectFamilyAttemptTimeout: 220,
   socketHighWaterMark: 64 * 1024,
   allowMux: true
@@ -87,7 +89,7 @@ const BOOSTER_PROFILE_LATENCY = Object.freeze({
   idleTimeoutMs: 300000,
   udpIdleTimeoutMs: 180000,
   connectTimeoutMs: 10000,
-  wsPingIntervalMs: 10000,
+  wsPingIntervalMs: 1500,
   autoSelectFamilyAttemptTimeout: 120,
   socketHighWaterMark: 16 * 1024,
   allowMux: false
@@ -100,7 +102,7 @@ const BOOSTER_PROFILE_SPEED = Object.freeze({
   idleTimeoutMs: 300000,
   udpIdleTimeoutMs: 120000,
   connectTimeoutMs: CONNECT_TIMEOUT_MS,
-  wsPingIntervalMs: 5000,
+  wsPingIntervalMs: 1500,
   autoSelectFamilyAttemptTimeout: 250,
   socketHighWaterMark: 256 * 1024,
   allowMux: true
@@ -113,7 +115,7 @@ const BOOSTER_PROFILE_STABLE = Object.freeze({
   idleTimeoutMs: 600000,
   udpIdleTimeoutMs: 300000,
   connectTimeoutMs: 20000,
-  wsPingIntervalMs: 15000,
+  wsPingIntervalMs: 1500,
   autoSelectFamilyAttemptTimeout: 300,
   socketHighWaterMark: 128 * 1024,
   allowMux: true
@@ -521,6 +523,7 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
     host,
     port,
     category: detectDestinationCategory({ command, host, port }),
+    role: String(target.role || (transport === 'ws' ? 'active' : 'active')),
     createdAt: Date.now()
   };
 }
@@ -543,6 +546,13 @@ function scoreDeviceCandidate(device, meta, now = Date.now()) {
   const groupIp = device.ipGroupSet?.has(meta.ipGroup);
   const sameUa = device.uaHash && meta.uaHash && device.uaHash === meta.uaHash;
   const sameUaFamily = device.uaFamily && meta.uaFamily && device.uaFamily === meta.uaFamily;
+  const unknownUaPair = (!device.uaFamily || device.uaFamily === 'unknown' || !meta.uaFamily || meta.uaFamily === 'unknown');
+  const inClusterWindow = age < DEVICE_CLUSTER_WINDOW_MS;
+
+  // Endpoint Cluster Lock: multiple WS/XHTTP pipes/probes from the same endpoint burst
+  // are almost always one physical client, even when one request has missing/slightly
+  // different UA. This prevents one desktop/mobile app from becoming 2-4 clients.
+  if (inClusterWindow && (exactIp || groupIp) && (sameUa || sameUaFamily || unknownUaPair)) score += 42;
 
   if (exactIp) score += 38;
   else if (groupIp) score += 20;
@@ -590,6 +600,9 @@ function createDeviceState(userId, meta) {
     userId,
     state: 'online',
     connections: new Set(),
+    anchorConnections: new Set(),
+    passiveConnections: new Set(),
+    connectionRoles: new Map(),
     ipSet: new Set(meta?.ip ? [meta.ip] : []),
     ipGroupSet: new Set(meta?.ipGroup ? [meta.ipGroup] : []),
     uaHash: meta?.uaHash || 'unknown',
@@ -599,6 +612,8 @@ function createDeviceState(userId, meta) {
     recentDestinations: meta?.host ? [{ host: meta.host, port: meta.port, ts: now }] : [],
     firstSeen: now,
     lastSeen: now,
+    lastAnchorSeen: meta?.role === 'passive' ? 0 : now,
+    passiveOnlySince: 0,
     lastTrafficAt: 0,
     confidence: 1,
     closeTimer: null
@@ -612,7 +627,17 @@ function updateDeviceState(device, meta, connectionId = '') {
   device.closeTimer = null;
   device.state = 'online';
   device.lastSeen = now;
-  if (connectionId) device.connections.add(connectionId);
+  const role = meta.role === 'passive' ? 'passive' : 'active';
+  if (connectionId) {
+    device.connections.add(connectionId);
+    device.connectionRoles.set(connectionId, role);
+    if (role === 'passive') device.passiveConnections.add(connectionId);
+    else {
+      device.anchorConnections.add(connectionId);
+      device.lastAnchorSeen = now;
+      device.passiveOnlySince = 0;
+    }
+  }
   if (meta.ip) device.ipSet.add(meta.ip);
   if (meta.ipGroup) device.ipGroupSet.add(meta.ipGroup);
   if (meta.uaHash && device.uaHash === 'unknown') device.uaHash = meta.uaHash;
@@ -644,11 +669,15 @@ function refreshClientSlot(userId, clientKey, traffic = false) {
   if (!device) return;
   const now = Date.now();
   device.lastSeen = now;
-  if (traffic) device.lastTrafficAt = now;
-  if (device.state === 'draining') {
+  if (traffic) {
+    device.lastTrafficAt = now;
+    if ((device.anchorConnections?.size || 0) > 0) device.lastAnchorSeen = now;
+  }
+  if (device.state === 'draining' && ((device.anchorConnections?.size || 0) > 0)) {
     clearTimeout(device.closeTimer);
     device.closeTimer = null;
     device.state = 'online';
+    device.passiveOnlySince = 0;
     scheduleRealtimeBroadcast();
   }
 }
@@ -659,6 +688,15 @@ function pruneClientSlots(userId) {
   const now = Date.now();
   let removed = 0;
   for (const [id, device] of Array.from(map.entries())) {
+    const anchors = device.anchorConnections?.size || 0;
+    const passives = device.passiveConnections?.size || 0;
+    if (anchors === 0 && passives > 0 && device.state !== 'draining') {
+      if (!device.passiveOnlySince) device.passiveOnlySince = now;
+      if (now - Number(device.passiveOnlySince || now) > DEVICE_PASSIVE_DRAIN_MS) {
+        scheduleDeviceOffline(userId, id, 1);
+      }
+      continue;
+    }
     if ((device.connections?.size || 0) === 0 && device.state !== 'draining') {
       if (now - Number(device.lastSeen || 0) > DEVICE_DRAINING_MS) {
         clearTimeout(device.closeTimer);
@@ -684,7 +722,8 @@ function getClientSlotCount(userId) {
   if (!map) return 0;
   let count = 0;
   for (const device of map.values()) {
-    if (device.state !== 'offline' && ((device.connections?.size || 0) > 0 || device.state === 'draining')) count += 1;
+    if (device.state === 'offline') continue;
+    if ((device.anchorConnections?.size || 0) > 0 || device.state === 'draining') count += 1;
   }
   return count;
 }
@@ -702,26 +741,50 @@ function canAcceptUserSession(user, clientKey) {
   return getClientSlotCount(user.id) < limit;
 }
 
+function scheduleDeviceOffline(userId, clientKey, delayMs) {
+  const device = getDeviceMap(userId, false)?.get(clientKey);
+  if (!device) return;
+  clearTimeout(device.closeTimer);
+  device.state = 'draining';
+  device.closeTimer = setTimeout(() => {
+    const current = getDeviceMap(userId, false)?.get(clientKey);
+    if (!current) return;
+    if ((current.anchorConnections?.size || 0) > 0) {
+      current.state = 'online';
+      current.closeTimer = null;
+      return;
+    }
+    const currentMap = getDeviceMap(userId, false);
+    currentMap?.delete(clientKey);
+    if (currentMap && currentMap.size === 0) activeDevices.delete(userId);
+    scheduleRealtimeBroadcast();
+  }, delayMs);
+  scheduleRealtimeBroadcast();
+}
+
 function releaseClientSlotIfUnused(userId, clientKey, connectionId) {
   if (!clientKey) return;
   const map = getDeviceMap(userId, false);
   const device = map?.get(clientKey);
   if (!device) return;
-  if (connectionId) device.connections.delete(connectionId);
-  device.lastSeen = Date.now();
-  if (device.connections.size === 0) {
-    clearTimeout(device.closeTimer);
-    device.state = 'draining';
-    device.closeTimer = setTimeout(() => {
-      const current = getDeviceMap(userId, false)?.get(clientKey);
-      if (!current || current.connections.size > 0) return;
-      const currentMap = getDeviceMap(userId, false);
-      currentMap?.delete(clientKey);
-      if (currentMap && currentMap.size === 0) activeDevices.delete(userId);
-      scheduleRealtimeBroadcast();
-    }, DEVICE_DRAINING_MS);
+  if (connectionId) {
+    device.connections.delete(connectionId);
+    const role = device.connectionRoles?.get(connectionId) || 'active';
+    device.connectionRoles?.delete(connectionId);
+    if (role === 'passive') device.passiveConnections?.delete(connectionId);
+    else device.anchorConnections?.delete(connectionId);
+  }
+  const now = Date.now();
+  device.lastSeen = now;
+  const anchors = device.anchorConnections?.size || 0;
+  const passives = device.passiveConnections?.size || 0;
+  if (anchors === 0) {
+    if (!device.passiveOnlySince) device.passiveOnlySince = now;
+    scheduleDeviceOffline(userId, clientKey, passives > 0 ? DEVICE_PASSIVE_DRAIN_MS : DEVICE_DRAINING_MS);
     return;
   }
+  device.state = 'online';
+  device.passiveOnlySince = 0;
   scheduleRealtimeBroadcast();
 }
 
