@@ -61,6 +61,7 @@ const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90
 const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIVITY_WINDOW_MS || 7000));
 // Mahan Active Client Tracker v3: fast traffic/heartbeat based online counter.
 const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 2500));
+const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
 const WS_PING_INTERVAL_MS = 2000;
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -442,6 +443,9 @@ function removeConnection(userId, connectionId, reason = 'removed') {
   if (map.size === 0) activeConnections.delete(userId);
   if (existed) {
     releaseClientSlotIfUnused(userId, conn?.clientKey, connectionId);
+    // WS has reliable close/error events. Remove its active endpoint quickly instead
+    // of waiting for ACTIVE_CLIENT_TTL_MS, while allowing a tiny reconnect grace.
+    if (conn?.kind === 'ws') scheduleActiveClientOffline(userId, conn.clientKey, ACTIVE_CLIENT_CLOSE_GRACE_MS);
     scheduleRealtimeBroadcast();
   }
   return existed;
@@ -568,14 +572,35 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
     ip: meta.ip || 'unknown',
     ipGroup: meta.ipGroup || 'unknown',
     uaFamily: meta.uaFamily || 'unknown',
-    transports: new Set()
+    transports: new Set(),
+    closeTimer: null
   };
+  if (existing.closeTimer) {
+    clearTimeout(existing.closeTimer);
+    existing.closeTimer = null;
+  }
   existing.lastActivity = now;
   if (meta.ip) existing.ip = meta.ip;
   if (meta.ipGroup) existing.ipGroup = meta.ipGroup;
   if (meta.uaFamily) existing.uaFamily = meta.uaFamily;
   if (meta.transport) existing.transports.add(meta.transport);
   map.set(endpointKey, existing);
+}
+
+function scheduleActiveClientOffline(userId, endpointKey, delayMs = ACTIVE_CLIENT_CLOSE_GRACE_MS) {
+  if (!userId || !endpointKey) return;
+  const map = getActivityMap(userId, false);
+  const item = map?.get(endpointKey);
+  if (!item) return;
+  if (item.closeTimer) clearTimeout(item.closeTimer);
+  item.closeTimer = setTimeout(() => {
+    const currentMap = getActivityMap(userId, false);
+    const current = currentMap?.get(endpointKey);
+    if (!current) return;
+    currentMap.delete(endpointKey);
+    if (currentMap.size === 0) activeClientActivity.delete(userId);
+    scheduleRealtimeBroadcast();
+  }, delayMs);
 }
 
 function pruneActiveClientActivity(userId) {
@@ -585,6 +610,7 @@ function pruneActiveClientActivity(userId) {
   let removed = 0;
   for (const [key, item] of Array.from(map.entries())) {
     if (now - Number(item.lastActivity || 0) > ACTIVE_CLIENT_TTL_MS) {
+      if (item.closeTimer) clearTimeout(item.closeTimer);
       map.delete(key);
       removed += 1;
     }
@@ -934,6 +960,10 @@ function forceClearUserConnections(userId, reason = 'connections cleared') {
     for (const device of deviceMap.values()) clearTimeout(device.closeTimer);
   }
   activeDevices.delete(userId);
+  const activityMap = activeClientActivity.get(userId);
+  if (activityMap) {
+    for (const item of activityMap.values()) clearTimeout(item.closeTimer);
+  }
   activeClientActivity.delete(userId);
   scheduleRealtimeBroadcast();
 }
@@ -2637,6 +2667,9 @@ app.post('/api/backup/restore', requireAuth, (req, res) => {
     for (const device of deviceMap.values()) clearTimeout(device.closeTimer);
   }
   activeDevices.clear();
+  for (const activityMap of activeClientActivity.values()) {
+    for (const item of activityMap.values()) clearTimeout(item.closeTimer);
+  }
   activeClientActivity.clear();
 
   scheduleRealtimeBroadcast();
