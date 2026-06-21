@@ -48,7 +48,10 @@ const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 const LOGIN_LOCK_MS = 15 * 60 * 1000;
 const ACTIVE_CONNECTION_STALE_MS = 60 * 1000;
 const CONNECTION_CLEANUP_INTERVAL_MS = 500;
-const ACTIVE_CLIENT_WINDOW_MS = 5 * 1000; // Xray-like client activity window for Client Limit
+// Online client accounting: keep a client slot alive from socket/session heartbeat,
+// not only from real traffic bytes. This prevents connected-but-idle VPN clients
+// from disappearing in the panel while still removing truly stale slots.
+const ACTIVE_CLIENT_SLOT_TTL_MS = Math.max(30000, Number(process.env.ACTIVE_CLIENT_SLOT_TTL_MS || 75000));
 const WS_PING_INTERVAL_MS = 2000;
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -474,10 +477,10 @@ function pruneClientSlots(userId) {
   let removed = 0;
 
   for (const [key, slot] of Array.from(slots.entries())) {
-    // Mahan Xray-like Client Tracker:
-    // Count active clients from recent connection/traffic activity, not raw
-    // socket lifetime. This prevents stuck sockets from keeping counts forever.
-    if (now - Number(slot.lastSeen || 0) > ACTIVE_CLIENT_WINDOW_MS) {
+    // Mahan Online Client Tracker:
+    // A client is online while its WS/XHTTP session heartbeat is alive. Real traffic
+    // is not required; otherwise idle-but-connected VPN clients disappear from UI.
+    if (now - Number(slot.lastSeen || 0) > ACTIVE_CLIENT_SLOT_TTL_MS) {
       slots.delete(key);
       removed += 1;
     }
@@ -563,9 +566,12 @@ function registerConnection(userId, closeFn, meta = {}) {
     const current = activeConnections.get(userId);
     const item = current?.get(id);
     if (item) {
-      // Heartbeat/session liveness only. Do not renew the client slot here;
-      // Client Limit must be based on real byte traffic, not ping/pong.
-      item.lastSeen = Date.now();
+      const now = Date.now();
+      // Heartbeat/session liveness renews the online client slot. This makes
+      // Active Client / Client Limit reflect real connection lifecycle, even
+      // when the VPN is connected but no user traffic is currently flowing.
+      item.lastSeen = now;
+      refreshClientSlot(userId, item.clientKey);
     }
   };
   unregister.touchData = () => {
@@ -3002,21 +3008,10 @@ wss.on('connection', (ws, req) => {
 setInterval(() => {
   const now = Date.now();
   for (const [userId, map] of Array.from(activeConnections.entries())) {
-    const user = DB.users.find((u) => u.id === userId);
-    const hasClientLimit = Number(user?.connection_limit || user?.ip_limit || 0) > 0;
-
     for (const conn of Array.from(map.values())) {
-      const noTrafficFor = now - Number(conn.lastDataAt || conn.createdAt || 0);
-
-      // For limited users, a client slot is considered gone when absolutely no
-      // traffic bytes pass for ACTIVE_CLIENT_WINDOW_MS. Close the stale raw sockets too
-      // so they cannot reserve/revive a slot later and cause EOF/limit confusion.
-      if (hasClientLimit && noTrafficFor > ACTIVE_CLIENT_WINDOW_MS) {
-        try { conn.closeFn('client traffic idle'); } catch (_) {}
-        removeConnection(userId, conn.id, 'traffic idle');
-        continue;
-      }
-
+      // Do NOT close a connection just because it has no traffic bytes. A VPN can
+      // be connected and idle for seconds/minutes. Only heartbeat/socket staleness
+      // should remove it; explicit client close is handled immediately by close events.
       if (now - conn.lastSeen > ACTIVE_CONNECTION_STALE_MS) {
         try { conn.closeFn('connection stale'); } catch (_) {}
         removeConnection(userId, conn.id, 'stale cleaner');
