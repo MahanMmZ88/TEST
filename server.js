@@ -3,6 +3,7 @@
 const http = require('http');
 const net = require('net');
 const dgram = require('dgram');
+const dns = require('dns').promises;
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -50,6 +51,64 @@ const CONNECTION_CLEANUP_INTERVAL_MS = 500;
 const ACTIVE_CLIENT_WINDOW_MS = 5 * 1000; // Xray-like client activity window for Client Limit
 const WS_PING_INTERVAL_MS = 2000;
 
+// Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
+// It does not change user configs; each connection is tuned after the VLESS target is parsed.
+const SMART_BOOSTER_ENABLED = process.env.SMART_BOOSTER === '0' ? false : true;
+const BOOSTER_DNS_TTL_MS = Math.max(5000, Number(process.env.BOOSTER_DNS_TTL_MS || 60000));
+const BOOSTER_DNS_CACHE_MAX = Math.max(64, Number(process.env.BOOSTER_DNS_CACHE_MAX || 512));
+const BOOSTER_PROFILE_BALANCED = Object.freeze({
+  name: 'balanced',
+  wsBackpressureLimit: 4 * 1024 * 1024,
+  wsBackpressureResume: 1 * 1024 * 1024,
+  xhttpDownlinkBufferLimit: MAX_XHTTP_DOWNLINK_BUFFER,
+  idleTimeoutMs: 180000,
+  udpIdleTimeoutMs: 90000,
+  connectTimeoutMs: CONNECT_TIMEOUT_MS,
+  wsPingIntervalMs: 5000,
+  autoSelectFamilyAttemptTimeout: 220,
+  socketHighWaterMark: 64 * 1024,
+  allowMux: true
+});
+const BOOSTER_PROFILE_LATENCY = Object.freeze({
+  name: 'latency',
+  wsBackpressureLimit: 512 * 1024,
+  wsBackpressureResume: 128 * 1024,
+  xhttpDownlinkBufferLimit: 1 * 1024 * 1024,
+  idleTimeoutMs: 300000,
+  udpIdleTimeoutMs: 180000,
+  connectTimeoutMs: 10000,
+  wsPingIntervalMs: 10000,
+  autoSelectFamilyAttemptTimeout: 120,
+  socketHighWaterMark: 16 * 1024,
+  allowMux: false
+});
+const BOOSTER_PROFILE_SPEED = Object.freeze({
+  name: 'speed',
+  wsBackpressureLimit: 16 * 1024 * 1024,
+  wsBackpressureResume: 4 * 1024 * 1024,
+  xhttpDownlinkBufferLimit: 8 * 1024 * 1024,
+  idleTimeoutMs: 300000,
+  udpIdleTimeoutMs: 120000,
+  connectTimeoutMs: CONNECT_TIMEOUT_MS,
+  wsPingIntervalMs: 5000,
+  autoSelectFamilyAttemptTimeout: 250,
+  socketHighWaterMark: 256 * 1024,
+  allowMux: true
+});
+const BOOSTER_PROFILE_STABLE = Object.freeze({
+  name: 'stable',
+  wsBackpressureLimit: 8 * 1024 * 1024,
+  wsBackpressureResume: 2 * 1024 * 1024,
+  xhttpDownlinkBufferLimit: 6 * 1024 * 1024,
+  idleTimeoutMs: 600000,
+  udpIdleTimeoutMs: 300000,
+  connectTimeoutMs: 20000,
+  wsPingIntervalMs: 15000,
+  autoSelectFamilyAttemptTimeout: 300,
+  socketHighWaterMark: 128 * 1024,
+  allowMux: true
+});
+
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
 let lastCpuUsage = process.cpuUsage();
@@ -69,6 +128,7 @@ const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clien
 const clientSlots = new Map(); // user.id -> Map(clientKey, { firstSeen, lastSeen }) - Mahan Xray-like Client Tracker
 const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
+const boosterDnsCache = new Map(); // hostname -> { expiresAt, addresses, next }
 let realtimeBroadcastTimer = null;
 
 app.use(express.json({ limit: '256kb' }));
@@ -609,6 +669,171 @@ function isForbiddenTarget(host, port) {
   return false;
 }
 
+function getBoosterProfile(profileName) {
+  if (!SMART_BOOSTER_ENABLED) return BOOSTER_PROFILE_BALANCED;
+  if (profileName === 'latency') return BOOSTER_PROFILE_LATENCY;
+  if (profileName === 'speed') return BOOSTER_PROFILE_SPEED;
+  if (profileName === 'stable') return BOOSTER_PROFILE_STABLE;
+  return BOOSTER_PROFILE_BALANCED;
+}
+
+function chooseBoosterProfile(request, transport = 'ws') {
+  if (!SMART_BOOSTER_ENABLED || !request) return BOOSTER_PROFILE_BALANCED;
+  if (request.command === 0x02) return BOOSTER_PROFILE_LATENCY; // UDP/game/voice: low queue + long UDP lifetime.
+  if (request.command === 0x03) return transport === 'xhttp' ? BOOSTER_PROFILE_STABLE : BOOSTER_PROFILE_BALANCED; // MUX: stable, not aggressive.
+
+  const port = Number(request.port || 0);
+  if (port === 80 || port === 443 || port === 8080 || port === 8443) return BOOSTER_PROFILE_SPEED;
+  if ([53, 123, 3478, 3479, 3480, 500, 4500].includes(port)) return BOOSTER_PROFILE_LATENCY;
+  return BOOSTER_PROFILE_BALANCED;
+}
+
+function describeBoosterProfile(profile) {
+  return SMART_BOOSTER_ENABLED ? `booster=${profile?.name || 'balanced'}` : 'booster=off';
+}
+
+function trimBoosterDnsCache() {
+  if (boosterDnsCache.size <= BOOSTER_DNS_CACHE_MAX) return;
+  const now = Date.now();
+  for (const [key, entry] of Array.from(boosterDnsCache.entries())) {
+    if (!entry || entry.expiresAt <= now) boosterDnsCache.delete(key);
+  }
+  while (boosterDnsCache.size > BOOSTER_DNS_CACHE_MAX) {
+    const first = boosterDnsCache.keys().next().value;
+    if (!first) break;
+    boosterDnsCache.delete(first);
+  }
+}
+
+function sortBoosterAddresses(addresses, profile, family = 0) {
+  const list = Array.isArray(addresses) ? addresses.slice() : [];
+  const wantedFamily = Number(family || 0);
+  if (wantedFamily === 4 || wantedFamily === 6) {
+    list.sort((a, b) => (a.family === wantedFamily ? 0 : 1) - (b.family === wantedFamily ? 0 : 1));
+    return list;
+  }
+  // Latency mode prefers IPv4 first on most PaaS networks; speed/stable keep resolver order.
+  if (profile?.name === 'latency') {
+    list.sort((a, b) => (a.family === 4 ? 0 : 1) - (b.family === 4 ? 0 : 1));
+  }
+  return list;
+}
+
+function getCachedBoosterAddresses(hostname) {
+  const key = String(hostname || '').toLowerCase();
+  const entry = boosterDnsCache.get(key);
+  if (!entry || entry.expiresAt <= Date.now() || !Array.isArray(entry.addresses) || !entry.addresses.length) {
+    boosterDnsCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function setCachedBoosterAddresses(hostname, addresses) {
+  const key = String(hostname || '').toLowerCase();
+  boosterDnsCache.set(key, { expiresAt: Date.now() + BOOSTER_DNS_TTL_MS, addresses, next: 0 });
+  trimBoosterDnsCache();
+  return boosterDnsCache.get(key);
+}
+
+function selectBoosterAddress(entry, profile, family = 0) {
+  const sorted = sortBoosterAddresses(entry.addresses, profile, family);
+  if (!sorted.length) return null;
+  const idx = Math.abs(Number(entry.next || 0)) % sorted.length;
+  entry.next = idx + 1;
+  return sorted[idx];
+}
+
+function makeSmartDnsLookup(port, profile) {
+  return (hostname, options, callback) => {
+    const cb = typeof callback === 'function' ? callback : options;
+    const opts = typeof options === 'object' && options ? options : {};
+    const host = String(hostname || '').trim();
+    const family = Number(opts.family || 0);
+    const directFamily = net.isIP(host);
+
+    if (directFamily) {
+      if (isForbiddenTarget(host, port) || isPrivateOrProxyIp(host)) return cb(new Error(`forbidden resolved target: ${host}:${port}`));
+      if (opts.all) return cb(null, [{ address: host, family: directFamily }]);
+      return cb(null, host, directFamily);
+    }
+
+    const cached = getCachedBoosterAddresses(host);
+    if (cached) {
+      const addresses = sortBoosterAddresses(cached.addresses, profile, family);
+      if (opts.all) return cb(null, addresses);
+      const selected = selectBoosterAddress(cached, profile, family);
+      if (selected) return cb(null, selected.address, selected.family);
+    }
+
+    dns.lookup(host, { all: true, verbatim: false }).then((records) => {
+      const safe = records
+        .map((r) => ({ address: normalizeIpAddress(r.address), family: Number(r.family || net.isIP(r.address)) }))
+        .filter((r) => r.address && r.family && !isForbiddenTarget(r.address, port) && !isPrivateOrProxyIp(r.address));
+
+      if (!safe.length) throw new Error(`no public address for ${host}`);
+      const entry = setCachedBoosterAddresses(host, safe);
+      const addresses = sortBoosterAddresses(entry.addresses, profile, family);
+      if (opts.all) return cb(null, addresses);
+      const selected = selectBoosterAddress(entry, profile, family) || addresses[0];
+      return cb(null, selected.address, selected.family);
+    }).catch((err) => cb(err));
+  };
+}
+
+function resolveBoostedAddress(hostname, port, profile = BOOSTER_PROFILE_BALANCED, family = 0) {
+  const host = String(hostname || '').trim();
+  const directFamily = net.isIP(host);
+  if (directFamily) {
+    if (isForbiddenTarget(host, port) || isPrivateOrProxyIp(host)) {
+      return Promise.reject(new Error(`forbidden resolved target: ${host}:${port}`));
+    }
+    if ((family === 4 || family === 6) && family !== directFamily) {
+      return Promise.reject(new Error(`address family mismatch for ${host}`));
+    }
+    return Promise.resolve(host);
+  }
+
+  const cached = getCachedBoosterAddresses(host);
+  if (cached) {
+    const selected = selectBoosterAddress(cached, profile, family);
+    if (selected) return Promise.resolve(selected.address);
+  }
+
+  return dns.lookup(host, { all: true, verbatim: false }).then((records) => {
+    const safe = records
+      .map((r) => ({ address: normalizeIpAddress(r.address), family: Number(r.family || net.isIP(r.address)) }))
+      .filter((r) => r.address && r.family && !isForbiddenTarget(r.address, port) && !isPrivateOrProxyIp(r.address));
+    if (!safe.length) throw new Error(`no public address for ${host}`);
+    const entry = setCachedBoosterAddresses(host, safe);
+    const selected = selectBoosterAddress(entry, profile, family);
+    if (!selected) throw new Error(`no address for ${host}`);
+    return selected.address;
+  });
+}
+
+function getUdpSocketFamily(socket, host = '') {
+  try {
+    if (socket && typeof socket.type === 'function') return socket.type() === 'udp6' ? 6 : 4;
+  } catch (_) {}
+  const ipFamily = net.isIP(host);
+  return ipFamily === 6 ? 6 : 4;
+}
+
+function createBoostedTcpConnection(host, port, profile = BOOSTER_PROFILE_BALANCED) {
+  const p = profile || BOOSTER_PROFILE_BALANCED;
+  const options = {
+    host,
+    port,
+    allowHalfOpen: false,
+    autoSelectFamily: true,
+    autoSelectFamilyAttemptTimeout: p.autoSelectFamilyAttemptTimeout || 250,
+    highWaterMark: p.socketHighWaterMark || 64 * 1024,
+    lookup: makeSmartDnsLookup(port, p)
+  };
+  return net.createConnection(options);
+}
+
 function parseVlessRequest(buffer, options = {}) {
   const allowUdp = options.allowUdp === true;
   const allowMux = options.allowMux === true;
@@ -920,6 +1145,7 @@ class XHttpSession {
     this.clientIp = 'unknown';
     this.clientKey = 'ip:unknown';
     this.version = 0;
+    this.boosterProfile = BOOSTER_PROFILE_BALANCED;
     this.downlinkRes = null;
     this.nextSeq = 0;
     this.pendingPackets = new Map();
@@ -1061,12 +1287,13 @@ class XHttpSession {
 
     this.user = request.user;
     this.version = request.version;
+    this.boosterProfile = chooseBoosterProfile(request, 'xhttp');
     if (!canAcceptUserSession(this.user, this.clientKey)) {
       this.close('client limit exceeded');
       throw new Error('client limit exceeded');
     }
     this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp' });
-    log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId}`);
+    log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)}`);
 
     if (request.command === 0x03) {
       this.muxMode = true;
@@ -1075,6 +1302,7 @@ class XHttpSession {
       this.muxHandler = new MuxHandler({
         user: this.user,
         label: 'XHTTP MUX',
+        profile: this.boosterProfile,
         touch: () => this.touchData(),
         send: (chunk) => this.sendDownlink(chunk),
         close: (reason) => this.close(reason || 'mux closed')
@@ -1108,7 +1336,7 @@ class XHttpSession {
         this.close('udp error');
       });
       this.udpSocket.on('close', () => this.close('udp closed'));
-      this.udpIdleTimer = setTimeout(() => this.close('udp idle timeout'), UDP_IDLE_TIMEOUT_MS);
+      this.udpIdleTimer = setTimeout(() => this.close('udp idle timeout'), this.boosterProfile.udpIdleTimeoutMs || UDP_IDLE_TIMEOUT_MS);
 
       if (request.payload.length) this.writeToRemote(request.payload);
       this.flushRemoteWrites();
@@ -1122,12 +1350,12 @@ class XHttpSession {
         settled = true;
         this.close('connect timeout');
         reject(new Error('connect timeout'));
-      }, CONNECT_TIMEOUT_MS);
+      }, this.boosterProfile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
 
-      this.remote = net.createConnection({ host: request.host, port: request.port, allowHalfOpen: false, autoSelectFamily: true });
+      this.remote = createBoostedTcpConnection(request.host, request.port, this.boosterProfile);
       this.remote.setNoDelay(true);
       this.remote.setKeepAlive(true, 30000);
-      this.remote.setTimeout(IDLE_TIMEOUT_MS);
+      this.remote.setTimeout(this.boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
 
       this.remote.once('connect', () => {
         if (this.closed) return;
@@ -1201,11 +1429,18 @@ class XHttpSession {
     if (this.closed || !this.udpSocket || !this.udpTargetHost || !this.udpTargetPort) return;
     if (this.udpIdleTimer && this.udpIdleTimer.refresh) this.udpIdleTimer.refresh();
     updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
-    this.udpSocket.send(packet, this.udpTargetPort, this.udpTargetHost, (err) => {
-      if (err) {
-        log('[XHTTP UDP] Send failed:', err.message);
-        this.close('udp send failed');
-      }
+    const family = getUdpSocketFamily(this.udpSocket, this.udpTargetHost);
+    resolveBoostedAddress(this.udpTargetHost, this.udpTargetPort, this.boosterProfile, family).then((address) => {
+      if (this.closed || !this.udpSocket) return;
+      this.udpSocket.send(packet, this.udpTargetPort, address, (err) => {
+        if (err) {
+          log('[XHTTP UDP] Send failed:', err.message);
+          this.close('udp send failed');
+        }
+      });
+    }).catch((err) => {
+      log('[XHTTP UDP] Resolve failed:', err && err.message ? err.message : 'unknown');
+      this.close('udp resolve failed');
     });
   }
 
@@ -1227,7 +1462,8 @@ class XHttpSession {
     if (!this.downlinkRes || this.downlinkRes.writableEnded || this.downlinkRes.destroyed) {
       this.pendingDownlinkChunks.push(chunk);
       this.pendingDownlinkBytes += chunk.length;
-      if (this.pendingDownlinkBytes > MAX_XHTTP_DOWNLINK_BUFFER) {
+      const downlinkLimit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
+      if (this.pendingDownlinkBytes > downlinkLimit) {
         this.close('downlink buffer overflow');
       }
       return;
@@ -1288,8 +1524,9 @@ function getXHttpSession(sessionId) {
 }
 
 class MuxHandler {
-  constructor({ user, send, close, touch = null, label = 'MUX' }) {
+  constructor({ user, send, close, touch = null, label = 'MUX', profile = BOOSTER_PROFILE_BALANCED }) {
     this.user = user;
+    this.profile = profile || BOOSTER_PROFILE_BALANCED;
     this.send = send;
     this.closeTransport = close;
     this.touch = touch;
@@ -1378,10 +1615,10 @@ class MuxHandler {
       return;
     }
 
-    session.remote = net.createConnection({ host: target.host, port: target.port, allowHalfOpen: false, autoSelectFamily: true });
+    session.remote = createBoostedTcpConnection(target.host, target.port, this.profile);
     session.remote.setNoDelay(true);
     session.remote.setKeepAlive(true, 30000);
-    session.remote.setTimeout(IDLE_TIMEOUT_MS);
+    session.remote.setTimeout(this.profile.idleTimeoutMs || IDLE_TIMEOUT_MS);
     session.remote.once('connect', () => {
       session.connected = true;
       while (session.pending.length && session.remote && !session.remote.destroyed) {
@@ -1416,12 +1653,20 @@ class MuxHandler {
 
     if (session.target.network === 'udp') {
       updateTraffic(this.user, data.length, 'uplink', this.touch);
-      session.udp?.send(data, session.target.port, session.target.host, (err) => {
-        if (err) {
-          log(`[${this.label}] UDP send failed:`, err.message);
-          this.sendEnd(sessionId, true);
-          this.closeSession(sessionId, true);
-        }
+      const family = getUdpSocketFamily(session.udp, session.target.host);
+      resolveBoostedAddress(session.target.host, session.target.port, this.profile, family).then((address) => {
+        if (!session.udp || session.closed) return;
+        session.udp.send(data, session.target.port, address, (err) => {
+          if (err) {
+            log(`[${this.label}] UDP send failed:`, err.message);
+            this.sendEnd(sessionId, true);
+            this.closeSession(sessionId, true);
+          }
+        });
+      }).catch((err) => {
+        log(`[${this.label}] UDP resolve failed:`, err && err.message ? err.message : 'unknown');
+        this.sendEnd(sessionId, true);
+        this.closeSession(sessionId, true);
       });
       return;
     }
@@ -2241,24 +2486,42 @@ wss.on('connection', (ws, req) => {
   const udpState = { buffer: Buffer.alloc(0) };
   const pendingClientChunks = [];
   let wsAlive = true;
+  let boosterProfile = BOOSTER_PROFILE_BALANCED;
 
-  const wsPingTimer = setInterval(() => {
-    if (closed) return;
-    if (!wsAlive) {
-      closeAll(1000, 'websocket ping timeout');
-      try { ws.terminate(); } catch (_) {}
-      return;
-    }
-    wsAlive = false;
-    try { ws.ping(); } catch (_) { closeAll(1011, 'websocket ping failed'); }
-  }, WS_PING_INTERVAL_MS);
+  let wsPingTimer = null;
+  function scheduleWsPing() {
+    clearTimeout(wsPingTimer);
+    wsPingTimer = setTimeout(() => {
+      if (closed) return;
+      if (!wsAlive) {
+        closeAll(1000, 'websocket ping timeout');
+        try { ws.terminate(); } catch (_) {}
+        return;
+      }
+      wsAlive = false;
+      try { ws.ping(); } catch (_) { closeAll(1011, 'websocket ping failed'); return; }
+      scheduleWsPing();
+    }, boosterProfile.wsPingIntervalMs || WS_PING_INTERVAL_MS);
+  }
+  scheduleWsPing();
 
-  const idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), IDLE_TIMEOUT_MS);
-  const connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), CONNECT_TIMEOUT_MS);
+  let idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
+  let connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), boosterProfile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
+
+  function resetIdleTimer() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
+  }
+
+  function resetConnectTimer() {
+    clearTimeout(connectTimer);
+    connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), boosterProfile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
+  }
 
   function refreshIdleTimer() {
     unregisterConnection?.touch?.();
     if (idleTimer.refresh) idleTimer.refresh();
+    else resetIdleTimer();
   }
 
   function closeAll(code = 1000, reason = '') {
@@ -2266,7 +2529,7 @@ wss.on('connection', (ws, req) => {
     closed = true;
     clearTimeout(idleTimer);
     clearTimeout(connectTimer);
-    clearInterval(wsPingTimer);
+    clearTimeout(wsPingTimer);
     clearTimeout(udpIdleTimer);
     if (unregisterConnection) unregisterConnection();
     destroySocket(remote);
@@ -2277,11 +2540,13 @@ wss.on('connection', (ws, req) => {
 
   function sendToWs(chunk) {
     if (closed || ws.readyState !== ws.OPEN) return false;
-    if (ws.bufferedAmount > WS_BACKPRESSURE_LIMIT) {
+    const backpressureLimit = boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT;
+    const backpressureResume = boosterProfile.wsBackpressureResume || WS_BACKPRESSURE_RESUME;
+    if (ws.bufferedAmount > backpressureLimit) {
       if (remote) remote.pause();
       const interval = setInterval(() => {
         if (closed || ws.readyState !== ws.OPEN) { clearInterval(interval); return; }
-        if (ws.bufferedAmount < WS_BACKPRESSURE_RESUME) {
+        if (ws.bufferedAmount < backpressureResume) {
           clearInterval(interval);
           if (remote) remote.resume();
         }
@@ -2315,11 +2580,18 @@ wss.on('connection', (ws, req) => {
     if (closed || !udpSocket || !udpTargetHost || !udpTargetPort) return;
     if (udpIdleTimer && udpIdleTimer.refresh) udpIdleTimer.refresh();
     updateTraffic(user, packet.length, 'uplink', () => unregisterConnection?.touchData?.());
-    udpSocket.send(packet, udpTargetPort, udpTargetHost, (err) => {
-      if (err) {
-        log('[UDP] Send failed:', err.message);
-        closeAll(1011, 'udp send failed');
-      }
+    const family = getUdpSocketFamily(udpSocket, udpTargetHost);
+    resolveBoostedAddress(udpTargetHost, udpTargetPort, boosterProfile, family).then((address) => {
+      if (closed || !udpSocket) return;
+      udpSocket.send(packet, udpTargetPort, address, (err) => {
+        if (err) {
+          log('[UDP] Send failed:', err.message);
+          closeAll(1011, 'udp send failed');
+        }
+      });
+    }).catch((err) => {
+      log('[UDP] Resolve failed:', err && err.message ? err.message : 'unknown');
+      closeAll(1011, 'udp resolve failed');
     });
   }
 
@@ -2339,6 +2611,10 @@ wss.on('connection', (ws, req) => {
       }
 
       user = request.user;
+      boosterProfile = chooseBoosterProfile(request, 'ws');
+      resetIdleTimer();
+      resetConnectTimer();
+      scheduleWsPing();
       const clientIp = getClientIp(req);
       const clientKey = makeClientKey(clientIp);
       if (!canAcceptUserSession(user, clientKey)) {
@@ -2347,7 +2623,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
       unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws' });
-      log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port}`);
+      log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)}`);
 
       if (request.command === 0x03) {
         muxMode = true;
@@ -2357,6 +2633,7 @@ wss.on('connection', (ws, req) => {
         muxHandler = new MuxHandler({
           user,
           label: 'WS MUX',
+          profile: boosterProfile,
           touch: () => unregisterConnection?.touchData?.(),
           send: (chunk) => sendToWs(chunk),
           close: (reason) => closeAll(1000, reason || 'mux closed')
@@ -2397,7 +2674,7 @@ wss.on('connection', (ws, req) => {
         });
         udpSocket.on('close', () => closeAll(1000, 'udp closed'));
 
-        udpIdleTimer = setTimeout(() => closeAll(1000, 'udp idle timeout'), UDP_IDLE_TIMEOUT_MS);
+        udpIdleTimer = setTimeout(() => closeAll(1000, 'udp idle timeout'), boosterProfile.udpIdleTimeoutMs || UDP_IDLE_TIMEOUT_MS);
 
         try {
           drainUdpPackets(udpState, request.payload, sendUdpPacket);
@@ -2409,10 +2686,10 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      remote = net.createConnection({ host: request.host, port: request.port, allowHalfOpen: false, autoSelectFamily: true });
+      remote = createBoostedTcpConnection(request.host, request.port, boosterProfile);
       remote.setNoDelay(true);
       remote.setKeepAlive(true, 30000);
-      remote.setTimeout(IDLE_TIMEOUT_MS);
+      remote.setTimeout(boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
 
       remote.once('connect', () => {
         if (closed) return;
