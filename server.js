@@ -720,11 +720,6 @@ function scoreDeviceCandidate(device, meta, now = Date.now()) {
   const unknownUaPair = (!device.uaFamily || device.uaFamily === 'unknown' || !meta.uaFamily || meta.uaFamily === 'unknown');
   const inClusterWindow = age < DEVICE_CLUSTER_WINDOW_MS;
 
-  // Hard guard: never merge across completely different IP ranges.
-  // Two connections from different /23 networks are almost certainly
-  // different physical devices, even if they share the same browser UA.
-  if (!exactIp && !groupIp) return -999;
-
   // Endpoint Cluster Lock: multiple WS/XHTTP pipes/probes from the same endpoint burst
   // are almost always one physical client, even when one request has missing/slightly
   // different UA. This prevents one desktop/mobile app from becoming 2-4 clients.
@@ -732,6 +727,7 @@ function scoreDeviceCandidate(device, meta, now = Date.now()) {
 
   if (exactIp) score += 38;
   else if (groupIp) score += 20;
+  else score -= 14;
 
   if (sameUa) score += 38;
   else if (sameUaFamily && meta.uaFamily !== 'unknown') score += 18;
@@ -1964,10 +1960,20 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      // Keep XHTTP session/socket alive AND keep dashboard showing online.
-      // The downlink pipe is open → the client IS connected. Server-side
-      // touch prevents idle sessions from disappearing in the panel.
-      this.unregisterConnection?.touch?.();
+      // Keep the downlink pipe and all cohort connections alive, and keep
+      // the dashboard showing online. We must refresh connections directly
+      // instead of relying on a single unregisterConnection that may have
+      // been trimmed by the XHTTP cohort limiter.
+      if (this.user && this.clientKey) {
+        const now = Date.now();
+        const connMap = activeConnections.get(this.user.id);
+        if (connMap) {
+          for (const conn of connMap.values()) {
+            if (conn.clientKey === this.clientKey) conn.lastSeen = now;
+          }
+        }
+        touchActiveClient(this.user.id, this.clientKey, { ip: this.clientIp, transport: 'xhttp' });
+      }
     }, 1000);
 
     res.on('close', () => {
