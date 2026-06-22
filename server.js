@@ -723,9 +723,6 @@ function scoreDeviceCandidate(device, meta, now = Date.now()) {
   // Hard guard: never merge across completely different IP ranges.
   // Two connections from different /23 networks are almost certainly
   // different physical devices, even if they share the same browser UA.
-  // Without this, sameUa (+38) + age (<3000, +20) overpowers the -14
-  // penalty for different IP groups, causing two physical devices to
-  // merge into one (e.g. phone on 2.145.x.x and laptop on 31.171.x.x).
   if (!exactIp && !groupIp) return -999;
 
   // Endpoint Cluster Lock: multiple WS/XHTTP pipes/probes from the same endpoint burst
@@ -735,7 +732,6 @@ function scoreDeviceCandidate(device, meta, now = Date.now()) {
 
   if (exactIp) score += 38;
   else if (groupIp) score += 20;
-  else score -= 14;
 
   if (sameUa) score += 38;
   else if (sameUaFamily && meta.uaFamily !== 'unknown') score += 18;
@@ -1968,11 +1964,23 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      // Keep connection sockets from being pruned by ACTIVE_CONNECTION_STALE_MS.
-      // Dashboard online/offline is driven by real client packets (touchData)
-      // so idle clients naturally fall off the activity TTL without artificial
-      // keepalive noise.
-      this.unregisterConnection?.touchLiveness?.();
+      // Refresh lastSeen on ALL cohort connections so that trimming one
+      // specific connection (by trimXhttpCohortConnections) does NOT break
+      // the keepalive for the remaining connections. Without this, the
+      // ACTIVE_CONNECTION_STALE_MS=60s check in the cleanup interval
+      // prunes all connections ~60s after the referenced connection is
+      // trimmed, because unregisterConnection.touch() becomes a no-op.
+      // Dashboard online/offline is driven by real traffic packets
+      // (touchData), not by this keepalive.
+      if (this.user && this.clientKey) {
+        const connMap = activeConnections.get(this.user.id);
+        if (connMap) {
+          const now = Date.now();
+          for (const c of connMap.values()) {
+            if (c.clientKey === this.clientKey) c.lastSeen = now;
+          }
+        }
+      }
     }, 1000);
 
     res.on('close', () => {
