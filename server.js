@@ -1018,55 +1018,10 @@ function scheduleWsDuplicateCohortCleanup(userId, clientKey, currentConnectionId
 }
 
 function trimXhttpCohortConnections(userId) {
-  const map = activeConnections.get(userId);
-  if (!map) return 0;
-  const now = Date.now();
-  const groups = new Map();
-
-  for (const conn of map.values()) {
-    if (conn.kind !== 'xhttp' || !conn.clientKey) continue;
-    if (!groups.has(conn.clientKey)) groups.set(conn.clientKey, []);
-    groups.get(conn.clientKey).push(conn);
-  }
-
-  let trimmed = 0;
-  for (const [clientKey, conns] of groups.entries()) {
-    if (conns.length <= XHTTP_MAX_CONNECTIONS_PER_COHORT) continue;
-
-    // Keep newest / recently data-active streams first. Trim only old idle sessions.
-    const rankedNewest = conns.slice().sort((a, b) => {
-      const aActive = Number(a.lastDataAt || a.createdAt || 0);
-      const bActive = Number(b.lastDataAt || b.createdAt || 0);
-      if (bActive !== aActive) return bActive - aActive;
-      return Number(b.createdAt || 0) - Number(a.createdAt || 0);
-    });
-    const protectedIds = new Set(rankedNewest.slice(0, XHTTP_MAX_CONNECTIONS_PER_COHORT).map((conn) => conn.id));
-    const candidates = rankedNewest
-      .slice(XHTTP_MAX_CONNECTIONS_PER_COHORT)
-      .filter((conn) => now - Number(conn.lastDataAt || conn.createdAt || 0) >= XHTTP_MIN_IDLE_BEFORE_TRIM_MS)
-      .sort((a, b) => Number(a.lastDataAt || a.createdAt || 0) - Number(b.lastDataAt || b.createdAt || 0));
-
-    let currentSize = conns.length;
-    for (const conn of candidates) {
-      if (currentSize <= XHTTP_MAX_CONNECTIONS_PER_COHORT) break;
-      if (protectedIds.has(conn.id)) continue;
-      debugActive('xhttp-trim-idle', {
-        userId,
-        endpointKey: clientKey,
-        connectionId: conn.id,
-        idleFor: now - Number(conn.lastDataAt || conn.createdAt || 0),
-        currentSize,
-        limit: XHTTP_MAX_CONNECTIONS_PER_COHORT
-      });
-      try { conn.closeFn('xhttp idle cohort trim'); } catch (_) {}
-      if (removeConnection(userId, conn.id, 'xhttp idle cohort trim')) {
-        trimmed += 1;
-        currentSize -= 1;
-      }
-    }
-  }
-
-  return trimmed;
+  // Non-destructive Booster policy: do not close XHTTP packet-up sessions from the
+  // server side. XHTTP clients may depend on multiple POST/GET request lifecycles
+  // during heavy traffic; trimming them caused YouTube/Speedtest stalls.
+  return 0;
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -2010,23 +1965,14 @@ function buildWsVlessLink(req, user) {
   return link;
 }
 
-function buildXhttpVlessLink(req, user) {
+function buildXhttpVlessLink(req, user, deviceToken = '') {
   const { host, port, security, isTls } = getPublicEndpoint(req);
   const tag = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
-  // XHTTP keepalive should be expressed via XHTTP/XMUX extra, not aggressive quicParams.
-  // hKeepAlivePeriod=2s gives small client-visible keepalive activity; modest concurrency
-  // prevents one app/device from exploding into many parallel HTTP streams.
-  const xhttpExtra = encodeURIComponent(JSON.stringify({
-    xmux: {
-      hKeepAlivePeriod: 2,
-      // Conservative XMUX: reduce request/stream explosion during traffic peaks.
-      maxConcurrency: '2-4',
-      cMaxReuseTimes: '60-120',
-      hMaxRequestTimes: '300-500',
-      hMaxReusableSecs: '900-1800'
-    }
-  }));
-  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=packet-up&extra=${xhttpExtra}`;
+  // Throughput-safe XHTTP: keep packet-up and do not inject XMUX/extra limits here.
+  // Some clients/platforms throttle or stall heavy traffic (YouTube/Speedtest) when
+  // restrictive extra.xmux values are present.
+  const xhttpPath = deviceToken ? `/xhttp/t/${encodeURIComponent(deviceToken)}` : '/xhttp';
+  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=${encodeURIComponent(xhttpPath)}&mode=packet-up`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}&alpn=h2%2Chttp%2F1.1&fp=chrome`;
   link += `#${tag}`;
   return link;
