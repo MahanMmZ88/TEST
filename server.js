@@ -528,9 +528,10 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
   const port = Number(target.port || 0);
   const category = detectDestinationCategory({ command, host, port });
   const role = String(target.role || 'active');
-  const identityBase = uaNorm
-    ? `${normalizedIp}|${uaHash}`
-    : `${normalizedIp}|${uaFamily || 'unknown'}`;
+  // Active Client identity is intentionally IP-only (Xray-like Online IP model).
+  // User-Agent/device heuristics caused one WebSocket client to be counted as multiple
+  // clients when headers varied across streams. IP-only is stable and matches most panels.
+  const identityBase = `ip|${normalizedIp}`;
   return {
     ip: normalizedIp,
     ipGroup,
@@ -1642,7 +1643,7 @@ function buildXhttpVlessLink(req, user) {
       cMaxReuseTimes: '100-200'
     }
   }));
-  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=stream-up&extra=${xhttpExtra}`;
+  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=packet-up&extra=${xhttpExtra}`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}&alpn=h2%2Chttp%2F1.1&fp=chrome`;
   link += `#${tag}`;
   return link;
