@@ -3733,6 +3733,23 @@ wss.on('connection', (ws, req) => {
 
 setInterval(() => {
   const now = Date.now();
+
+  // Keep XHTTP connections alive as long as their session downlink pipe
+  // is open. The per-session aliveTimer handles this during normal operation,
+  // but intermediate proxy timeouts, mobile network transitions, or transient
+  // HTTP stream closures can stop it. This backup guarantees that no connection
+  // is pruned while its session still exists, preventing the ~60s idle dropout.
+  for (const session of xhttpSessions.values()) {
+    if (session.closed) continue;
+    if (!session.downlinkRes || session.downlinkRes.writableEnded || session.downlinkRes.destroyed) continue;
+    if (!session.user || !session.clientKey) continue;
+    const sessionConnMap = activeConnections.get(session.user.id);
+    if (!sessionConnMap) continue;
+    for (const c of sessionConnMap.values()) {
+      if (c.clientKey === session.clientKey) c.lastSeen = now;
+    }
+  }
+
   for (const [userId, map] of Array.from(activeConnections.entries())) {
     for (const conn of Array.from(map.values())) {
       if (conn.kind === 'ws') {
