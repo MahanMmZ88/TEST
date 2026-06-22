@@ -470,9 +470,10 @@ function removeConnection(userId, connectionId, reason = 'removed') {
   if (map.size === 0) activeConnections.delete(userId);
   if (existed) {
     releaseClientSlotIfUnused(userId, conn?.clientKey, connectionId);
-    // WS has reliable close/error events. Remove its active endpoint quickly instead
-    // of waiting for ACTIVE_CLIENT_TTL_MS, while allowing a tiny reconnect grace.
-    if (conn?.kind === 'ws') scheduleActiveClientOffline(userId, conn.clientKey, ACTIVE_CLIENT_CLOSE_GRACE_MS);
+    // Schedule fast offline for ALL connection types, not just WS.
+    // XHTTP/other connections also have reliable close events through
+    // their session close/downlink-close paths.
+    if (conn?.clientKey) scheduleActiveClientOffline(userId, conn.clientKey, ACTIVE_CLIENT_CLOSE_GRACE_MS);
     scheduleRealtimeBroadcast();
   }
   return existed;
@@ -1963,10 +1964,10 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      // Keep the XHTTP session/socket lifecycle alive without touching dashboard
-      // active-client activity. This protects data-plane stability while keeping
-      // Active Clients strictly traffic/client-heartbeat based.
-      this.unregisterConnection?.touchLiveness?.();
+      // Keep XHTTP session/socket alive AND keep dashboard showing online.
+      // The downlink pipe is open → the client IS connected. Server-side
+      // touch prevents idle sessions from disappearing in the panel.
+      this.unregisterConnection?.touch?.();
     }, 1000);
 
     res.on('close', () => {
