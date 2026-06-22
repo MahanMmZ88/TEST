@@ -720,6 +720,14 @@ function scoreDeviceCandidate(device, meta, now = Date.now()) {
   const unknownUaPair = (!device.uaFamily || device.uaFamily === 'unknown' || !meta.uaFamily || meta.uaFamily === 'unknown');
   const inClusterWindow = age < DEVICE_CLUSTER_WINDOW_MS;
 
+  // Hard guard: never merge across completely different IP ranges.
+  // Two connections from different /23 networks are almost certainly
+  // different physical devices, even if they share the same browser UA.
+  // Without this, sameUa (+38) + age (<3000, +20) overpowers the -14
+  // penalty for different IP groups, causing two physical devices to
+  // merge into one (e.g. phone on 2.145.x.x and laptop on 31.171.x.x).
+  if (!exactIp && !groupIp) return -999;
+
   // Endpoint Cluster Lock: multiple WS/XHTTP pipes/probes from the same endpoint burst
   // are almost always one physical client, even when one request has missing/slightly
   // different UA. This prevents one desktop/mobile app from becoming 2-4 clients.
