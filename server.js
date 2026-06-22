@@ -64,6 +64,12 @@ const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIV
 const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 5000));
 const ACTIVE_CLIENT_STABILIZE_MS = Math.max(0, Number(process.env.ACTIVE_CLIENT_STABILIZE_MS || 800));
 const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
+// Cohort tuning: /23 fixes mobile/PaaS IP pool flips like 31.171.100.x <-> 31.171.101.x.
+const ACTIVE_CLIENT_IPV4_PREFIX = Math.max(16, Math.min(32, Number(process.env.ACTIVE_CLIENT_IPV4_PREFIX || 23)));
+// For WS, a single client can leave multiple zombie/reconnect sockets in the same cohort.
+// Keep a small number of newest sockets and close older duplicates after a short grace.
+const WS_MAX_CONNECTIONS_PER_COHORT = Math.max(1, Number(process.env.WS_MAX_CONNECTIONS_PER_COHORT || 2));
+const WS_DUPLICATE_CLOSE_GRACE_MS = Math.max(250, Number(process.env.WS_DUPLICATE_CLOSE_GRACE_MS || 1500));
 // Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
 const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
 const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 4000));
@@ -517,13 +523,17 @@ function getIpGroup(ip) {
   const h = normalizeIpAddress(ip);
   if (!h || h === 'unknown') return 'unknown';
   if (net.isIP(h) === 4) {
-    const parts = h.split('.');
-    return parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.0/24` : h;
+    const parts = h.split('.').map((x) => Number(x) & 255);
+    if (parts.length !== 4) return h;
+    const prefix = ACTIVE_CLIENT_IPV4_PREFIX;
+    const ipNum = (((parts[0] << 24) >>> 0) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    const netNum = (ipNum & mask) >>> 0;
+    return `${(netNum >>> 24) & 255}.${(netNum >>> 16) & 255}.${(netNum >>> 8) & 255}.${netNum & 255}/${prefix}`;
   }
   if (net.isIP(h) === 6) {
     const clean = h.toLowerCase();
-    const expanded = clean.includes('::') ? clean : clean;
-    return expanded.split(':').slice(0, 4).join(':') + '::/64';
+    return clean.split(':').slice(0, 4).join(':') + '::/64';
   }
   return h;
 }
@@ -945,6 +955,26 @@ function releaseClientSlotIfUnused(userId, clientKey, connectionId) {
   scheduleRealtimeBroadcast();
 }
 
+function scheduleWsDuplicateCohortCleanup(userId, clientKey, currentConnectionId) {
+  if (!userId || !clientKey) return;
+  setTimeout(() => {
+    const map = activeConnections.get(userId);
+    if (!map) return;
+    const wsConnections = Array.from(map.values())
+      .filter((conn) => conn.kind === 'ws' && conn.clientKey === clientKey)
+      .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+
+    if (wsConnections.length <= WS_MAX_CONNECTIONS_PER_COHORT) return;
+    const keep = new Set(wsConnections.slice(0, WS_MAX_CONNECTIONS_PER_COHORT).map((conn) => conn.id));
+    for (const conn of wsConnections) {
+      if (keep.has(conn.id)) continue;
+      debugActive('ws-duplicate-close', { userId, endpointKey: clientKey, connectionId: conn.id, currentConnectionId });
+      try { conn.closeFn('ws duplicate cohort cleanup'); } catch (_) {}
+      removeConnection(userId, conn.id, 'ws duplicate cohort cleanup');
+    }
+  }, WS_DUPLICATE_CLOSE_GRACE_MS);
+}
+
 function registerConnection(userId, closeFn, meta = {}) {
   if (!activeConnections.has(userId)) activeConnections.set(userId, new Map());
   const map = activeConnections.get(userId);
@@ -977,6 +1007,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     wsDashboardOffline: false
   };
   map.set(id, conn);
+  if (conn.kind === 'ws') scheduleWsDuplicateCohortCleanup(userId, conn.clientKey, id);
   scheduleRealtimeBroadcast();
 
   const unregister = () => {
