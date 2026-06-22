@@ -60,9 +60,13 @@ const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90
 // MDIE v3: Active Client is recent client-side activity/heartbeat, not raw open sockets.
 const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIVITY_WINDOW_MS || 7000));
 // Mahan Active Client Tracker v3: fast traffic/heartbeat based online counter.
-const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 2500));
+// Keep this >= 2x XHTTP hKeepAlivePeriod so XHTTP keepalive does not flicker.
+const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 5000));
 const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
-const WS_PING_INTERVAL_MS = 2000;
+// Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
+const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
+const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 4000));
+const WS_TERMINATE_MS = Math.max(3000, Number(process.env.WS_TERMINATE_MS || 8000));
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
 // It does not change user configs; each connection is tuned after the VLESS target is parsed.
@@ -587,13 +591,17 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
   map.set(endpointKey, existing);
 }
 
-function scheduleActiveClientOffline(userId, endpointKey, delayMs = ACTIVE_CLIENT_CLOSE_GRACE_MS) {
+function scheduleActiveClientOffline(userId, endpointKey, delayMs = ACTIVE_CLIENT_CLOSE_GRACE_MS, force = false) {
   if (!userId || !endpointKey) return;
   const map = getActivityMap(userId, false);
   const item = map?.get(endpointKey);
   if (!item) return;
   if (item.closeTimer) clearTimeout(item.closeTimer);
   item.closeTimer = setTimeout(() => {
+    // Do not remove the dashboard endpoint if another socket/session with the
+    // same endpoint is still connected, unless this is a liveness-forced offline
+    // (e.g. WS pong disappeared while the proxy has not closed the socket yet).
+    if (!force && hasConnectedEndpoint(userId, endpointKey)) return;
     const currentMap = getActivityMap(userId, false);
     const current = currentMap?.get(endpointKey);
     if (!current) return;
@@ -819,12 +827,35 @@ function makeClientKey(ip) {
   return `ip:${normalizeIpAddress(ip) || 'unknown'}`;
 }
 
+function getConnectedEndpointCount(userId) {
+  pruneStaleConnections(userId, ACTIVE_CONNECTION_STALE_MS);
+  const map = activeConnections.get(userId);
+  if (!map) return 0;
+  const keys = new Set();
+  for (const conn of map.values()) {
+    if (conn?.clientKey) keys.add(conn.clientKey);
+  }
+  return keys.size;
+}
+
+function hasConnectedEndpoint(userId, clientKey) {
+  if (!clientKey) return false;
+  const map = activeConnections.get(userId);
+  if (!map) return false;
+  for (const conn of map.values()) {
+    if (conn?.clientKey === clientKey) return true;
+  }
+  return false;
+}
+
 function canAcceptUserSession(user, clientKey) {
   const limit = Number(user.connection_limit || user.ip_limit || 0);
   if (!limit || limit <= 0) return true;
-  pruneActiveClientActivity(user.id);
-  if (clientKey && getActivityMap(user.id, false)?.has(clientKey)) return true;
-  return getActiveClientActivityCount(user.id) < limit;
+  // Rollback architecture: connection admission/client limit must be conservative
+  // and independent from the fast dashboard activity TTL. Otherwise XHTTP packet-up
+  // streams can be rejected when the UI activity window expires.
+  if (clientKey && hasConnectedEndpoint(user.id, clientKey)) return true;
+  return getConnectedEndpointCount(user.id) < limit;
 }
 
 function scheduleDeviceOffline(userId, clientKey, delayMs) {
@@ -909,14 +940,19 @@ function registerConnection(userId, closeFn, meta = {}) {
   const unregister = () => {
     removeConnection(userId, id, 'unregister');
   };
+  unregister.touchLiveness = () => {
+    const current = activeConnections.get(userId);
+    const item = current?.get(id);
+    if (item) item.lastSeen = Date.now();
+  };
   unregister.touch = () => {
     const current = activeConnections.get(userId);
     const item = current?.get(id);
     if (item) {
       const now = Date.now();
-      // Heartbeat/session liveness renews the online client slot. This makes
-      // Active Client / Client Limit reflect real connection lifecycle, even
-      // when the VPN is connected but no user traffic is currently flowing.
+      // Client-originated heartbeat/activity renews dashboard activity. Server-only
+      // keepalive should call touchLiveness() instead so XHTTP remains stable without
+      // keeping the UI online forever.
       item.lastSeen = now;
       refreshClientSlot(userId, item.clientKey);
       touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
@@ -1596,7 +1632,17 @@ function buildWsVlessLink(req, user) {
 function buildXhttpVlessLink(req, user) {
   const { host, port, security, isTls } = getPublicEndpoint(req);
   const tag = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
-  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=packet-up`;
+  // XHTTP keepalive should be expressed via XHTTP/XMUX extra, not aggressive quicParams.
+  // hKeepAlivePeriod=2s gives small client-visible keepalive activity; modest concurrency
+  // prevents one app/device from exploding into many parallel HTTP streams.
+  const xhttpExtra = encodeURIComponent(JSON.stringify({
+    xmux: {
+      hKeepAlivePeriod: 2,
+      maxConcurrency: '4-8',
+      cMaxReuseTimes: '100-200'
+    }
+  }));
+  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=stream-up&extra=${xhttpExtra}`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}&alpn=h2%2Chttp%2F1.1&fp=chrome`;
   link += `#${tag}`;
   return link;
@@ -1747,8 +1793,10 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      // MDIE v3: do not renew active-client state from server-only downlink pings.
-      // Only client-originated traffic/requests or WS pong should keep a device active.
+      // Keep the XHTTP session/socket lifecycle alive without touching dashboard
+      // active-client activity. This protects data-plane stability while keeping
+      // Active Clients strictly traffic/client-heartbeat based.
+      this.unregisterConnection?.touchLiveness?.();
     }, 1000);
 
     res.on('close', () => {
@@ -3073,19 +3121,37 @@ wss.on('connection', (ws, req) => {
   const udpDownlinkBurstState = createUdpBurstState();
   const pendingClientChunks = [];
   let wsAlive = true;
+  let lastPongAt = Date.now();
+  let lastPingAt = 0;
+  let wsDashboardMarkedOffline = false;
   let boosterProfile = BOOSTER_PROFILE_BALANCED;
 
   let wsPingTimer = null;
+  function markWsDashboardOffline() {
+    if (wsDashboardMarkedOffline || !user || !unregisterConnection?.clientKey) return;
+    wsDashboardMarkedOffline = true;
+    scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
+  }
+
   function scheduleWsPing() {
     clearTimeout(wsPingTimer);
     wsPingTimer = setTimeout(() => {
       if (closed) return;
-      if (!wsAlive) {
-        closeAll(1000, 'websocket ping timeout');
+      const now = Date.now();
+      const silentFor = now - Number(lastPongAt || 0);
+
+      // Hybrid WS Fast Liveness:
+      // 1) dashboard offline quickly when pong disappears;
+      // 2) terminate socket later to avoid killing users during short radio/proxy jitter.
+      if (silentFor > WS_DASHBOARD_OFFLINE_MS) markWsDashboardOffline();
+      if (silentFor > WS_TERMINATE_MS) {
+        closeAll(1000, 'websocket pong timeout');
         try { ws.terminate(); } catch (_) {}
         return;
       }
+
       wsAlive = false;
+      lastPingAt = now;
       try { ws.ping(); } catch (_) { closeAll(1011, 'websocket ping failed'); return; }
       scheduleWsPing();
     }, boosterProfile.wsPingIntervalMs || WS_PING_INTERVAL_MS);
@@ -3357,6 +3423,8 @@ wss.on('connection', (ws, req) => {
 
   ws.on('pong', () => {
     wsAlive = true;
+    lastPongAt = Date.now();
+    wsDashboardMarkedOffline = false;
     refreshIdleTimer();
   });
 
@@ -3372,6 +3440,11 @@ wss.on('connection', (ws, req) => {
     log('[WS] Error:', err && err.message ? err.message : 'unknown');
     closeAll(1011, 'websocket error');
   });
+  try {
+    req.socket.on('close', () => closeAll(1000, 'underlying socket closed'));
+    req.socket.on('end', () => closeAll(1000, 'underlying socket ended'));
+    req.socket.on('error', () => closeAll(1011, 'underlying socket error'));
+  } catch (_) {}
 
   const earlyData = decodeEarlyDataFromProtocolHeader(req.headers['sec-websocket-protocol']);
   if (earlyData) {
