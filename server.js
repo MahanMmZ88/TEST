@@ -83,7 +83,7 @@ const DEBUG_ACTIVE_CLIENTS = process.env.DEBUG_ACTIVE_CLIENTS === '1';
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
 // It does not change user configs; each connection is tuned after the VLESS target is parsed.
-const SMART_BOOSTER_ENABLED = process.env.SMART_BOOSTER === '0' ? false : true;
+const SMART_BOOSTER_ENABLED = true; // Mahan Smart Booster v2 is core engine: always on.
 const BOOSTER_DNS_TTL_MS = Math.max(5000, Number(process.env.BOOSTER_DNS_TTL_MS || 60000));
 const BOOSTER_DNS_CACHE_MAX = Math.max(64, Number(process.env.BOOSTER_DNS_CACHE_MAX || 512));
 const BOOSTER_DEST_MEMORY_MAX = Math.max(128, Number(process.env.BOOSTER_DEST_MEMORY_MAX || 2048));
@@ -142,6 +142,14 @@ const BOOSTER_PROFILE_STABLE = Object.freeze({
   socketHighWaterMark: 128 * 1024,
   allowMux: true
 });
+const BOOSTER_V2_CONFIG = Object.freeze({
+  memoryMax: 4096,
+  activeFlowMax: 512,
+  debugFlowMax: 200,
+  explorationRate: 0.02,
+  minReward: -100,
+  maxReward: 100
+});
 
 let DB = { admin: null, users: [] };
 let dbSaveTimer = null;
@@ -166,6 +174,11 @@ const adminEventClients = new Set();
 const subEventClients = new Map(); // sub_id -> Set(res)
 const boosterDnsCache = new Map(); // hostname -> { expiresAt, addresses, next }
 const boosterDestMemory = new Map(); // host:port -> adaptive performance memory
+const boosterLearningMemory = new Map(); // targetKey -> profile statistics used by FlowSense AutoPilot
+const boosterUserMemory = new Map(); // user.id -> user-specific network mood and profile bias
+const boosterFlowTwins = new Map(); // flowId -> runtime flow twin
+const boosterRecentFlows = [];
+const boosterStats = { started: 0, finished: 0, errors: 0, profileSelections: { latency: 0, balanced: 0, speed: 0, stable: 0 } };
 let realtimeBroadcastTimer = null;
 
 app.use(express.json({ limit: '256kb' }));
@@ -1393,24 +1406,217 @@ function detectDestinationCategory(requestOrTarget) {
   return 'general';
 }
 
-function chooseBoosterProfile(request, transport = 'ws') {
-  if (!SMART_BOOSTER_ENABLED || !request) return BOOSTER_PROFILE_BALANCED;
+function detectBoosterIntent(features) {
+  if (!features) return 'unknown';
+  if (features.command === 0x02 || features.category === 'game') return features.port === 53 ? 'dns' : 'gaming';
+  if (features.command === 0x03 || features.category === 'mux') return 'multiplex';
+  if (features.category === 'download') return 'streaming';
+  if ([80, 443, 8080, 8443].includes(Number(features.port || 0))) return 'browsing';
+  return 'general';
+}
+
+function getBoosterTargetKey(features) {
+  const host = String(features?.host || '').toLowerCase() || 'unknown';
+  const port = Number(features?.port || 0);
+  const category = String(features?.category || 'general');
+  return `${category}|${host}:${port}|${features?.transport || 'unknown'}`;
+}
+
+function extractBoosterFeatures(request, transport = 'ws', userId = '') {
   const category = detectDestinationCategory(request);
-  const mem = getDestinationMemory(request.host, request.port, true);
-  if (mem) {
-    mem.category = category;
+  const features = {
+    userId: String(userId || ''),
+    transport: String(transport || 'unknown'),
+    command: Number(request?.command || 0),
+    host: String(request?.host || '').toLowerCase(),
+    port: Number(request?.port || 0),
+    category,
+    isDomain: Boolean(String(request?.host || '').match(/[a-z]/i)),
+    payloadSize: Buffer.isBuffer(request?.payload) ? request.payload.length : 0,
+    createdAt: Date.now()
+  };
+  features.intent = detectBoosterIntent(features);
+  features.targetKey = getBoosterTargetKey(features);
+  return features;
+}
+
+function getProfileBase(profileName) {
+  if (profileName === 'latency') return BOOSTER_PROFILE_LATENCY;
+  if (profileName === 'speed') return BOOSTER_PROFILE_SPEED;
+  if (profileName === 'stable') return BOOSTER_PROFILE_STABLE;
+  return BOOSTER_PROFILE_BALANCED;
+}
+
+function getLearningRecord(targetKey) {
+  let rec = boosterLearningMemory.get(targetKey);
+  if (!rec) {
+    rec = { targetKey, updatedAt: Date.now(), profiles: {} };
+    for (const name of ['latency', 'balanced', 'speed', 'stable']) {
+      rec.profiles[name] = { attempts: 0, success: 0, errors: 0, avgReward: 0, avgConnectMs: 0, avgThroughput: 0, bufferPenalty: 0 };
+    }
+    boosterLearningMemory.set(targetKey, rec);
+    trimBoosterLearningMemory();
+  }
+  rec.updatedAt = Date.now();
+  return rec;
+}
+
+function trimBoosterLearningMemory() {
+  if (boosterLearningMemory.size <= BOOSTER_V2_CONFIG.memoryMax) return;
+  const entries = Array.from(boosterLearningMemory.entries()).sort((a, b) => Number(a[1].updatedAt || 0) - Number(b[1].updatedAt || 0));
+  while (boosterLearningMemory.size > BOOSTER_V2_CONFIG.memoryMax && entries.length) boosterLearningMemory.delete(entries.shift()[0]);
+}
+
+function getUserBoosterMemory(userId) {
+  const id = String(userId || 'global');
+  let mem = boosterUserMemory.get(id);
+  if (!mem) {
+    mem = { userId: id, updatedAt: Date.now(), reconnects: 0, errors: 0, profileBias: { latency: 0, balanced: 0, speed: 0, stable: 0 }, mood: 'smooth' };
+    boosterUserMemory.set(id, mem);
+  }
+  mem.updatedAt = Date.now();
+  return mem;
+}
+
+function detectNetworkMood(userId) {
+  const mem = getUserBoosterMemory(userId);
+  if (mem.errors >= 5 || mem.reconnects >= 5) return 'unstable';
+  if (mem.errors >= 2 || mem.reconnects >= 2) return 'jittery';
+  return mem.mood || 'smooth';
+}
+
+function profileScore(profileName, features, learning, userMemory, mood) {
+  const stats = learning.profiles[profileName] || { attempts: 0, avgReward: 0, errors: 0, success: 0 };
+  let score = 0;
+  if (profileName === 'latency') score += features.intent === 'gaming' || features.intent === 'dns' ? 55 : -5;
+  if (profileName === 'speed') score += ['streaming', 'browsing'].includes(features.intent) ? 45 : 0;
+  if (profileName === 'stable') score += ['unstable', 'jittery'].includes(mood) ? 50 : (features.transport === 'xhttp' ? 8 : 0);
+  if (profileName === 'balanced') score += 15;
+  score += Number(stats.avgReward || 0) * 0.35;
+  score += Number(userMemory.profileBias?.[profileName] || 0);
+  score -= Number(stats.errors || 0) * 2;
+  if (stats.attempts > 0) score += Math.min(12, Math.sqrt(stats.attempts));
+  return score;
+}
+
+function deriveProfile(baseProfile, features, mood) {
+  const p = { ...baseProfile };
+  if (features.intent === 'streaming' && mood === 'smooth') {
+    p.wsBackpressureLimit = Math.max(p.wsBackpressureLimit, 12 * 1024 * 1024);
+    p.xhttpDownlinkBufferLimit = Math.max(p.xhttpDownlinkBufferLimit, 6 * 1024 * 1024);
+  }
+  if (features.intent === 'gaming') {
+    p.wsBackpressureLimit = Math.min(p.wsBackpressureLimit, 512 * 1024);
+    p.wsBackpressureResume = Math.min(p.wsBackpressureResume, 128 * 1024);
+  }
+  if (mood === 'unstable') {
+    p.connectTimeoutMs = Math.max(p.connectTimeoutMs || CONNECT_TIMEOUT_MS, 20000);
+    p.idleTimeoutMs = Math.max(p.idleTimeoutMs || IDLE_TIMEOUT_MS, 300000);
+  }
+  return p;
+}
+
+function selectBoosterProfile(features) {
+  const learning = getLearningRecord(features.targetKey);
+  const userMemory = getUserBoosterMemory(features.userId);
+  const mood = detectNetworkMood(features.userId);
+  const scores = {};
+  for (const name of ['latency', 'balanced', 'speed', 'stable']) scores[name] = profileScore(name, features, learning, userMemory, mood);
+
+  let selected = Object.entries(scores).sort((a, b) => b[1] - a[1])[0][0];
+  const reasons = [`intent:${features.intent}`, `mood:${mood}`, `category:${features.category}`];
+
+  // Safe exploration: only for non-realtime flows, tiny probability, never when unstable.
+  if (!['gaming', 'dns', 'multiplex'].includes(features.intent) && mood === 'smooth' && Math.random() < BOOSTER_V2_CONFIG.explorationRate) {
+    const alternatives = Object.entries(scores).sort((a, b) => b[1] - a[1]).map(([name]) => name).filter((name) => name !== selected);
+    if (alternatives[0]) { selected = alternatives[0]; reasons.push('safe-exploration'); }
   }
 
-  let profile = BOOSTER_PROFILE_BALANCED;
-  if (category === 'game') profile = BOOSTER_PROFILE_LATENCY;
-  else if (category === 'download' || category === 'web') profile = BOOSTER_PROFILE_SPEED;
-  else if (category === 'mux') profile = transport === 'xhttp' ? BOOSTER_PROFILE_STABLE : BOOSTER_PROFILE_BALANCED;
+  const profile = deriveProfile(getProfileBase(selected), features, mood);
+  boosterStats.profileSelections[selected] = Number(boosterStats.profileSelections[selected] || 0) + 1;
+  return { profile, profileName: selected, confidence: Math.max(0.05, Math.min(0.99, 0.55 + (scores[selected] / 150))), scores, reasons, mood };
+}
 
-  // Per-destination memory: repeated failures prefer stability over raw speed.
-  if (mem && Number(mem.errors || 0) >= 2 && profile.name === 'speed') profile = BOOSTER_PROFILE_STABLE;
-  if (mem && Number(mem.errors || 0) >= 4) profile = BOOSTER_PROFILE_STABLE;
-  if (mem) mem.lastProfile = profile.name;
-  return profile;
+function startBoosterFlow(request, transport = 'ws', userId = '') {
+  const features = extractBoosterFeatures(request, transport, userId);
+  const decision = selectBoosterProfile(features);
+  const flow = {
+    id: `flow_${crypto.randomBytes(6).toString('hex')}`,
+    userId: String(userId || ''),
+    targetKey: features.targetKey,
+    features,
+    intent: features.intent,
+    mood: decision.mood,
+    profileName: decision.profileName,
+    profile: decision.profile,
+    confidence: decision.confidence,
+    reason: decision.reasons,
+    scores: decision.scores,
+    metrics: { startedAt: Date.now(), connectMs: 0, bytesUp: 0, bytesDown: 0, bufferPeak: 0, errors: 0, timeout: false },
+    status: 'active'
+  };
+  boosterStats.started += 1;
+  boosterFlowTwins.set(flow.id, flow);
+  boosterRecentFlows.unshift(flow);
+  if (boosterRecentFlows.length > BOOSTER_V2_CONFIG.debugFlowMax) boosterRecentFlows.pop();
+  while (boosterFlowTwins.size > BOOSTER_V2_CONFIG.activeFlowMax) {
+    const first = boosterFlowTwins.keys().next().value;
+    if (!first) break;
+    boosterFlowTwins.delete(first);
+  }
+  return flow;
+}
+
+function recordBoosterFlowMetric(flow, patch = {}) {
+  if (!flow) return;
+  Object.assign(flow.metrics, patch);
+  if (patch.bufferPeak) flow.metrics.bufferPeak = Math.max(Number(flow.metrics.bufferPeak || 0), Number(patch.bufferPeak || 0));
+}
+
+function finishBoosterFlow(flow, outcome = {}) {
+  if (!flow || flow.status === 'finished') return;
+  flow.status = 'finished';
+  flow.metrics.finishedAt = Date.now();
+  flow.metrics.durationMs = flow.metrics.finishedAt - Number(flow.metrics.startedAt || flow.metrics.finishedAt);
+  if (outcome.error) flow.metrics.errors += 1;
+  if (outcome.timeout) flow.metrics.timeout = true;
+  boosterFlowTwins.delete(flow.id);
+  boosterStats.finished += 1;
+  if (outcome.error) boosterStats.errors += 1;
+
+  const bytes = Number(flow.metrics.bytesUp || 0) + Number(flow.metrics.bytesDown || 0);
+  const durationSec = Math.max(0.25, Number(flow.metrics.durationMs || 0) / 1000);
+  const throughput = bytes / durationSec;
+  let reward = 20;
+  reward += Math.min(25, throughput / (256 * 1024));
+  reward += Math.max(0, 15 - (Number(flow.metrics.connectMs || 0) / 100));
+  reward -= Number(flow.metrics.errors || 0) * 35;
+  if (flow.metrics.timeout) reward -= 35;
+  reward -= Math.min(25, Number(flow.metrics.bufferPeak || 0) / (2 * 1024 * 1024));
+  reward = Math.max(BOOSTER_V2_CONFIG.minReward, Math.min(BOOSTER_V2_CONFIG.maxReward, reward));
+  flow.reward = Number(reward.toFixed(2));
+
+  const learning = getLearningRecord(flow.targetKey);
+  const st = learning.profiles[flow.profileName] || (learning.profiles[flow.profileName] = { attempts: 0, success: 0, errors: 0, avgReward: 0, avgConnectMs: 0, avgThroughput: 0 });
+  st.attempts += 1;
+  if (outcome.error) st.errors += 1;
+  else st.success += 1;
+  st.avgReward = Number(((Number(st.avgReward || 0) * 0.8) + (reward * 0.2)).toFixed(3));
+  if (flow.metrics.connectMs) st.avgConnectMs = Number(((Number(st.avgConnectMs || 0) * 0.8) + (flow.metrics.connectMs * 0.2)).toFixed(1));
+  st.avgThroughput = Number(((Number(st.avgThroughput || 0) * 0.8) + (throughput * 0.2)).toFixed(1));
+  learning.updatedAt = Date.now();
+
+  const userMem = getUserBoosterMemory(flow.userId);
+  if (outcome.error) userMem.errors += 1;
+  else userMem.errors = Math.max(0, userMem.errors - 0.25);
+  userMem.profileBias[flow.profileName] = Math.max(-20, Math.min(20, Number(userMem.profileBias[flow.profileName] || 0) + (reward > 25 ? 0.4 : -0.5)));
+}
+
+function chooseBoosterProfile(request, transport = 'ws', userId = '') {
+  if (!request) return BOOSTER_PROFILE_BALANCED;
+  const flow = startBoosterFlow(request, transport, userId);
+  try { Object.defineProperty(flow.profile, '_boosterFlow', { value: flow, enumerable: false, configurable: true }); } catch (_) { flow.profile._boosterFlow = flow; }
+  return flow.profile;
 }
 
 function describeBoosterProfile(profile) {
@@ -1593,6 +1799,7 @@ function adaptXhttpDownlinkProfile(session, pressureBytes = 0) {
 
 function createBoostedTcpConnection(host, port, profile = BOOSTER_PROFILE_BALANCED) {
   const p = profile || BOOSTER_PROFILE_BALANCED;
+  const flow = p._boosterFlow || null;
   const mem = getDestinationMemory(host, port, true);
   const attemptTimeout = mem?.connectAvgMs
     ? Math.max(75, Math.min(p.autoSelectFamilyAttemptTimeout || 250, Math.round(mem.connectAvgMs * 0.65)))
@@ -1611,10 +1818,15 @@ function createBoostedTcpConnection(host, port, profile = BOOSTER_PROFILE_BALANC
   let connected = false;
   socket.once('connect', () => {
     connected = true;
-    markBoosterConnectSuccess(host, port, socket.remoteAddress || '', Date.now() - startedAt);
+    const connectMs = Date.now() - startedAt;
+    markBoosterConnectSuccess(host, port, socket.remoteAddress || '', connectMs);
+    recordBoosterFlowMetric(flow, { connectMs });
   });
   socket.once('error', (err) => {
-    if (!connected) markBoosterConnectFailure(host, port, socket.remoteAddress || '', err);
+    if (!connected) {
+      markBoosterConnectFailure(host, port, socket.remoteAddress || '', err);
+      finishBoosterFlow(flow, { error: true });
+    }
   });
   return socket;
 }
@@ -2097,7 +2309,7 @@ class XHttpSession {
 
     this.user = request.user;
     this.version = request.version;
-    this.boosterProfile = chooseBoosterProfile(request, 'xhttp');
+    this.boosterProfile = chooseBoosterProfile(request, 'xhttp', this.user.id);
     const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, 'xhttp', request);
     const candidate = findBestDeviceCandidate(this.user.id, deviceMeta);
     this.clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
@@ -2141,6 +2353,7 @@ class XHttpSession {
         const limit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
         if (shouldDropUdpForLatency(this.boosterProfile, this.udpDownlinkBurstState, buffered, limit)) return;
         updateTraffic(this.user, msg.length, 'downlink', () => this.touchData());
+        recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesDown: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + msg.length });
         try {
           this.sendDownlink(encodeUdpPacket(msg));
         } catch (err) {
@@ -2199,6 +2412,7 @@ class XHttpSession {
       this.remote.on('data', (chunk) => {
         this.touchData();
         updateTraffic(this.user, chunk.length, 'downlink', () => this.touchData());
+        recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesDown: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + chunk.length });
         this.sendDownlink(chunk);
       });
       this.remote.on('drain', () => this.flushRemoteWrites());
@@ -2237,6 +2451,7 @@ class XHttpSession {
     }
 
     updateTraffic(this.user, chunk.length, 'uplink', () => this.touchData());
+    recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesUp: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesUp || 0) + chunk.length });
     if (!this.remote.write(chunk)) {
       // Let Node socket backpressure work; later packets remain queued if needed.
     }
@@ -2247,6 +2462,7 @@ class XHttpSession {
     if (shouldDropUdpForLatency(this.boosterProfile, this.udpBurstState, this.pendingDownlinkBytes || 0, this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER)) return;
     if (this.udpIdleTimer && this.udpIdleTimer.refresh) this.udpIdleTimer.refresh();
     updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
+    recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesUp: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesUp || 0) + packet.length });
     const family = getUdpSocketFamily(this.udpSocket, this.udpTargetHost);
     resolveBoostedAddress(this.udpTargetHost, this.udpTargetPort, this.boosterProfile, family).then((address) => {
       if (this.closed || !this.udpSocket) return;
@@ -2331,6 +2547,7 @@ class XHttpSession {
     this.pendingRemoteWrites = [];
     this.pendingDownlinkChunks = [];
     this.pendingDownlinkBytes = 0;
+    finishBoosterFlow(this.boosterProfile?._boosterFlow, { error: !['remote closed', 'downlink closed', 'closed'].includes(reason), timeout: String(reason || '').includes('timeout') });
     xhttpSessions.delete(this.sessionId);
     if (reason && reason !== 'remote closed' && reason !== 'downlink closed') {
       log('[XHTTP] Session closed:', `${this.sessionId} ${reason}`);
@@ -3033,6 +3250,68 @@ app.get('/api/debug/active', requireAuth, (req, res) => {
   });
 });
 
+app.get('/api/debug/booster', requireAuth, (req, res) => {
+  const now = Date.now();
+  const activeFlows = Array.from(boosterFlowTwins.values()).map((flow) => ({
+    id: flow.id,
+    ageMs: now - Number(flow.metrics?.startedAt || now),
+    userId: flow.userId,
+    targetKey: flow.targetKey,
+    transport: flow.features?.transport,
+    host: flow.features?.host,
+    port: flow.features?.port,
+    category: flow.features?.category,
+    intent: flow.intent,
+    mood: flow.mood,
+    profile: flow.profileName,
+    confidence: flow.confidence,
+    reason: flow.reason,
+    metrics: flow.metrics,
+    reward: flow.reward || null
+  }));
+  const recentFlows = boosterRecentFlows.slice(0, BOOSTER_V2_CONFIG.debugFlowMax).map((flow) => ({
+    id: flow.id,
+    status: flow.status,
+    ageMs: now - Number(flow.metrics?.startedAt || now),
+    durationMs: flow.metrics?.durationMs || null,
+    userId: flow.userId,
+    targetKey: flow.targetKey,
+    intent: flow.intent,
+    mood: flow.mood,
+    profile: flow.profileName,
+    confidence: flow.confidence,
+    reason: flow.reason,
+    metrics: flow.metrics,
+    reward: flow.reward || null
+  }));
+  const memory = Array.from(boosterLearningMemory.values()).slice(0, 200).map((rec) => ({
+    targetKey: rec.targetKey,
+    updatedAgoMs: now - Number(rec.updatedAt || now),
+    profiles: rec.profiles
+  }));
+  const users = Array.from(boosterUserMemory.values()).map((mem) => ({
+    userId: mem.userId,
+    updatedAgoMs: now - Number(mem.updatedAt || now),
+    mood: mem.mood,
+    errors: mem.errors,
+    reconnects: mem.reconnects,
+    profileBias: mem.profileBias
+  }));
+  res.json({
+    now,
+    name: 'Mahan Smart Booster v2 - FlowSense AutoPilot',
+    always_on: true,
+    config: BOOSTER_V2_CONFIG,
+    stats: boosterStats,
+    activeFlows,
+    recentFlows,
+    memorySize: boosterLearningMemory.size,
+    userMemorySize: boosterUserMemory.size,
+    memory,
+    users
+  });
+});
+
 app.get('/api/events', requireAuth, (req, res) => {
   setupSse(req, res);
   adminEventClients.add(res);
@@ -3482,6 +3761,7 @@ wss.on('connection', (ws, req) => {
     if (closed) return;
     debugActive('ws-closeAll', { code, reason, endpointKey: unregisterConnection?.clientKey || '', userId: user?.id || '' });
     closed = true;
+    finishBoosterFlow(boosterProfile?._boosterFlow, { error: !['websocket closed', 'remote closed', 'closed'].includes(reason), timeout: String(reason || '').includes('timeout') });
     clearTimeout(idleTimer);
     clearTimeout(connectTimer);
     clearTimeout(wsPingTimer);
@@ -3528,6 +3808,8 @@ wss.on('connection', (ws, req) => {
     while (pendingClientChunks.length) {
       const chunk = pendingClientChunks.shift();
       updateTraffic(user, chunk.length, 'uplink', () => unregisterConnection?.touchData?.());
+    recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesUp: Number(boosterProfile?._boosterFlow?.metrics?.bytesUp || 0) + chunk.length });
+      recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesUp: Number(boosterProfile?._boosterFlow?.metrics?.bytesUp || 0) + chunk.length });
       if (!remote.write(chunk)) break;
     }
   }
@@ -3537,6 +3819,7 @@ wss.on('connection', (ws, req) => {
     if (shouldDropUdpForLatency(boosterProfile, udpBurstState, ws.bufferedAmount, boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT)) return;
     if (udpIdleTimer && udpIdleTimer.refresh) udpIdleTimer.refresh();
     updateTraffic(user, packet.length, 'uplink', () => unregisterConnection?.touchData?.());
+    recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesUp: Number(boosterProfile?._boosterFlow?.metrics?.bytesUp || 0) + packet.length });
     const family = getUdpSocketFamily(udpSocket, udpTargetHost);
     resolveBoostedAddress(udpTargetHost, udpTargetPort, boosterProfile, family).then((address) => {
       if (closed || !udpSocket) return;
@@ -3570,7 +3853,7 @@ wss.on('connection', (ws, req) => {
       }
 
       user = request.user;
-      boosterProfile = chooseBoosterProfile(request, 'ws');
+      boosterProfile = chooseBoosterProfile(request, 'ws', user.id);
       resetIdleTimer();
       resetConnectTimer();
       scheduleWsPing();
@@ -3622,6 +3905,7 @@ wss.on('connection', (ws, req) => {
         udpSocket.on('message', (msg) => {
           refreshIdleTimer();
           updateTraffic(user, msg.length, 'downlink', () => unregisterConnection?.touchData?.());
+          recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesDown: Number(boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + msg.length });
           try {
             sendToWs(encodeUdpPacket(msg), { udp: true });
           } catch (err) {
@@ -3659,6 +3943,7 @@ wss.on('connection', (ws, req) => {
         sendVlessResponseHeader(request.version);
         if (request.payload.length) {
           updateTraffic(user, request.payload.length, 'uplink', () => unregisterConnection?.touchData?.());
+          recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesUp: Number(boosterProfile?._boosterFlow?.metrics?.bytesUp || 0) + request.payload.length });
           if (!remote.write(request.payload)) {
             try { req.socket.pause(); } catch (_) {}
           }
@@ -3674,6 +3959,7 @@ wss.on('connection', (ws, req) => {
       remote.on('data', (remoteChunk) => {
         refreshIdleTimer();
         updateTraffic(user, remoteChunk.length, 'downlink', () => unregisterConnection?.touchData?.());
+        recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesDown: Number(boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + remoteChunk.length });
         sendToWs(remoteChunk);
       });
 
