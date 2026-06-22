@@ -758,7 +758,7 @@ function findBestDeviceCandidate(userId, meta) {
     if (!best || score > best.score) best = { device, score };
   }
   if (!best) return null;
-  const threshold = best.device.state === 'draining' ? 58 : 72;
+  const threshold = best.device.state === 'draining' ? 48 : 55;
   return best.score >= threshold ? best : null;
 }
 
@@ -824,10 +824,9 @@ function attachDeviceConnection(userId, connectionId, meta = {}, preferredDevice
   const map = getDeviceMap(userId, true);
   const stableKey = preferredDeviceId || meta?.endpointKey || '';
   let device = stableKey ? map.get(stableKey) : null;
-  if (!device && stableKey && meta?.endpointKey) {
-    device = createDeviceState(userId, meta);
-    map.set(device.id, device);
-  }
+  // Check for a matching existing device before creating a new one.
+  // This prevents CGNAT / multi-homed clients that appear from different
+  // IP ranges from being counted as separate devices.
   if (!device) device = findBestDeviceCandidate(userId, meta)?.device || null;
   if (!device) {
     device = createDeviceState(userId, meta);
