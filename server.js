@@ -62,6 +62,7 @@ const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIV
 // Mahan Active Client Tracker v3: fast traffic/heartbeat based online counter.
 // Keep this >= 2x XHTTP hKeepAlivePeriod so XHTTP keepalive does not flicker.
 const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 5000));
+const ACTIVE_CLIENT_STABILIZE_MS = Math.max(0, Number(process.env.ACTIVE_CLIENT_STABILIZE_MS || 800));
 const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
 // Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
 const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
@@ -528,10 +529,13 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
   const port = Number(target.port || 0);
   const category = detectDestinationCategory({ command, host, port });
   const role = String(target.role || 'active');
-  // Active Client identity is intentionally IP-only (Xray-like Online IP model).
-  // User-Agent/device heuristics caused one WebSocket client to be counted as multiple
-  // clients when headers varied across streams. IP-only is stable and matches most panels.
-  const identityBase = `ip|${normalizedIp}`;
+  // Mahan Active Client Cohort Engine:
+  // Use IP prefix cohorts (IPv4 /24, IPv6 /64) instead of exact IP/UA/connection count.
+  // During traffic peaks, clients may open many streams and PaaS/proxy headers or IPv6
+  // privacy addresses can vary; cohorting collapses that noise into one online client.
+  const identityBase = ipGroup && ipGroup !== 'unknown'
+    ? `cohort|${ipGroup}`
+    : `ip|${normalizedIp}`;
   return {
     ip: normalizedIp,
     ipGroup,
@@ -574,6 +578,7 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
   const existing = map.get(endpointKey) || {
     firstActivity: now,
     lastActivity: 0,
+    activityCount: 0,
     ip: meta.ip || 'unknown',
     ipGroup: meta.ipGroup || 'unknown',
     uaFamily: meta.uaFamily || 'unknown',
@@ -585,6 +590,7 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
     existing.closeTimer = null;
   }
   existing.lastActivity = now;
+  existing.activityCount = Number(existing.activityCount || 0) + 1;
   if (meta.ip) existing.ip = meta.ip;
   if (meta.ipGroup) existing.ipGroup = meta.ipGroup;
   if (meta.uaFamily) existing.uaFamily = meta.uaFamily;
@@ -631,7 +637,16 @@ function pruneActiveClientActivity(userId) {
 
 function getActiveClientActivityCount(userId) {
   pruneActiveClientActivity(userId);
-  return getActivityMap(userId, false)?.size || 0;
+  const map = getActivityMap(userId, false);
+  if (!map) return 0;
+  const now = Date.now();
+  let count = 0;
+  for (const item of map.values()) {
+    const fresh = now - Number(item.lastActivity || 0) <= ACTIVE_CLIENT_TTL_MS;
+    const stable = Number(item.activityCount || 0) >= 2 || now - Number(item.firstActivity || 0) >= ACTIVE_CLIENT_STABILIZE_MS;
+    if (fresh && stable) count += 1;
+  }
+  return count;
 }
 
 function scoreDeviceCandidate(device, meta, now = Date.now()) {
@@ -1639,8 +1654,11 @@ function buildXhttpVlessLink(req, user) {
   const xhttpExtra = encodeURIComponent(JSON.stringify({
     xmux: {
       hKeepAlivePeriod: 2,
-      maxConcurrency: '4-8',
-      cMaxReuseTimes: '100-200'
+      // Conservative XMUX: reduce request/stream explosion during traffic peaks.
+      maxConcurrency: '2-4',
+      cMaxReuseTimes: '60-120',
+      hMaxRequestTimes: '300-500',
+      hMaxReusableSecs: '900-1800'
     }
   }));
   let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=packet-up&extra=${xhttpExtra}`;
