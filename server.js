@@ -311,6 +311,15 @@ function normalizeUser(u) {
     last_seen: Number(u.last_seen || 0),
     is_active: Number(u.is_active === 0 ? 0 : 1),
     protocol: 'ws+xhttp',
+    device_tokens: Array.isArray(u.device_tokens) ? u.device_tokens.map((d) => ({
+      token: String(d.token || ''),
+      fingerprint: String(d.fingerprint || ''),
+      ip_group: String(d.ip_group || ''),
+      ua_family: String(d.ua_family || ''),
+      created_at: Number(d.created_at || Date.now()),
+      last_seen: Number(d.last_seen || 0),
+      label: String(d.label || 'Device')
+    })).filter((d) => d.token) : [],
     created_on: String(u.created_on || 'other'),
     created_at: String(u.created_at || new Date().toISOString())
   };
@@ -559,9 +568,10 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
   // Use IP prefix cohorts (IPv4 /24, IPv6 /64) instead of exact IP/UA/connection count.
   // During traffic peaks, clients may open many streams and PaaS/proxy headers or IPv6
   // privacy addresses can vary; cohorting collapses that noise into one online client.
-  const identityBase = ipGroup && ipGroup !== 'unknown'
-    ? `cohort|${ipGroup}`
-    : `ip|${normalizedIp}`;
+  const deviceToken = String(target.deviceToken || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  const identityBase = deviceToken
+    ? `token|${deviceToken}`
+    : (ipGroup && ipGroup !== 'unknown' ? `cohort|${ipGroup}` : `ip|${normalizedIp}`);
   return {
     ip: normalizedIp,
     ipGroup,
@@ -574,7 +584,9 @@ function getConnectionDeviceMeta(req, ip, transport = 'unknown', target = {}) {
     port,
     category,
     role,
-    endpointKey: `ep_${shortHash(identityBase, 18)}`,
+    deviceToken,
+    tokenFingerprint: shortHash(`${ipGroup}|${uaHash}|${uaFamily}`, 18),
+    endpointKey: deviceToken ? `dt_${shortHash(deviceToken, 18)}` : `ep_${shortHash(identityBase, 18)}`,
     createdAt: Date.now()
   };
 }
@@ -595,6 +607,75 @@ function getActivityMap(userId, create = true) {
     activeClientActivity.set(userId, map);
   }
   return map || null;
+}
+
+function getSubscriptionFingerprint(req) {
+  const ip = getClientIp(req);
+  const ipGroup = getIpGroup(ip);
+  const ua = normalizeUserAgent(req?.headers?.['user-agent'] || req?.headers?.['sec-ch-ua'] || '');
+  const uaFamily = getUserAgentFamily(ua);
+  const uaHash = shortHash(ua || uaFamily || 'unknown', 12);
+  return { ip, ipGroup, uaFamily, uaHash, fingerprint: shortHash(`${ipGroup}|${uaHash}|${uaFamily}`, 18) };
+}
+
+function getOrCreateDeviceToken(req, user) {
+  if (!user) return '';
+  if (!Array.isArray(user.device_tokens)) user.device_tokens = [];
+  const fp = getSubscriptionFingerprint(req);
+  const existing = user.device_tokens.find((d) => d.fingerprint === fp.fingerprint);
+  if (existing) {
+    existing.last_seen = Date.now();
+    existing.ip_group = fp.ipGroup;
+    existing.ua_family = fp.uaFamily;
+    scheduleSaveDB(false);
+    return existing.token;
+  }
+
+  const token = crypto.randomBytes(12).toString('base64url');
+  user.device_tokens.push({
+    token,
+    fingerprint: fp.fingerprint,
+    ip_group: fp.ipGroup,
+    ua_family: fp.uaFamily,
+    created_at: Date.now(),
+    last_seen: Date.now(),
+    label: `Device ${user.device_tokens.length + 1}`
+  });
+
+  // Keep token list bounded; active enforcement is by current connections, not old tokens.
+  if (user.device_tokens.length > 32) {
+    user.device_tokens.sort((a, b) => Number(b.last_seen || b.created_at || 0) - Number(a.last_seen || a.created_at || 0));
+    user.device_tokens = user.device_tokens.slice(0, 32);
+  }
+  scheduleSaveDB(false);
+  return token;
+}
+
+function isDeviceTokenAllowed(user, token, meta) {
+  const clean = String(token || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  if (!clean) return true; // legacy links without token keep working via cohort fallback.
+  if (!user || !Array.isArray(user.device_tokens)) return false;
+  const rec = user.device_tokens.find((d) => d.token === clean);
+  if (!rec) return false;
+
+  const currentFp = String(meta?.tokenFingerprint || '');
+  const tokenKey = `dt_${shortHash(clean, 18)}`;
+  const limit = Number(user.connection_limit || user.ip_limit || 0);
+
+  if (rec.fingerprint && currentFp && rec.fingerprint !== currentFp) {
+    // If a final tokenized config is shared while the original token is active,
+    // reject for single-device users. If inactive, allow re-bind for mobility.
+    if (limit <= 1 && hasConnectedEndpoint(user.id, tokenKey)) return false;
+    if (!hasConnectedEndpoint(user.id, tokenKey)) {
+      rec.fingerprint = currentFp;
+      rec.ip_group = meta.ipGroup || rec.ip_group || '';
+      rec.ua_family = meta.uaFamily || rec.ua_family || '';
+    }
+  }
+
+  rec.last_seen = Date.now();
+  scheduleSaveDB(false);
+  return true;
 }
 
 function touchActiveClient(userId, endpointKey, meta = {}) {
@@ -1828,16 +1909,17 @@ function getPublicEndpoint(req) {
   return { host, port, security, isTls };
 }
 
-function buildWsVlessLink(req, user) {
+function buildWsVlessLink(req, user, deviceToken = '') {
   const { host, port, security, isTls } = getPublicEndpoint(req);
   const tag = encodeURIComponent((user.remark || 'Mahan') + '-WS');
-  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=ws&host=${encodeURIComponent(host)}&path=%2Fws`;
+  const wsPath = deviceToken ? `/ws/t/${encodeURIComponent(deviceToken)}` : '/ws';
+  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=ws&host=${encodeURIComponent(host)}&path=${encodeURIComponent(wsPath)}`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}`;
   link += `#${tag}`;
   return link;
 }
 
-function buildXhttpVlessLink(req, user) {
+function buildXhttpVlessLink(req, user, deviceToken = '') {
   const { host, port, security, isTls } = getPublicEndpoint(req);
   const tag = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
   // XHTTP keepalive should be expressed via XHTTP/XMUX extra, not aggressive quicParams.
@@ -1853,7 +1935,8 @@ function buildXhttpVlessLink(req, user) {
       hMaxReusableSecs: '900-1800'
     }
   }));
-  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=packet-up&extra=${xhttpExtra}`;
+  const xhttpPath = deviceToken ? `/xhttp/t/${encodeURIComponent(deviceToken)}` : '/xhttp';
+  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=${encodeURIComponent(xhttpPath)}&mode=packet-up&extra=${xhttpExtra}`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}&alpn=h2%2Chttp%2F1.1&fp=chrome`;
   link += `#${tag}`;
   return link;
@@ -1864,7 +1947,8 @@ function buildVlessLink(req, user) {
 }
 
 function buildSubscriptionLinks(req, user) {
-  return [buildWsVlessLink(req, user), buildXhttpVlessLink(req, user)];
+  const deviceToken = getOrCreateDeviceToken(req, user);
+  return [buildWsVlessLink(req, user, deviceToken), buildXhttpVlessLink(req, user, deviceToken)];
 }
 
 function getPublicBaseUrl(req) {
@@ -1945,6 +2029,7 @@ class XHttpSession {
     this.clientIp = 'unknown';
     this.clientKey = '';
     this.userAgent = '';
+    this.deviceToken = '';
     this.version = 0;
     this.boosterProfile = BOOSTER_PROFILE_BALANCED;
     this.downlinkRes = null;
@@ -2098,7 +2183,11 @@ class XHttpSession {
     this.user = request.user;
     this.version = request.version;
     this.boosterProfile = chooseBoosterProfile(request, 'xhttp');
-    const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, 'xhttp', request);
+    const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, 'xhttp', { ...request, deviceToken: this.deviceToken });
+    if (!isDeviceTokenAllowed(this.user, this.deviceToken, deviceMeta)) {
+      this.close('device token rejected');
+      throw new Error('device token rejected');
+    }
     const candidate = findBestDeviceCandidate(this.user.id, deviceMeta);
     this.clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
     if (!canAcceptUserSession(this.user, this.clientKey)) {
@@ -2747,7 +2836,11 @@ app.options(`${XHTTP_PATH}/*`, (req, res) => {
   res.end();
 });
 
-app.get([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
+function cleanDeviceToken(value) {
+  return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+}
+
+app.get([`${XHTTP_PATH}/t/:deviceToken/:sessionId`, `${XHTTP_PATH}/t/:deviceToken/:sessionId/`, `${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
   const sessionId = String(req.params.sessionId || '').trim();
   if (sessionId.length < 1 || sessionId.length > 256) {
     res.writeHead(400, XHTTP_RESPONSE_HEADERS);
@@ -2755,11 +2848,12 @@ app.get([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =>
     return;
   }
   const session = getXHttpSession(sessionId);
+  session.deviceToken = cleanDeviceToken(req.params.deviceToken || session.deviceToken || '');
   session.attachDownlink(req, res);
 });
 
 // XHTTP stream-up upload channel: one long-lived POST carrying ordered VLESS bytes.
-app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
+app.post([`${XHTTP_PATH}/t/:deviceToken/:sessionId`, `${XHTTP_PATH}/t/:deviceToken/:sessionId/`, `${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
   const sessionId = String(req.params.sessionId || '').trim();
   if (sessionId.length < 1 || sessionId.length > 256) {
     res.writeHead(400, XHTTP_RESPONSE_HEADERS);
@@ -2768,6 +2862,7 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
   }
 
   const session = getXHttpSession(sessionId);
+  session.deviceToken = cleanDeviceToken(req.params.deviceToken || session.deviceToken || '');
   if (!session.clientIp || session.clientIp === 'unknown') {
     session.clientIp = getClientIp(req);
     session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
@@ -2806,7 +2901,7 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
   });
 });
 
-app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], async (req, res) => {
+app.post([`${XHTTP_PATH}/t/:deviceToken/:sessionId/:seq`, `${XHTTP_PATH}/t/:deviceToken/:sessionId/:seq/`, `${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], async (req, res) => {
   const sessionId = String(req.params.sessionId || '').trim();
   const seq = Number(req.params.seq);
   if (sessionId.length < 1 || sessionId.length > 256 || !Number.isSafeInteger(seq) || seq < 0) {
@@ -2818,6 +2913,7 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
   try {
     const body = await readRequestBody(req, MAX_XHTTP_POST_SIZE);
     const session = getXHttpSession(sessionId);
+    session.deviceToken = cleanDeviceToken(req.params.deviceToken || session.deviceToken || '');
     if (!session.clientIp || session.clientIp === 'unknown') {
       session.clientIp = getClientIp(req);
       session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
@@ -3390,7 +3486,8 @@ const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxP
 server.on('upgrade', (req, socket, head) => {
   let url;
   try { url = new URL(req.url || '/', 'http://127.0.0.1'); } catch (_) { socket.destroy(); return; }
-  if (url.pathname !== WS_PATH) {
+  const isWsPath = url.pathname === WS_PATH || url.pathname.startsWith(`${WS_PATH}/t/`);
+  if (!isWsPath) {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
@@ -3424,6 +3521,12 @@ wss.on('connection', (ws, req) => {
   let lastPingAt = 0;
   let wsDashboardMarkedOffline = false;
   let boosterProfile = BOOSTER_PROFILE_BALANCED;
+  let wsDeviceToken = '';
+  try {
+    const parsedWsUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    const m = parsedWsUrl.pathname.match(/^\/ws\/t\/([a-zA-Z0-9_-]{1,64})$/);
+    wsDeviceToken = cleanDeviceToken(m ? m[1] : '');
+  } catch (_) {}
 
   let wsPingTimer = null;
   function markWsDashboardOffline() {
@@ -3575,7 +3678,12 @@ wss.on('connection', (ws, req) => {
       resetConnectTimer();
       scheduleWsPing();
       const clientIp = getClientIp(req);
-      const deviceMeta = getConnectionDeviceMeta(req, clientIp, 'ws', request);
+      const deviceMeta = getConnectionDeviceMeta(req, clientIp, 'ws', { ...request, deviceToken: wsDeviceToken });
+      if (!isDeviceTokenAllowed(user, wsDeviceToken, deviceMeta)) {
+        log('[TOKEN] Device token rejected:', `${user.remark} ip=${clientIp}`);
+        closeAll(1008, 'device token rejected');
+        return;
+      }
       const candidate = findBestDeviceCandidate(user.id, deviceMeta);
       const clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
       if (!canAcceptUserSession(user, clientKey)) {
