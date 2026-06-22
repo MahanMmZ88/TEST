@@ -63,6 +63,7 @@ const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIV
 // Keep this >= 2x XHTTP hKeepAlivePeriod so XHTTP keepalive does not flicker.
 const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 5000));
 const ACTIVE_CLIENT_STABILIZE_MS = Math.max(0, Number(process.env.ACTIVE_CLIENT_STABILIZE_MS || 800));
+const ACTIVE_CLIENT_SPLIT_STABLE_MS = Math.max(2000, Number(process.env.ACTIVE_CLIENT_SPLIT_STABLE_MS || 8000));
 const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
 // Cohort tuning: /23 fixes mobile/PaaS IP pool flips like 31.171.100.x <-> 31.171.101.x.
 const ACTIVE_CLIENT_IPV4_PREFIX = Math.max(16, Math.min(32, Number(process.env.ACTIVE_CLIENT_IPV4_PREFIX || 23)));
@@ -604,6 +605,7 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
     ipGroup: meta.ipGroup || 'unknown',
     uaFamily: meta.uaFamily || 'unknown',
     transports: new Set(),
+    exactEndpoints: new Map(),
     closeTimer: null
   };
   if (existing.closeTimer) {
@@ -612,6 +614,21 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
   }
   existing.lastActivity = now;
   existing.activityCount = Number(existing.activityCount || 0) + 1;
+  if (!existing.exactEndpoints) existing.exactEndpoints = new Map();
+  const exactKey = meta.ip ? `ip:${meta.ip}` : 'ip:unknown';
+  const exact = existing.exactEndpoints.get(exactKey) || {
+    ip: meta.ip || 'unknown',
+    firstActivity: now,
+    lastActivity: 0,
+    activityCount: 0,
+    uaFamily: meta.uaFamily || 'unknown',
+    transports: new Set()
+  };
+  exact.lastActivity = now;
+  exact.activityCount = Number(exact.activityCount || 0) + 1;
+  if (meta.uaFamily) exact.uaFamily = meta.uaFamily;
+  if (meta.transport) exact.transports.add(meta.transport);
+  existing.exactEndpoints.set(exactKey, exact);
   if (meta.ip) existing.ip = meta.ip;
   if (meta.ipGroup) existing.ipGroup = meta.ipGroup;
   if (meta.uaFamily) existing.uaFamily = meta.uaFamily;
@@ -675,10 +692,28 @@ function getActiveClientActivityCount(userId) {
   if (!map) return 0;
   const now = Date.now();
   let count = 0;
+
   for (const item of map.values()) {
     const fresh = now - Number(item.lastActivity || 0) <= ACTIVE_CLIENT_TTL_MS;
-    const stable = Number(item.activityCount || 0) >= 2 || now - Number(item.firstActivity || 0) >= ACTIVE_CLIENT_STABILIZE_MS;
-    if (fresh && stable) count += 1;
+    const stableCohort = Number(item.activityCount || 0) >= 2 || now - Number(item.firstActivity || 0) >= ACTIVE_CLIENT_STABILIZE_MS;
+    if (!fresh || !stableCohort) continue;
+
+    const exactItems = Array.from((item.exactEndpoints || new Map()).values())
+      .filter((exact) => now - Number(exact.lastActivity || 0) <= ACTIVE_CLIENT_TTL_MS);
+
+    if (exactItems.length <= 1) {
+      count += 1;
+      continue;
+    }
+
+    // Adaptive Split: /23 absorbs short IP-pool bursts from one device, but if two
+    // exact IPs stay independently active long enough, count them as separate devices.
+    const stableExact = exactItems.filter((exact) => {
+      const age = now - Number(exact.firstActivity || now);
+      return age >= ACTIVE_CLIENT_SPLIT_STABLE_MS && Number(exact.activityCount || 0) >= 2;
+    });
+
+    count += stableExact.length >= 2 ? stableExact.length : 1;
   }
   return count;
 }
@@ -1050,7 +1085,6 @@ function registerConnection(userId, closeFn, meta = {}) {
       item.lastSeen = now;
       item.lastPongAt = now;
       item.wsDashboardOffline = false;
-      touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
     }
   };
   unregister.markWsDashboardOffline = () => {
@@ -2855,7 +2889,16 @@ app.get('/api/debug/active', requireAuth, (req, res) => {
         firstActivityAgoMs: now - Number(item.firstActivity || now),
         lastActivityAgoMs: now - Number(item.lastActivity || now),
         activityCount: Number(item.activityCount || 0),
-        hasCloseTimer: Boolean(item.closeTimer)
+        hasCloseTimer: Boolean(item.closeTimer),
+        exactEndpoints: Array.from((item.exactEndpoints || new Map()).values()).map((exact) => ({
+          ip: exact.ip,
+          uaFamily: exact.uaFamily,
+          transports: Array.from(exact.transports || []),
+          firstActivityAgoMs: now - Number(exact.firstActivity || now),
+          lastActivityAgoMs: now - Number(exact.lastActivity || now),
+          activityCount: Number(exact.activityCount || 0),
+          stableForSplit: (now - Number(exact.firstActivity || now) >= ACTIVE_CLIENT_SPLIT_STABLE_MS) && Number(exact.activityCount || 0) >= 2
+        }))
       })),
       connections: Array.from(connMap.values()).map((conn) => ({
         id: conn.id,
@@ -2888,6 +2931,7 @@ app.get('/api/debug/active', requireAuth, (req, res) => {
     settings: {
       ACTIVE_CLIENT_TTL_MS,
       ACTIVE_CLIENT_STABILIZE_MS,
+      ACTIVE_CLIENT_SPLIT_STABLE_MS,
       WS_PING_INTERVAL_MS,
       WS_DASHBOARD_OFFLINE_MS,
       WS_TERMINATE_MS
