@@ -68,6 +68,7 @@ const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLI
 const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
 const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 4000));
 const WS_TERMINATE_MS = Math.max(3000, Number(process.env.WS_TERMINATE_MS || 8000));
+const DEBUG_ACTIVE_CLIENTS = process.env.DEBUG_ACTIVE_CLIENTS === '1';
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
 // It does not change user configs; each connection is tuned after the VLESS target is parsed.
@@ -183,6 +184,16 @@ app.use(express.static(path.join(__dirname, 'public')));
 function log(message, extra = '') {
   const suffix = extra ? ` ${extra}` : '';
   console.log(`[${new Date().toISOString()}] ${message}${suffix}`);
+}
+
+function debugActive(message, data = null) {
+  if (!DEBUG_ACTIVE_CLIENTS) return;
+  try {
+    const payload = data ? ` ${JSON.stringify(data)}` : '';
+    log(`[ACTIVE-DEBUG] ${message}`, payload);
+  } catch (_) {
+    log(`[ACTIVE-DEBUG] ${message}`);
+  }
 }
 
 function generateHash(password) {
@@ -596,10 +607,21 @@ function touchActiveClient(userId, endpointKey, meta = {}) {
   if (meta.uaFamily) existing.uaFamily = meta.uaFamily;
   if (meta.transport) existing.transports.add(meta.transport);
   map.set(endpointKey, existing);
+  debugActive('touch', {
+    userId,
+    endpointKey,
+    ip: existing.ip,
+    ipGroup: existing.ipGroup,
+    uaFamily: existing.uaFamily,
+    transport: meta.transport || '',
+    activityCount: existing.activityCount,
+    activeCount: getActivityMap(userId, false)?.size || 0
+  });
 }
 
 function scheduleActiveClientOffline(userId, endpointKey, delayMs = ACTIVE_CLIENT_CLOSE_GRACE_MS, force = false) {
   if (!userId || !endpointKey) return;
+  debugActive('schedule-offline', { userId, endpointKey, delayMs, force });
   const map = getActivityMap(userId, false);
   const item = map?.get(endpointKey);
   if (!item) return;
@@ -613,6 +635,7 @@ function scheduleActiveClientOffline(userId, endpointKey, delayMs = ACTIVE_CLIEN
     const current = currentMap?.get(endpointKey);
     if (!current) return;
     currentMap.delete(endpointKey);
+    debugActive('offline', { userId, endpointKey, force });
     if (currentMap.size === 0) activeClientActivity.delete(userId);
     scheduleRealtimeBroadcast();
   }, delayMs);
@@ -627,6 +650,7 @@ function pruneActiveClientActivity(userId) {
     if (now - Number(item.lastActivity || 0) > ACTIVE_CLIENT_TTL_MS) {
       if (item.closeTimer) clearTimeout(item.closeTimer);
       map.delete(key);
+      debugActive('prune-ttl', { userId, endpointKey: key, age: now - Number(item.lastActivity || 0) });
       removed += 1;
     }
   }
@@ -948,7 +972,9 @@ function registerConnection(userId, closeFn, meta = {}) {
     closeFn,
     createdAt: Date.now(),
     lastSeen: Date.now(),
-    lastDataAt: 0
+    lastDataAt: 0,
+    lastPongAt: Date.now(),
+    wsDashboardOffline: false
   };
   map.set(id, conn);
   scheduleRealtimeBroadcast();
@@ -984,6 +1010,22 @@ function registerConnection(userId, closeFn, meta = {}) {
       refreshClientSlot(userId, item.clientKey, true);
       touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
     }
+  };
+  unregister.markPong = () => {
+    const current = activeConnections.get(userId);
+    const item = current?.get(id);
+    if (item) {
+      const now = Date.now();
+      item.lastSeen = now;
+      item.lastPongAt = now;
+      item.wsDashboardOffline = false;
+      touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
+    }
+  };
+  unregister.markWsDashboardOffline = () => {
+    const current = activeConnections.get(userId);
+    const item = current?.get(id);
+    if (item) item.wsDashboardOffline = true;
   };
   unregister.id = id;
   unregister.clientKey = conn.clientKey;
@@ -1833,6 +1875,10 @@ class XHttpSession {
     if (this.pendingPackets.size > MAX_XHTTP_BUFFERED_POSTS) throw new Error('too many buffered posts');
 
     this.refresh();
+    // XHTTP packet-up request from the client is real client-side activity even
+    // when the body is tiny/empty keepalive-like traffic.
+    this.touchData();
+    debugActive('xhttp-packet', { sid: this.sessionId, seq, bytes: data?.length || 0, endpointKey: this.unregisterConnection?.clientKey || this.clientKey || '' });
     this.pendingPackets.set(seq, Buffer.isBuffer(data) ? data : Buffer.from(data));
     await this.drainPackets();
   }
@@ -1860,6 +1906,8 @@ class XHttpSession {
   async _processStreamChunk(chunk) {
     if (this.closed || !chunk || chunk.length === 0) return;
     this.refresh();
+    this.touchData();
+    debugActive('xhttp-stream-chunk', { sid: this.sessionId, bytes: chunk.length, endpointKey: this.unregisterConnection?.clientKey || this.clientKey || '' });
 
     if (this.established || this.remote || this.udpMode || this.muxMode) {
       this.writeToRemote(chunk);
@@ -2753,6 +2801,70 @@ app.get('/api/users', requireAuth, (req, res) => {
   res.json({ users: buildUsersSnapshot() });
 });
 
+app.get('/api/debug/active', requireAuth, (req, res) => {
+  const now = Date.now();
+  const users = DB.users.map((user) => {
+    pruneActiveClientActivity(user.id);
+    pruneStaleConnections(user.id, ACTIVE_CONNECTION_STALE_MS);
+    const activityMap = getActivityMap(user.id, false) || new Map();
+    const connMap = activeConnections.get(user.id) || new Map();
+    const deviceMap = getDeviceMap(user.id, false) || new Map();
+    return {
+      id: user.id,
+      remark: user.remark,
+      active_clients: getActiveClientActivityCount(user.id),
+      connected_endpoints: getConnectedEndpointCount(user.id),
+      raw_connections: connMap.size,
+      activity: Array.from(activityMap.entries()).map(([key, item]) => ({
+        key,
+        ip: item.ip,
+        ipGroup: item.ipGroup,
+        uaFamily: item.uaFamily,
+        transports: Array.from(item.transports || []),
+        firstActivityAgoMs: now - Number(item.firstActivity || now),
+        lastActivityAgoMs: now - Number(item.lastActivity || now),
+        activityCount: Number(item.activityCount || 0),
+        hasCloseTimer: Boolean(item.closeTimer)
+      })),
+      connections: Array.from(connMap.values()).map((conn) => ({
+        id: conn.id,
+        kind: conn.kind,
+        ip: conn.ip,
+        clientKey: conn.clientKey,
+        createdAgoMs: now - Number(conn.createdAt || now),
+        lastSeenAgoMs: now - Number(conn.lastSeen || now),
+        lastDataAgoMs: conn.lastDataAt ? now - Number(conn.lastDataAt) : null,
+        lastPongAgoMs: conn.lastPongAt ? now - Number(conn.lastPongAt) : null,
+        wsDashboardOffline: Boolean(conn.wsDashboardOffline)
+      })),
+      devices: Array.from(deviceMap.values()).map((device) => ({
+        id: device.id,
+        state: device.state,
+        connections: device.connections?.size || 0,
+        anchors: device.anchorConnections?.size || 0,
+        passives: device.passiveConnections?.size || 0,
+        lastSeenAgoMs: now - Number(device.lastSeen || now),
+        lastTrafficAgoMs: device.lastTrafficAt ? now - Number(device.lastTrafficAt) : null,
+        ipSet: Array.from(device.ipSet || []),
+        ipGroupSet: Array.from(device.ipGroupSet || []),
+        uaFamily: device.uaFamily
+      }))
+    };
+  });
+  res.json({
+    now,
+    debug_enabled: DEBUG_ACTIVE_CLIENTS,
+    settings: {
+      ACTIVE_CLIENT_TTL_MS,
+      ACTIVE_CLIENT_STABILIZE_MS,
+      WS_PING_INTERVAL_MS,
+      WS_DASHBOARD_OFFLINE_MS,
+      WS_TERMINATE_MS
+    },
+    users
+  });
+});
+
 app.get('/api/events', requireAuth, (req, res) => {
   setupSse(req, res);
   adminEventClients.add(res);
@@ -3149,6 +3261,8 @@ wss.on('connection', (ws, req) => {
   function markWsDashboardOffline() {
     if (wsDashboardMarkedOffline || !user || !unregisterConnection?.clientKey) return;
     wsDashboardMarkedOffline = true;
+    unregisterConnection?.markWsDashboardOffline?.();
+    debugActive('ws-dashboard-offline', { userId: user.id, endpointKey: unregisterConnection.clientKey, silentFor: Date.now() - lastPongAt });
     scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
   }
 
@@ -3198,6 +3312,7 @@ wss.on('connection', (ws, req) => {
 
   function closeAll(code = 1000, reason = '') {
     if (closed) return;
+    debugActive('ws-closeAll', { code, reason, endpointKey: unregisterConnection?.clientKey || '', userId: user?.id || '' });
     closed = true;
     clearTimeout(idleTimer);
     clearTimeout(connectTimer);
@@ -3444,7 +3559,9 @@ wss.on('connection', (ws, req) => {
     wsAlive = true;
     lastPongAt = Date.now();
     wsDashboardMarkedOffline = false;
-    refreshIdleTimer();
+    unregisterConnection?.markPong?.();
+    if (idleTimer.refresh) idleTimer.refresh();
+    else resetIdleTimer();
   });
 
   ws.on('message', (data, isBinary) => {
@@ -3476,6 +3593,20 @@ setInterval(() => {
   const now = Date.now();
   for (const [userId, map] of Array.from(activeConnections.entries())) {
     for (const conn of Array.from(map.values())) {
+      if (conn.kind === 'ws') {
+        const silentFor = now - Number(conn.lastPongAt || conn.lastSeen || conn.createdAt || 0);
+        if (silentFor > WS_DASHBOARD_OFFLINE_MS && !conn.wsDashboardOffline) {
+          conn.wsDashboardOffline = true;
+          debugActive('cleanup-ws-dashboard-offline', { userId, endpointKey: conn.clientKey, silentFor });
+          scheduleActiveClientOffline(userId, conn.clientKey, 1, true);
+        }
+        if (silentFor > WS_TERMINATE_MS) {
+          try { conn.closeFn('ws pong stale'); } catch (_) {}
+          removeConnection(userId, conn.id, 'ws pong stale');
+          continue;
+        }
+      }
+
       // Do NOT close a connection just because it has no traffic bytes. A VPN can
       // be connected and idle for seconds/minutes. Only heartbeat/socket staleness
       // should remove it; explicit client close is handled immediately by close events.
