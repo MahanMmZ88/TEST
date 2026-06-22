@@ -709,57 +709,18 @@ function getActiveClientActivityCount(userId) {
   if (!map) return 0;
   const now = Date.now();
   let count = 0;
-  const connMap = activeConnections.get(userId) || new Map();
 
-  for (const [cohortKey, item] of map.entries()) {
+  for (const [key, item] of map.entries()) {
     const fresh = now - Number(item.lastActivity || 0) <= ACTIVE_CLIENT_TTL_MS;
     const stableCohort = Number(item.activityCount || 0) >= 2 || now - Number(item.firstActivity || 0) >= ACTIVE_CLIENT_STABILIZE_MS;
     if (!fresh || !stableCohort) continue;
 
-    const exact = new Map();
-    for (const exactItem of (item.exactEndpoints || new Map()).values()) {
-      if (now - Number(exactItem.lastActivity || 0) <= ACTIVE_CLIENT_TTL_MS) {
-        exact.set(exactItem.ip, {
-          ip: exactItem.ip,
-          firstSeen: Number(exactItem.firstActivity || now),
-          lastSeen: Number(exactItem.lastActivity || now),
-          activityCount: Number(exactItem.activityCount || 0),
-          source: 'activity'
-        });
-      }
-    }
-
-    // Adaptive Split v2: include live connected exact IPs too. Some devices can be
-    // connected and stable while momentarily not producing activity inside the short
-    // dashboard TTL, especially under XHTTP request pooling.
-    for (const conn of connMap.values()) {
-      if (conn.clientKey !== cohortKey) continue;
-      const ip = normalizeIpAddress(conn.ip || 'unknown') || 'unknown';
-      if (!ip || ip === 'unknown') continue;
-      const existing = exact.get(ip);
-      const firstSeen = Number(conn.createdAt || now);
-      const lastSeen = Math.max(Number(conn.lastDataAt || 0), Number(conn.lastPongAt || 0), Number(conn.lastSeen || 0), firstSeen);
-      if (existing) {
-        existing.firstSeen = Math.min(existing.firstSeen, firstSeen);
-        existing.lastSeen = Math.max(existing.lastSeen, lastSeen);
-        existing.source = existing.source === 'activity' ? 'activity+connection' : 'connection';
-      } else if (now - lastSeen <= Math.max(ACTIVE_CLIENT_TTL_MS, WS_DASHBOARD_OFFLINE_MS)) {
-        exact.set(ip, { ip, firstSeen, lastSeen, activityCount: 1, source: 'connection' });
-      }
-    }
-
-    const exactItems = Array.from(exact.values()).filter((x) => now - Number(x.lastSeen || 0) <= Math.max(ACTIVE_CLIENT_TTL_MS, WS_DASHBOARD_OFFLINE_MS));
-    if (exactItems.length <= 1) {
-      count += 1;
-      continue;
-    }
-
-    const stableExact = exactItems.filter((x) => {
-      const age = now - Number(x.firstSeen || now);
-      return age >= ACTIVE_CLIENT_SPLIT_STABLE_MS;
-    });
-
-    count += stableExact.length >= 2 ? stableExact.length : 1;
+    // Final model:
+    // - ep_* keys are Xray-like online cohorts. Do NOT split by exact IP; Railway/XHTTP
+    //   can show many stable exact IPs for one real client during heavy traffic.
+    // - dt_* keys are tokenized devices. Multiple real devices are counted by multiple
+    //   token keys, not by exact IP heuristics.
+    count += 1;
   }
   return count;
 }
