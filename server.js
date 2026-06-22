@@ -71,6 +71,10 @@ const ACTIVE_CLIENT_IPV4_PREFIX = Math.max(16, Math.min(32, Number(process.env.A
 // Keep a small number of newest sockets and close older duplicates after a short grace.
 const WS_MAX_CONNECTIONS_PER_COHORT = Math.max(1, Number(process.env.WS_MAX_CONNECTIONS_PER_COHORT || 2));
 const WS_DUPLICATE_CLOSE_GRACE_MS = Math.max(250, Number(process.env.WS_DUPLICATE_CLOSE_GRACE_MS || 1500));
+// XHTTP raw request/session limiter: keeps packet-up bursts from accumulating many
+// stale server-side sessions while preserving the newest/active streams.
+const XHTTP_MAX_CONNECTIONS_PER_COHORT = Math.max(2, Number(process.env.XHTTP_MAX_CONNECTIONS_PER_COHORT || 8));
+const XHTTP_MIN_IDLE_BEFORE_TRIM_MS = Math.max(5000, Number(process.env.XHTTP_MIN_IDLE_BEFORE_TRIM_MS || 15000));
 // Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
 const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
 const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 4000));
@@ -1008,6 +1012,58 @@ function scheduleWsDuplicateCohortCleanup(userId, clientKey, currentConnectionId
       removeConnection(userId, conn.id, 'ws duplicate cohort cleanup');
     }
   }, WS_DUPLICATE_CLOSE_GRACE_MS);
+}
+
+function trimXhttpCohortConnections(userId) {
+  const map = activeConnections.get(userId);
+  if (!map) return 0;
+  const now = Date.now();
+  const groups = new Map();
+
+  for (const conn of map.values()) {
+    if (conn.kind !== 'xhttp' || !conn.clientKey) continue;
+    if (!groups.has(conn.clientKey)) groups.set(conn.clientKey, []);
+    groups.get(conn.clientKey).push(conn);
+  }
+
+  let trimmed = 0;
+  for (const [clientKey, conns] of groups.entries()) {
+    if (conns.length <= XHTTP_MAX_CONNECTIONS_PER_COHORT) continue;
+
+    // Keep newest / recently data-active streams first. Trim only old idle sessions.
+    const rankedNewest = conns.slice().sort((a, b) => {
+      const aActive = Number(a.lastDataAt || a.createdAt || 0);
+      const bActive = Number(b.lastDataAt || b.createdAt || 0);
+      if (bActive !== aActive) return bActive - aActive;
+      return Number(b.createdAt || 0) - Number(a.createdAt || 0);
+    });
+    const protectedIds = new Set(rankedNewest.slice(0, XHTTP_MAX_CONNECTIONS_PER_COHORT).map((conn) => conn.id));
+    const candidates = rankedNewest
+      .slice(XHTTP_MAX_CONNECTIONS_PER_COHORT)
+      .filter((conn) => now - Number(conn.lastDataAt || conn.createdAt || 0) >= XHTTP_MIN_IDLE_BEFORE_TRIM_MS)
+      .sort((a, b) => Number(a.lastDataAt || a.createdAt || 0) - Number(b.lastDataAt || b.createdAt || 0));
+
+    let currentSize = conns.length;
+    for (const conn of candidates) {
+      if (currentSize <= XHTTP_MAX_CONNECTIONS_PER_COHORT) break;
+      if (protectedIds.has(conn.id)) continue;
+      debugActive('xhttp-trim-idle', {
+        userId,
+        endpointKey: clientKey,
+        connectionId: conn.id,
+        idleFor: now - Number(conn.lastDataAt || conn.createdAt || 0),
+        currentSize,
+        limit: XHTTP_MAX_CONNECTIONS_PER_COHORT
+      });
+      try { conn.closeFn('xhttp idle cohort trim'); } catch (_) {}
+      if (removeConnection(userId, conn.id, 'xhttp idle cohort trim')) {
+        trimmed += 1;
+        currentSize -= 1;
+      }
+    }
+  }
+
+  return trimmed;
 }
 
 function registerConnection(userId, closeFn, meta = {}) {
@@ -2934,7 +2990,9 @@ app.get('/api/debug/active', requireAuth, (req, res) => {
       ACTIVE_CLIENT_SPLIT_STABLE_MS,
       WS_PING_INTERVAL_MS,
       WS_DASHBOARD_OFFLINE_MS,
-      WS_TERMINATE_MS
+      WS_TERMINATE_MS,
+      XHTTP_MAX_CONNECTIONS_PER_COHORT,
+      XHTTP_MIN_IDLE_BEFORE_TRIM_MS
     },
     users
   });
@@ -3690,6 +3748,7 @@ setInterval(() => {
         removeConnection(userId, conn.id, 'stale cleaner');
       }
     }
+    trimXhttpCohortConnections(userId);
     pruneClientSlots(userId);
   }
   for (const userId of Array.from(activeDevices.keys())) pruneClientSlots(userId);
