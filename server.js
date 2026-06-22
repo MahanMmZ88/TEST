@@ -1968,20 +1968,11 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      // Keep the downlink pipe and all cohort connections alive, and keep
-      // the dashboard showing online. We must refresh connections directly
-      // instead of relying on a single unregisterConnection that may have
-      // been trimmed by the XHTTP cohort limiter.
-      if (this.user && this.clientKey) {
-        const now = Date.now();
-        const connMap = activeConnections.get(this.user.id);
-        if (connMap) {
-          for (const conn of connMap.values()) {
-            if (conn.clientKey === this.clientKey) conn.lastSeen = now;
-          }
-        }
-        touchActiveClient(this.user.id, this.clientKey, { ip: this.clientIp, transport: 'xhttp' });
-      }
+      // Keep connection sockets from being pruned by ACTIVE_CONNECTION_STALE_MS.
+      // Dashboard online/offline is driven by real client packets (touchData)
+      // so idle clients naturally fall off the activity TTL without artificial
+      // keepalive noise.
+      this.unregisterConnection?.touchLiveness?.();
     }, 1000);
 
     res.on('close', () => {
@@ -3733,23 +3724,6 @@ wss.on('connection', (ws, req) => {
 
 setInterval(() => {
   const now = Date.now();
-
-  // Keep XHTTP connections alive as long as their session downlink pipe
-  // is open. The per-session aliveTimer handles this during normal operation,
-  // but intermediate proxy timeouts, mobile network transitions, or transient
-  // HTTP stream closures can stop it. This backup guarantees that no connection
-  // is pruned while its session still exists, preventing the ~60s idle dropout.
-  for (const session of xhttpSessions.values()) {
-    if (session.closed) continue;
-    if (!session.downlinkRes || session.downlinkRes.writableEnded || session.downlinkRes.destroyed) continue;
-    if (!session.user || !session.clientKey) continue;
-    const sessionConnMap = activeConnections.get(session.user.id);
-    if (!sessionConnMap) continue;
-    for (const c of sessionConnMap.values()) {
-      if (c.clientKey === session.clientKey) c.lastSeen = now;
-    }
-  }
-
   for (const [userId, map] of Array.from(activeConnections.entries())) {
     for (const conn of Array.from(map.values())) {
       if (conn.kind === 'ws') {
