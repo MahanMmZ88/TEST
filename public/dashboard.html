@@ -325,6 +325,18 @@
         .client-actions .action-btn:hover, .action-btn:hover { transform: none !important; }
         .panel-section { overflow-x: auto !important; overflow-y: visible !important; }
 
+    
+        /* FINAL MOBILE CLIENT CARDS: no horizontal scrolling */
+        @media (max-width: 900px) {
+            .client-card { grid-template-columns: 1fr !important; min-width: 0 !important; overflow: hidden !important; }
+            .client-main, .client-usage, .client-actions { min-width: 0 !important; width: 100% !important; }
+            .client-actions { display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) !important; gap: 8px !important; min-width: 0 !important; overflow: visible !important; padding: 10px 0 0 !important; }
+            .client-actions .action-btn { width: 100% !important; min-width: 0 !important; padding: 10px 7px !important; font-size: 10px !important; white-space: nowrap !important; justify-content: center !important; }
+            .client-actions .toggle-switch { justify-self: center !important; width: 62px !important; min-width: 62px !important; }
+            .client-name { max-width: 100% !important; }
+            .client-usage { min-width: 0 !important; }
+        }
+
     </style>
 </head>
 <body>
@@ -1463,5 +1475,5 @@
     fetchInbounds();
     startRealtime();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a103234b9ffc9727',t:'MTc4MjIxMzk4Nw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</body>
 </html>
