@@ -236,6 +236,12 @@
 
 
 
+        /* Stable interaction fixes: avoid re-render/hover flicker and button clipping */
+        .client-card:hover { transform: none; border-color: rgba(212,175,55,0.22); box-shadow: 0 16px 34px rgba(0,0,0,.30); }
+        .action-btn:hover { transform: none; }
+        .client-actions { padding-top: 5px; padding-bottom: 5px; }
+        .client-actions .action-btn, .client-actions .toggle-switch { position: relative; z-index: 4; }
+
         @keyframes fadeUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         .mobile-nav { display: none; }
@@ -310,6 +316,15 @@
             .toast-wrap { left:12px; right:12px; bottom:12px; }
             .toast { min-width:0; width:100%; }
         }
+    
+        /* FINAL UI FIXES */
+        .client-card, .client-card:hover { transform: none !important; animation: none !important; overflow: visible !important; }
+        .client-card:hover { border-color: rgba(212,175,55,0.22) !important; box-shadow: 0 16px 34px rgba(0,0,0,.30) !important; }
+        .client-actions { overflow: visible !important; flex-wrap: nowrap !important; align-items: center !important; padding: 7px 2px !important; min-width: max-content !important; }
+        .client-actions .action-btn, .client-actions .toggle-switch { position: relative !important; z-index: 20 !important; transform: none !important; }
+        .client-actions .action-btn:hover, .action-btn:hover { transform: none !important; }
+        .panel-section { overflow-x: auto !important; overflow-y: visible !important; }
+
     </style>
 </head>
 <body>
@@ -581,6 +596,8 @@
     var activityLog = [];
     var currentClientFilter = 'all';
     var pendingRestoreBackup = null;
+    var pendingClientsRenderTimer = null;
+    var pendingClientsRenderData = null;
 
     document.getElementById('hostBadge').textContent = 'VLESS WS/XHTTP: ' + host + ':' + vlessPort;
 
@@ -801,10 +818,20 @@
         renderInboundsData(currentUsers);
     }
 
-    function renderInboundsData(users) {
+    function renderInboundsData(users, forceRender) {
         try {
             var list = document.getElementById('clientsList');
             currentUsers = users || [];
+            // Avoid DOM rebuild while the pointer is on a client card. SSE snapshots arrive
+            // frequently and rebuilding the card under the mouse causes hover flicker/loop.
+            if (!forceRender && document.querySelector('.client-card:hover')) {
+                pendingClientsRenderData = currentUsers;
+                clearTimeout(pendingClientsRenderTimer);
+                pendingClientsRenderTimer = setTimeout(function() {
+                    if (!document.querySelector('.client-card:hover')) renderInboundsData(pendingClientsRenderData || currentUsers, true);
+                }, 700);
+                return;
+            }
             var query = (document.getElementById('clientSearchInput')?.value || '').toLowerCase().trim();
             var filter = currentClientFilter || 'all';
             var displayUsers = currentUsers.filter(function(user) {
@@ -1436,5 +1463,5 @@
     fetchInbounds();
     startRealtime();
 </script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a1030cac8f0b4c90',t:'MTc4MjIxMzA2MA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a103234b9ffc9727',t:'MTc4MjIxMzk4Nw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>
