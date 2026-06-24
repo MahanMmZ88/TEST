@@ -3437,7 +3437,8 @@ const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxP
 server.on('upgrade', (req, socket, head) => {
   let url;
   try { url = new URL(req.url || '/', 'http://127.0.0.1'); } catch (_) { socket.destroy(); return; }
-  if (url.pathname !== WS_PATH) {
+  const isWsPath = url.pathname === WS_PATH || url.pathname.startsWith(`${WS_PATH}/t/`);
+  if (!isWsPath) {
     socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
@@ -3447,6 +3448,8 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws, req) => {
   ws.binaryType = 'nodebuffer';
+  ws.isAlive = true;
+  ws._mahan = null;
 
   let remote = null;
   let udpSocket = null;
@@ -3482,27 +3485,8 @@ wss.on('connection', (ws, req) => {
   }
 
   function scheduleWsPing() {
-    clearTimeout(wsPingTimer);
-    wsPingTimer = setTimeout(() => {
-      if (closed) return;
-      const now = Date.now();
-      const silentFor = now - Number(lastPongAt || 0);
-
-      // Hybrid WS Fast Liveness:
-      // 1) dashboard offline quickly when pong disappears;
-      // 2) terminate socket later to avoid killing users during short radio/proxy jitter.
-      if (silentFor > WS_DASHBOARD_OFFLINE_MS) markWsDashboardOffline();
-      if (silentFor > WS_TERMINATE_MS) {
-        closeAll(1000, 'websocket pong timeout');
-        try { ws.terminate(); } catch (_) {}
-        return;
-      }
-
-      wsAlive = false;
-      lastPingAt = now;
-      try { ws.ping(); } catch (_) { closeAll(1011, 'websocket ping failed'); return; }
-      scheduleWsPing();
-    }, boosterProfile.wsPingIntervalMs || WS_PING_INTERVAL_MS);
+    // Authoritative WS heartbeat is global (wss.clients loop). Keeping this no-op
+    // avoids per-connection timer races and zombie sockets that kept dashboard online.
   }
   scheduleWsPing();
 
@@ -3642,6 +3626,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
       unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws', deviceMeta });
+      ws._mahan = { userId: user.id, clientKey: unregisterConnection.clientKey || clientKey, connectionId: unregisterConnection.id, closeAll, createdAt: Date.now(), lastPongAt: Date.now() };
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)} device=${unregisterConnection.clientKey || clientKey}`);
 
       if (request.command === 0x03) {
@@ -3781,8 +3766,10 @@ wss.on('connection', (ws, req) => {
 
   ws.on('pong', () => {
     if (closed || ws.readyState !== ws.OPEN) return;
+    ws.isAlive = true;
     wsAlive = true;
     lastPongAt = Date.now();
+    if (ws._mahan) ws._mahan.lastPongAt = lastPongAt;
     wsDashboardMarkedOffline = false;
     unregisterConnection?.markPong?.();
     if (idleTimer.refresh) idleTimer.refresh();
@@ -3813,6 +3800,38 @@ wss.on('connection', (ws, req) => {
     setImmediate(() => handleClientData(earlyData));
   }
 });
+
+const wsHeartbeatInterval = setInterval(() => {
+  for (const ws of wss.clients) {
+    try {
+      const meta = ws._mahan;
+      if (ws.readyState !== ws.OPEN) {
+        if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
+        continue;
+      }
+
+      if (ws.isAlive === false) {
+        if (meta?.userId && meta?.clientKey) {
+          debugActive('global-ws-heartbeat-timeout', { userId: meta.userId, endpointKey: meta.clientKey, connectionId: meta.connectionId });
+          scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
+          if (meta.connectionId) removeConnection(meta.userId, meta.connectionId, 'global ws heartbeat timeout');
+        }
+        try { meta?.closeAll?.('global ws heartbeat timeout'); } catch (_) {}
+        try { ws.terminate(); } catch (_) {}
+        continue;
+      }
+
+      ws.isAlive = false;
+      try { ws.ping(); } catch (_) {
+        if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
+        try { meta?.closeAll?.('global ws ping failed'); } catch (_) {}
+        try { ws.terminate(); } catch (_) {}
+      }
+    } catch (_) {}
+  }
+}, WS_PING_INTERVAL_MS);
+
+wss.on('close', () => clearInterval(wsHeartbeatInterval));
 
 setInterval(() => {
   const now = Date.now();
