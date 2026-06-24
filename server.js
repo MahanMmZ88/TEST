@@ -473,10 +473,12 @@ function removeConnection(userId, connectionId, reason = 'removed') {
   if (map.size === 0) activeConnections.delete(userId);
   if (existed) {
     releaseClientSlotIfUnused(userId, conn?.clientKey, connectionId);
-    // WS close must force dashboard offline; otherwise a still-open zombie/proxy
-    // socket with the same endpoint can keep hasConnectedEndpoint() true.
-    // XHTTP remains graceful/non-forced to avoid flicker during request rotation.
-    if (conn?.clientKey) scheduleActiveClientOffline(userId, conn.clientKey, conn.kind === 'ws' ? 1 : ACTIVE_CLIENT_CLOSE_GRACE_MS, conn.kind === 'ws');
+    // Do not force dashboard offline if another socket for the same endpoint is
+    // still alive. Duplicate WS/XHTTP streams are common during reconnect/peaks and
+    // forcing offline here caused online/offline flicker.
+    if (conn?.clientKey && !hasConnectedEndpoint(userId, conn.clientKey)) {
+      scheduleActiveClientOffline(userId, conn.clientKey, conn.kind === 'ws' ? 1 : ACTIVE_CLIENT_CLOSE_GRACE_MS, conn.kind === 'ws');
+    }
     scheduleRealtimeBroadcast();
   }
   return existed;
@@ -925,6 +927,16 @@ function hasConnectedEndpoint(userId, clientKey) {
   if (!map) return false;
   for (const conn of map.values()) {
     if (conn?.clientKey === clientKey) return true;
+  }
+  return false;
+}
+
+function hasConnectedEndpointExcept(userId, clientKey, exceptConnectionId = '') {
+  if (!clientKey) return false;
+  const map = activeConnections.get(userId);
+  if (!map) return false;
+  for (const conn of map.values()) {
+    if (conn?.id !== exceptConnectionId && conn?.clientKey === clientKey) return true;
   }
   return false;
 }
@@ -3483,7 +3495,9 @@ wss.on('connection', (ws, req) => {
     wsDashboardMarkedOffline = true;
     unregisterConnection?.markWsDashboardOffline?.();
     debugActive('ws-dashboard-offline', { userId: user.id, endpointKey: unregisterConnection.clientKey, silentFor: Date.now() - lastPongAt });
-    scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
+    if (!hasConnectedEndpointExcept(user.id, unregisterConnection.clientKey, unregisterConnection.id)) {
+      scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
+    }
   }
 
   function scheduleWsPing() {
@@ -3515,7 +3529,7 @@ wss.on('connection', (ws, req) => {
     if (closed) return;
     debugActive('ws-closeAll', { code, reason, endpointKey: unregisterConnection?.clientKey || '', userId: user?.id || '' });
     closed = true;
-    if (user && unregisterConnection?.clientKey) {
+    if (user && unregisterConnection?.clientKey && !hasConnectedEndpointExcept(user.id, unregisterConnection.clientKey, unregisterConnection.id)) {
       scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
     }
     clearTimeout(idleTimer);
