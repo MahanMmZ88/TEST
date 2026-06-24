@@ -61,7 +61,7 @@ const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90
 const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIVITY_WINDOW_MS || 7000));
 // Mahan Active Client Tracker v3: fast traffic/heartbeat based online counter.
 // Keep this >= 2x XHTTP hKeepAlivePeriod so XHTTP keepalive does not flicker.
-const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 5000));
+const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 6000));
 const ACTIVE_CLIENT_STABILIZE_MS = Math.max(0, Number(process.env.ACTIVE_CLIENT_STABILIZE_MS || 800));
 const ACTIVE_CLIENT_SPLIT_STABLE_MS = Math.max(2000, Number(process.env.ACTIVE_CLIENT_SPLIT_STABLE_MS || 8000));
 const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
@@ -77,8 +77,8 @@ const XHTTP_MAX_CONNECTIONS_PER_COHORT = Math.max(2, Number(process.env.XHTTP_MA
 const XHTTP_MIN_IDLE_BEFORE_TRIM_MS = Math.max(5000, Number(process.env.XHTTP_MIN_IDLE_BEFORE_TRIM_MS || 15000));
 // Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
 const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
-const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 4000));
-const WS_TERMINATE_MS = Math.max(3000, Number(process.env.WS_TERMINATE_MS || 8000));
+const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 5000));
+const WS_TERMINATE_MS = Math.max(3000, Number(process.env.WS_TERMINATE_MS || 9000));
 const DEBUG_ACTIVE_CLIENTS = process.env.DEBUG_ACTIVE_CLIENTS === '1';
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -1130,6 +1130,10 @@ function registerConnection(userId, closeFn, meta = {}) {
       item.lastSeen = now;
       item.lastPongAt = now;
       item.wsDashboardOffline = false;
+      // WS pong is the standard lightweight client heartbeat. It keeps the
+      // dashboard online while VPN is connected but idle; missing pong still
+      // triggers fast dashboard-offline via Hybrid WS Fast Liveness.
+      touchActiveClient(userId, item.clientKey, { ip: item.ip, transport: item.kind });
     }
   };
   unregister.markWsDashboardOffline = () => {
@@ -1797,23 +1801,14 @@ function buildWsVlessLink(req, user) {
   return link;
 }
 
-function buildXhttpVlessLink(req, user) {
+function buildXhttpVlessLink(req, user, deviceToken = '') {
   const { host, port, security, isTls } = getPublicEndpoint(req);
   const tag = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
-  // XHTTP keepalive should be expressed via XHTTP/XMUX extra, not aggressive quicParams.
-  // hKeepAlivePeriod=2s gives small client-visible keepalive activity; modest concurrency
-  // prevents one app/device from exploding into many parallel HTTP streams.
-  const xhttpExtra = encodeURIComponent(JSON.stringify({
-    xmux: {
-      hKeepAlivePeriod: 2,
-      // Conservative XMUX: reduce request/stream explosion during traffic peaks.
-      maxConcurrency: '2-4',
-      cMaxReuseTimes: '60-120',
-      hMaxRequestTimes: '300-500',
-      hMaxReusableSecs: '900-1800'
-    }
-  }));
-  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=%2Fxhttp&mode=packet-up&extra=${xhttpExtra}`;
+  // Lightweight XHTTP heartbeat only: no concurrency/reuse limits, no quicParams.
+  // hKeepAlivePeriod keeps idle XHTTP visible with a tiny client-side keepalive.
+  const xhttpExtra = encodeURIComponent(JSON.stringify({ xmux: { hKeepAlivePeriod: 2 } }));
+  const xhttpPath = deviceToken ? `/xhttp/t/${encodeURIComponent(deviceToken)}` : '/xhttp';
+  let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=${encodeURIComponent(xhttpPath)}&mode=packet-up&extra=${xhttpExtra}`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}&alpn=h2%2Chttp%2F1.1&fp=chrome`;
   link += `#${tag}`;
   return link;
