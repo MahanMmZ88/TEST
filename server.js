@@ -2113,9 +2113,8 @@ class XHttpSession {
         const buffered = this.pendingDownlinkBytes || 0;
         const limit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
         if (shouldDropUdpForLatency(this.boosterProfile, this.udpDownlinkBurstState, buffered, limit)) return;
-        updateTraffic(this.user, msg.length, 'downlink', () => this.touchData());
         try {
-          this.sendDownlink(encodeUdpPacket(msg));
+          this.sendDownlink(encodeUdpPacket(msg), { accountDownlink: true, bytes: msg.length });
         } catch (err) {
           log('[XHTTP UDP] Encode failed:', err.message);
           this.close('udp encode failed');
@@ -2171,8 +2170,7 @@ class XHttpSession {
 
       this.remote.on('data', (chunk) => {
         this.touchData();
-        updateTraffic(this.user, chunk.length, 'downlink', () => this.touchData());
-        this.sendDownlink(chunk);
+        this.sendDownlink(chunk, { accountDownlink: true, bytes: chunk.length });
       });
       this.remote.on('drain', () => this.flushRemoteWrites());
       this.remote.on('timeout', () => this.close('remote timeout'));
@@ -2250,10 +2248,11 @@ class XHttpSession {
     }
   }
 
-  sendDownlink(chunk) {
+  sendDownlink(chunk, meta = {}) {
     if (this.closed) return;
+    const item = { chunk, accountBytes: meta.accountDownlink ? Number(meta.bytes || chunk.length || 0) : 0 };
     if (!this.downlinkRes || this.downlinkRes.writableEnded || this.downlinkRes.destroyed) {
-      this.pendingDownlinkChunks.push(chunk);
+      this.pendingDownlinkChunks.push(item);
       this.pendingDownlinkBytes += chunk.length;
       adaptXhttpDownlinkProfile(this, this.pendingDownlinkBytes);
       const downlinkLimit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
@@ -2264,7 +2263,12 @@ class XHttpSession {
     }
     this.flushDownlink();
     if (!this.downlinkRes.writableEnded) {
-      const ok = this.downlinkRes.write(chunk);
+      const ok = this.downlinkRes.write(chunk, () => {
+        if (item.accountBytes > 0 && !this.closed) {
+          updateTraffic(this.user, item.accountBytes, 'downlink', () => this.touchData());
+          recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesDown: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + item.accountBytes });
+        }
+      });
       if (!ok) adaptXhttpDownlinkProfile(this, Math.max(this.pendingDownlinkBytes, chunk.length));
     }
   }
@@ -2279,9 +2283,16 @@ class XHttpSession {
     if (this.closed || !this.downlinkRes || this.downlinkRes.writableEnded) return;
     if (this.established) this.sendVlessResponseHeader();
     while (this.pendingDownlinkChunks.length && !this.downlinkRes.writableEnded) {
-      const chunk = this.pendingDownlinkChunks.shift();
+      const item = this.pendingDownlinkChunks.shift();
+      const chunk = item.chunk || item;
+      const accountBytes = Number(item.accountBytes || 0);
       this.pendingDownlinkBytes -= chunk.length;
-      this.downlinkRes.write(chunk);
+      this.downlinkRes.write(chunk, () => {
+        if (accountBytes > 0 && !this.closed) {
+          updateTraffic(this.user, accountBytes, 'downlink', () => this.touchData());
+          recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesDown: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + accountBytes });
+        }
+      });
     }
   }
 
@@ -3485,6 +3496,14 @@ wss.on('connection', (ws, req) => {
       if (err) {
         log('[WS] Send failed:', err.message);
         closeAll(1011, 'websocket send failed');
+        return;
+      }
+      if (meta.accountDownlink && user) {
+        const bytes = Number(meta.bytes || chunk.length || 0);
+        if (bytes > 0) {
+          updateTraffic(user, bytes, 'downlink', () => unregisterConnection?.touchData?.());
+          recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesDown: Number(boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + bytes });
+        }
       }
     });
     return true;
@@ -3594,9 +3613,8 @@ wss.on('connection', (ws, req) => {
         udpSocket = dgram.createSocket(udpType);
         udpSocket.on('message', (msg) => {
           refreshIdleTimer();
-          updateTraffic(user, msg.length, 'downlink', () => unregisterConnection?.touchData?.());
           try {
-            sendToWs(encodeUdpPacket(msg), { udp: true });
+            sendToWs(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
           } catch (err) {
             log('[UDP] Encode failed:', err.message);
             closeAll(1011, 'udp encode failed');
@@ -3646,8 +3664,7 @@ wss.on('connection', (ws, req) => {
 
       remote.on('data', (remoteChunk) => {
         refreshIdleTimer();
-        updateTraffic(user, remoteChunk.length, 'downlink', () => unregisterConnection?.touchData?.());
-        sendToWs(remoteChunk);
+        sendToWs(remoteChunk, { accountDownlink: true, bytes: remoteChunk.length });
       });
 
       remote.on('drain', () => {
