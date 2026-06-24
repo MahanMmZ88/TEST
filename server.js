@@ -3,6 +3,7 @@
 const http = require('http');
 const net = require('net');
 const dgram = require('dgram');
+const os = require('os');
 const dns = require('dns').promises;
 const path = require('path');
 const fs = require('fs');
@@ -2624,13 +2625,84 @@ function buildUsersSnapshot() {
   });
 }
 
+function readNumberFile(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = String(fs.readFileSync(filePath, 'utf8')).trim();
+    if (!raw || raw === 'max') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function readMemoryStatValue(filePath, key) {
+  try {
+    if (!fs.existsSync(filePath)) return 0;
+    const lines = fs.readFileSync(filePath, 'utf8').split(/\n+/);
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/);
+      if (parts[0] === key) {
+        const n = Number(parts[1]);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      }
+    }
+  } catch (_) {}
+  return 0;
+}
+
+function getSystemMemoryStats() {
+  // Prefer container/cgroup memory, because PaaS providers usually run Node inside
+  // a memory-limited container. Use Docker-like working set (usage - inactive_file)
+  // so filesystem cache doesn't look like real app RAM pressure.
+  const v2Current = readNumberFile('/sys/fs/cgroup/memory.current');
+  const v2Max = readNumberFile('/sys/fs/cgroup/memory.max');
+  if (v2Current !== null && v2Max && v2Max > 0 && v2Max < Number.MAX_SAFE_INTEGER) {
+    const inactiveFile = readMemoryStatValue('/sys/fs/cgroup/memory.stat', 'inactive_file');
+    const used = Math.max(0, v2Current - inactiveFile);
+    return { total: v2Max, used, percent: Math.round((used / Math.max(1, v2Max)) * 100), source: 'cgroup-v2' };
+  }
+
+  const v1Current = readNumberFile('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+  const v1Max = readNumberFile('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+  if (v1Current !== null && v1Max && v1Max > 0 && v1Max < 9e15) {
+    const inactiveFile = readMemoryStatValue('/sys/fs/cgroup/memory/memory.stat', 'total_inactive_file') ||
+      readMemoryStatValue('/sys/fs/cgroup/memory/memory.stat', 'inactive_file');
+    const used = Math.max(0, v1Current - inactiveFile);
+    return { total: v1Max, used, percent: Math.round((used / Math.max(1, v1Max)) * 100), source: 'cgroup-v1' };
+  }
+
+  // Host/VM fallback: use MemAvailable from /proc/meminfo when available, because it
+  // matches `free -h available` better than os.freemem().
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const totalKb = Number((meminfo.match(/^MemTotal:\s+(\d+)/m) || [])[1] || 0);
+    const availableKb = Number((meminfo.match(/^MemAvailable:\s+(\d+)/m) || [])[1] || 0);
+    if (totalKb > 0 && availableKb > 0) {
+      const total = totalKb * 1024;
+      const used = Math.max(0, (totalKb - availableKb) * 1024);
+      return { total, used, percent: Math.round((used / Math.max(1, total)) * 100), source: 'proc-meminfo' };
+    }
+  } catch (_) {}
+
+  const total = os.totalmem();
+  const used = Math.max(0, total - os.freemem());
+  return { total, used, percent: Math.round((used / Math.max(1, total)) * 100), source: 'os' };
+}
+
 function buildStatsSnapshot() {
   const memory = process.memoryUsage();
+  const systemMemory = getSystemMemoryStats();
   const totalTraffic = DB.users.reduce((sum, u) => sum + getEffectiveUsedBytes(u), 0);
   let activeClientCount = 0;
   for (const user of DB.users) activeClientCount += getClientSlotCount(user.id);
   return {
-    ram_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
+    ram_usage: Math.max(0, Math.min(100, systemMemory.percent)),
+    ram_used: systemMemory.used,
+    ram_total: systemMemory.total,
+    ram_source: systemMemory.source,
+    node_heap_usage: Math.round((memory.heapUsed / Math.max(1, memory.heapTotal)) * 100),
     cpu_usage: getCpuUsagePercent(),
     uptime: Math.round(process.uptime()),
     total_traffic: totalTraffic,
