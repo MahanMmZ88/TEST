@@ -2653,28 +2653,9 @@ function readMemoryStatValue(filePath, key) {
 }
 
 function getSystemMemoryStats() {
-  // Prefer container/cgroup memory, because PaaS providers usually run Node inside
-  // a memory-limited container. Use Docker-like working set (usage - inactive_file)
-  // so filesystem cache doesn't look like real app RAM pressure.
-  const v2Current = readNumberFile('/sys/fs/cgroup/memory.current');
-  const v2Max = readNumberFile('/sys/fs/cgroup/memory.max');
-  if (v2Current !== null && v2Max && v2Max > 0 && v2Max < Number.MAX_SAFE_INTEGER) {
-    const inactiveFile = readMemoryStatValue('/sys/fs/cgroup/memory.stat', 'inactive_file');
-    const used = Math.max(0, v2Current - inactiveFile);
-    return { total: v2Max, used, percent: Math.round((used / Math.max(1, v2Max)) * 100), source: 'cgroup-v2' };
-  }
-
-  const v1Current = readNumberFile('/sys/fs/cgroup/memory/memory.usage_in_bytes');
-  const v1Max = readNumberFile('/sys/fs/cgroup/memory/memory.limit_in_bytes');
-  if (v1Current !== null && v1Max && v1Max > 0 && v1Max < 9e15) {
-    const inactiveFile = readMemoryStatValue('/sys/fs/cgroup/memory/memory.stat', 'total_inactive_file') ||
-      readMemoryStatValue('/sys/fs/cgroup/memory/memory.stat', 'inactive_file');
-    const used = Math.max(0, v1Current - inactiveFile);
-    return { total: v1Max, used, percent: Math.round((used / Math.max(1, v1Max)) * 100), source: 'cgroup-v1' };
-  }
-
-  // Host/VM fallback: use MemAvailable from /proc/meminfo when available, because it
-  // matches `free -h available` better than os.freemem().
+  // Dashboard RAM should match what users expect from `free -h`:
+  // (MemTotal - MemAvailable) / MemTotal. Some PaaS images (Railway) don't ship
+  // the `free` binary, but /proc/meminfo is still available and is what free uses.
   try {
     const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
     const totalKb = Number((meminfo.match(/^MemTotal:\s+(\d+)/m) || [])[1] || 0);
@@ -2685,6 +2666,21 @@ function getSystemMemoryStats() {
       return { total, used, percent: Math.round((used / Math.max(1, total)) * 100), source: 'proc-meminfo' };
     }
   } catch (_) {}
+
+  // Fallback for minimal containers where /proc/meminfo is unavailable. Use raw
+  // cgroup usage, not working-set subtraction, because subtracting inactive_file
+  // made the dashboard show unrealistically low values (4-7%) on some platforms.
+  const v2Current = readNumberFile('/sys/fs/cgroup/memory.current');
+  const v2Max = readNumberFile('/sys/fs/cgroup/memory.max');
+  if (v2Current !== null && v2Max && v2Max > 0 && v2Max < Number.MAX_SAFE_INTEGER) {
+    return { total: v2Max, used: v2Current, percent: Math.round((v2Current / Math.max(1, v2Max)) * 100), source: 'cgroup-v2-raw' };
+  }
+
+  const v1Current = readNumberFile('/sys/fs/cgroup/memory/memory.usage_in_bytes');
+  const v1Max = readNumberFile('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+  if (v1Current !== null && v1Max && v1Max > 0 && v1Max < 9e15) {
+    return { total: v1Max, used: v1Current, percent: Math.round((v1Current / Math.max(1, v1Max)) * 100), source: 'cgroup-v1-raw' };
+  }
 
   const total = os.totalmem();
   const used = Math.max(0, total - os.freemem());
