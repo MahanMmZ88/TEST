@@ -3767,19 +3767,8 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('pong', () => {
-    if (closed || ws.readyState !== ws.OPEN) return;
-    ws.isAlive = true;
-    wsAlive = true;
-    lastPongAt = Date.now();
-    if (ws._mahan) {
-      ws._mahan.lastPongAt = lastPongAt;
-      ws._mahan.missedPongs = 0;
-      ws._mahan.dashboardOffline = false;
-    }
-    wsDashboardMarkedOffline = false;
-    unregisterConnection?.markPong?.();
-    if (idleTimer.refresh) idleTimer.refresh();
-    else resetIdleTimer();
+    // WebSocket keepalive is intentionally disabled. Pong frames are ignored for
+    // dashboard/activity accounting; only real client data/traffic keeps a client online.
   });
 
   ws.on('message', (data, isBinary) => {
@@ -3807,77 +3796,17 @@ wss.on('connection', (ws, req) => {
   }
 });
 
-const wsHeartbeatInterval = setInterval(() => {
-  for (const ws of wss.clients) {
-    try {
-      const meta = ws._mahan;
-      if (ws.readyState !== ws.OPEN) {
-        if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
-        continue;
-      }
+// WebSocket protocol keepalive disabled by request. We don't send server pings and
+// don't use pong frames as activity. Offline state is driven by actual traffic and
+// close/error events only.
+const wsHeartbeatInterval = null;
 
-      if (ws.isAlive === false) {
-        if (meta) {
-          meta.missedPongs = Number(meta.missedPongs || 0) + 1;
-          const silentFor = Date.now() - Number(meta.lastPongAt || meta.createdAt || Date.now());
-
-          if (meta.missedPongs >= WS_MISSED_PONGS_OFFLINE && !meta.dashboardOffline && meta.userId && meta.clientKey) {
-            meta.dashboardOffline = true;
-            debugActive('global-ws-dashboard-offline', { userId: meta.userId, endpointKey: meta.clientKey, connectionId: meta.connectionId, missedPongs: meta.missedPongs, silentFor });
-            scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
-          }
-
-          if (meta.missedPongs >= WS_MISSED_PONGS_TERMINATE) {
-            if (meta.userId && meta.connectionId) removeConnection(meta.userId, meta.connectionId, 'global ws heartbeat terminate');
-            try { meta.closeAll?.('global ws heartbeat terminate'); } catch (_) {}
-            try { ws.terminate(); } catch (_) {}
-            continue;
-          }
-        }
-
-        // Give mobile/PaaS/proxy jitter another chance before terminating.
-        try { ws.ping(); } catch (_) {
-          if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
-          try { meta?.closeAll?.('global ws ping failed'); } catch (_) {}
-          try { ws.terminate(); } catch (_) {}
-        }
-        continue;
-      }
-
-      if (meta) {
-        meta.missedPongs = 0;
-        meta.dashboardOffline = false;
-      }
-      ws.isAlive = false;
-      try { ws.ping(); } catch (_) {
-        if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
-        try { meta?.closeAll?.('global ws ping failed'); } catch (_) {}
-        try { ws.terminate(); } catch (_) {}
-      }
-    } catch (_) {}
-  }
-}, WS_PING_INTERVAL_MS);
-
-wss.on('close', () => clearInterval(wsHeartbeatInterval));
+wss.on('close', () => { if (wsHeartbeatInterval) clearInterval(wsHeartbeatInterval); });
 
 setInterval(() => {
   const now = Date.now();
   for (const [userId, map] of Array.from(activeConnections.entries())) {
     for (const conn of Array.from(map.values())) {
-      if (conn.kind === 'ws') {
-        const silentFor = now - Number(conn.lastPongAt || conn.lastSeen || conn.createdAt || 0);
-        if (silentFor > WS_DASHBOARD_OFFLINE_MS && !conn.wsDashboardOffline) {
-          conn.wsDashboardOffline = true;
-          debugActive('cleanup-ws-dashboard-offline', { userId, endpointKey: conn.clientKey, silentFor });
-          scheduleActiveClientOffline(userId, conn.clientKey, 1, true);
-        }
-        if (silentFor > WS_TERMINATE_MS) {
-          try { conn.closeFn('ws pong stale'); } catch (_) {}
-          removeConnection(userId, conn.id, 'ws pong stale');
-          continue;
-        }
-      }
-
       // Do NOT close a connection just because it has no traffic bytes. A VPN can
       // be connected and idle for seconds/minutes. Only heartbeat/socket staleness
       // should remove it; explicit client close is handled immediately by close events.
