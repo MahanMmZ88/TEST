@@ -471,10 +471,10 @@ function removeConnection(userId, connectionId, reason = 'removed') {
   if (map.size === 0) activeConnections.delete(userId);
   if (existed) {
     releaseClientSlotIfUnused(userId, conn?.clientKey, connectionId);
-    // Schedule fast offline for ALL connection types, not just WS.
-    // XHTTP/other connections also have reliable close events through
-    // their session close/downlink-close paths.
-    if (conn?.clientKey) scheduleActiveClientOffline(userId, conn.clientKey, ACTIVE_CLIENT_CLOSE_GRACE_MS);
+    // WS close must force dashboard offline; otherwise a still-open zombie/proxy
+    // socket with the same endpoint can keep hasConnectedEndpoint() true.
+    // XHTTP remains graceful/non-forced to avoid flicker during request rotation.
+    if (conn?.clientKey) scheduleActiveClientOffline(userId, conn.clientKey, conn.kind === 'ws' ? 1 : ACTIVE_CLIENT_CLOSE_GRACE_MS, conn.kind === 'ws');
     scheduleRealtimeBroadcast();
   }
   return existed;
@@ -3529,6 +3529,9 @@ wss.on('connection', (ws, req) => {
     if (closed) return;
     debugActive('ws-closeAll', { code, reason, endpointKey: unregisterConnection?.clientKey || '', userId: user?.id || '' });
     closed = true;
+    if (user && unregisterConnection?.clientKey) {
+      scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
+    }
     clearTimeout(idleTimer);
     clearTimeout(connectTimer);
     clearTimeout(wsPingTimer);
@@ -3777,6 +3780,7 @@ wss.on('connection', (ws, req) => {
   }
 
   ws.on('pong', () => {
+    if (closed || ws.readyState !== ws.OPEN) return;
     wsAlive = true;
     lastPongAt = Date.now();
     wsDashboardMarkedOffline = false;
