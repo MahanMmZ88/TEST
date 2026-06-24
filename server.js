@@ -80,6 +80,8 @@ const XHTTP_MIN_IDLE_BEFORE_TRIM_MS = Math.max(5000, Number(process.env.XHTTP_MI
 const WS_PING_INTERVAL_MS = Math.max(500, Number(process.env.WS_PING_INTERVAL_MS || 1500));
 const WS_DASHBOARD_OFFLINE_MS = Math.max(1500, Number(process.env.WS_DASHBOARD_OFFLINE_MS || 5000));
 const WS_TERMINATE_MS = Math.max(3000, Number(process.env.WS_TERMINATE_MS || 9000));
+const WS_MISSED_PONGS_OFFLINE = 2;
+const WS_MISSED_PONGS_TERMINATE = 4;
 const DEBUG_ACTIVE_CLIENTS = process.env.DEBUG_ACTIVE_CLIENTS === '1';
 
 // Mahan Smart Booster: adaptive low-latency/throughput tuning on the same /ws and /xhttp paths.
@@ -3626,7 +3628,7 @@ wss.on('connection', (ws, req) => {
         return;
       }
       unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws', deviceMeta });
-      ws._mahan = { userId: user.id, clientKey: unregisterConnection.clientKey || clientKey, connectionId: unregisterConnection.id, closeAll, createdAt: Date.now(), lastPongAt: Date.now() };
+      ws._mahan = { userId: user.id, clientKey: unregisterConnection.clientKey || clientKey, connectionId: unregisterConnection.id, closeAll, createdAt: Date.now(), lastPongAt: Date.now(), missedPongs: 0, dashboardOffline: false };
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)} device=${unregisterConnection.clientKey || clientKey}`);
 
       if (request.command === 0x03) {
@@ -3769,7 +3771,11 @@ wss.on('connection', (ws, req) => {
     ws.isAlive = true;
     wsAlive = true;
     lastPongAt = Date.now();
-    if (ws._mahan) ws._mahan.lastPongAt = lastPongAt;
+    if (ws._mahan) {
+      ws._mahan.lastPongAt = lastPongAt;
+      ws._mahan.missedPongs = 0;
+      ws._mahan.dashboardOffline = false;
+    }
     wsDashboardMarkedOffline = false;
     unregisterConnection?.markPong?.();
     if (idleTimer.refresh) idleTimer.refresh();
@@ -3811,16 +3817,37 @@ const wsHeartbeatInterval = setInterval(() => {
       }
 
       if (ws.isAlive === false) {
-        if (meta?.userId && meta?.clientKey) {
-          debugActive('global-ws-heartbeat-timeout', { userId: meta.userId, endpointKey: meta.clientKey, connectionId: meta.connectionId });
-          scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
-          if (meta.connectionId) removeConnection(meta.userId, meta.connectionId, 'global ws heartbeat timeout');
+        if (meta) {
+          meta.missedPongs = Number(meta.missedPongs || 0) + 1;
+          const silentFor = Date.now() - Number(meta.lastPongAt || meta.createdAt || Date.now());
+
+          if (meta.missedPongs >= WS_MISSED_PONGS_OFFLINE && !meta.dashboardOffline && meta.userId && meta.clientKey) {
+            meta.dashboardOffline = true;
+            debugActive('global-ws-dashboard-offline', { userId: meta.userId, endpointKey: meta.clientKey, connectionId: meta.connectionId, missedPongs: meta.missedPongs, silentFor });
+            scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
+          }
+
+          if (meta.missedPongs >= WS_MISSED_PONGS_TERMINATE) {
+            if (meta.userId && meta.connectionId) removeConnection(meta.userId, meta.connectionId, 'global ws heartbeat terminate');
+            try { meta.closeAll?.('global ws heartbeat terminate'); } catch (_) {}
+            try { ws.terminate(); } catch (_) {}
+            continue;
+          }
         }
-        try { meta?.closeAll?.('global ws heartbeat timeout'); } catch (_) {}
-        try { ws.terminate(); } catch (_) {}
+
+        // Give mobile/PaaS/proxy jitter another chance before terminating.
+        try { ws.ping(); } catch (_) {
+          if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
+          try { meta?.closeAll?.('global ws ping failed'); } catch (_) {}
+          try { ws.terminate(); } catch (_) {}
+        }
         continue;
       }
 
+      if (meta) {
+        meta.missedPongs = 0;
+        meta.dashboardOffline = false;
+      }
       ws.isAlive = false;
       try { ws.ping(); } catch (_) {
         if (meta?.userId && meta?.clientKey) scheduleActiveClientOffline(meta.userId, meta.clientKey, 1, true);
