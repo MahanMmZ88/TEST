@@ -999,23 +999,12 @@ function releaseClientSlotIfUnused(userId, clientKey, connectionId) {
 }
 
 function scheduleWsDuplicateCohortCleanup(userId, clientKey, currentConnectionId) {
-  if (!userId || !clientKey) return;
-  setTimeout(() => {
-    const map = activeConnections.get(userId);
-    if (!map) return;
-    const wsConnections = Array.from(map.values())
-      .filter((conn) => conn.kind === 'ws' && conn.clientKey === clientKey)
-      .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
-
-    if (wsConnections.length <= WS_MAX_CONNECTIONS_PER_COHORT) return;
-    const keep = new Set(wsConnections.slice(0, WS_MAX_CONNECTIONS_PER_COHORT).map((conn) => conn.id));
-    for (const conn of wsConnections) {
-      if (keep.has(conn.id)) continue;
-      debugActive('ws-duplicate-close', { userId, endpointKey: clientKey, connectionId: conn.id, currentConnectionId });
-      try { conn.closeFn('ws duplicate cohort cleanup'); } catch (_) {}
-      removeConnection(userId, conn.id, 'ws duplicate cohort cleanup');
-    }
-  }, WS_DUPLICATE_CLOSE_GRACE_MS);
+  // Data-plane safety: do not close WebSocket connections just because several
+  // sockets belong to the same active-client cohort. Apps like Telegram open
+  // multiple parallel TCP flows over VLESS-WS; closing "duplicates" causes
+  // reconnect loops (Connecting/Connected). Active Client counting is cohort-based
+  // and does not require destructive WS cleanup.
+  return;
 }
 
 function trimXhttpCohortConnections(userId) {
@@ -3718,7 +3707,8 @@ wss.on('connection', (ws, req) => {
         if (request.payload.length) {
           updateTraffic(user, request.payload.length, 'uplink', () => unregisterConnection?.touchData?.());
           if (!remote.write(request.payload)) {
-            try { req.socket.pause(); } catch (_) {}
+            // Do not pause the underlying WebSocket HTTP socket. Pausing req.socket
+            // can stall WS frames/control flow and cause reconnect loops under load.
           }
         }
         flushPendingClientChunks();
@@ -3735,7 +3725,6 @@ wss.on('connection', (ws, req) => {
       });
 
       remote.on('drain', () => {
-        try { req.socket.resume(); } catch (_) {}
         flushPendingClientChunks();
       });
 
@@ -3776,7 +3765,7 @@ wss.on('connection', (ws, req) => {
 
     updateTraffic(user, chunk.length, 'uplink', () => unregisterConnection?.touchData?.());
     if (!remote.write(chunk)) {
-      try { req.socket.pause(); } catch (_) {}
+      // Let Node TCP backpressure apply naturally; never pause req.socket for WS.
     }
   }
 
