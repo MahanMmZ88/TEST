@@ -4,7 +4,8 @@
   "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=192 server.js"
+    "start": "node server.js",
+    "dev": "node --max-old-space-size=192 server.js"
   },
   "engines": {
     "node": "20.x"
