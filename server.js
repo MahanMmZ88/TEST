@@ -159,6 +159,15 @@ const pendingDownlinkBytes = new Map(); // user.id -> download/downlink bytes wa
 const pendingLastSeen = new Map(); // user.id -> latest timestamp waiting for batched commit
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
+// Mahan Keep-Alive Engine: prevent PaaS auto-sleep (Bonto/Glitch/Render/Koyeb).
+// KEEPALIVE_URL env var is the primary way to set the public URL on first boot.
+// If not set, the URL is auto-detected from the first incoming request (rememberPublicSelfUrl).
+// KEEPALIVE_INTERVAL_MS controls ping frequency (default 4 minutes, well under 30-min sleep threshold).
+const KEEPALIVE_URL = String(process.env.KEEPALIVE_URL || '').trim();
+const KEEPALIVE_INTERVAL_MS = Math.max(60000, Number(process.env.KEEPALIVE_INTERVAL_MS || 4 * 60 * 1000));
+let keepalivePingCount = 0;
+let keepaliveLastSuccessAt = 0;
+let keepaliveLastError = '';
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clientKey, kind, closeFn, lastSeen })
@@ -185,6 +194,7 @@ function rememberPublicSelfUrl(req) {
   const nextUrl = `${proto}://${host}/health`;
   if (selfPingHealthUrl !== nextUrl) {
     selfPingHealthUrl = nextUrl;
+    log('[KEEPALIVE] Public URL auto-detected:', nextUrl);
   }
 }
 
@@ -2790,7 +2800,22 @@ function scheduleRealtimeBroadcast() {
   }, 100);
 }
 
-app.get('/health', (req, res) => res.type('text/plain').send(`ok - ${BUILD_ID}\n`));
+app.get('/health', (req, res) => {
+  res.type('text/plain').send(`ok - ${BUILD_ID}\n`);
+});
+
+app.get('/api/keepalive', requireAuth, (req, res) => {
+  res.json({
+    enabled: true,
+    url: KEEPALIVE_URL || selfPingHealthUrl || '(not set)',
+    source: KEEPALIVE_URL ? 'KEEPALIVE_URL env' : (selfPingHealthUrl ? 'auto-detected' : 'none'),
+    interval_ms: KEEPALIVE_INTERVAL_MS,
+    interval_sec: Math.round(KEEPALIVE_INTERVAL_MS / 1000),
+    total_pings: keepalivePingCount,
+    last_success_at: keepaliveLastSuccessAt ? new Date(keepaliveLastSuccessAt).toISOString() : 'never',
+    last_error: keepaliveLastError || null
+  });
+});
 
 app.options(`${XHTTP_PATH}/*`, (req, res) => {
   res.writeHead(204, XHTTP_RESPONSE_HEADERS);
@@ -3858,23 +3883,38 @@ setInterval(() => {
 
 setInterval(() => {
   try {
-    const url = selfPingHealthUrl;
-    if (!url) return;
+    // KEEPALIVE_URL env var takes priority; fall back to auto-detected URL.
+    const url = KEEPALIVE_URL ? `${KEEPALIVE_URL.replace(/\/+$/, '')}/health` : selfPingHealthUrl;
+    if (!url) {
+      // No URL known yet. Log once every ~5 minutes to help debugging.
+      if (keepalivePingCount === 0) log('[KEEPALIVE] Waiting for public URL (set KEEPALIVE_URL env or send a request)');
+      return;
+    }
 
     if (lastSelfPingUrlLog !== url) {
       lastSelfPingUrlLog = url;
-      log('[KEEPALIVE] Self-ping target:', url);
+      log('[KEEPALIVE] Self-ping target:', url, `(interval ${Math.round(KEEPALIVE_INTERVAL_MS / 1000)}s)`);
     }
 
+    keepalivePingCount += 1;
+    const startedAt = Date.now();
+
     fetch(url, {
-      method: 'HEAD',
+      method: 'GET',
       cache: 'no-store',
-      headers: { 'user-agent': 'Mahan-Panel-Self-Keepalive/1.0' }
+      headers: { 'user-agent': 'Mahan-Panel-Keepalive/2.0' }
+    }).then((res) => {
+      keepaliveLastSuccessAt = Date.now();
+      keepaliveLastError = '';
+      if (keepalivePingCount <= 3 || keepalivePingCount % 15 === 0) {
+        log('[KEEPALIVE] Ping OK:', `${res.status} ${Math.round(Date.now() - startedAt)}ms (ping #${keepalivePingCount})`);
+      }
     }).catch((err) => {
-      log('[KEEPALIVE] Self-ping failed:', err && err.message ? err.message : 'unknown');
+      keepaliveLastError = err && err.message ? err.message : 'unknown';
+      log('[KEEPALIVE] Self-ping failed:', keepaliveLastError);
     });
   } catch (_) {}
-}, SELF_PING_INTERVAL_MS);
+}, KEEPALIVE_INTERVAL_MS);
 
 process.on('SIGTERM', () => {
   try { flushTrafficBuffers(); saveDBNow(); } catch (_) {}
@@ -3893,4 +3933,12 @@ server.listen(PORT, '0.0.0.0', () => {
   log('[INFO] WS path:', WS_PATH);
   log('[INFO] XHTTP path:', XHTTP_PATH);
   log('[INFO] Default admin:', 'admin / admin');
+  // Keep-alive startup info
+  if (KEEPALIVE_URL) {
+    log('[KEEPALIVE] Explicit URL from env:', KEEPALIVE_URL, `(ping every ${Math.round(KEEPALIVE_INTERVAL_MS / 1000)}s)`);
+    // Seed the URL immediately so pings start from boot, before any request arrives
+    selfPingHealthUrl = `${KEEPALIVE_URL.replace(/\/+$/, '')}/health`;
+  } else {
+    log('[KEEPALIVE] No KEEPALIVE_URL set — URL will auto-detect from first request (set KEEPALIVE_URL for instant keep-alive from boot)');
+  }
 });
