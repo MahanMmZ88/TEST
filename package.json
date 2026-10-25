@@ -4,11 +4,13 @@
   "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
   "main": "server.js",
   "scripts": {
+    "build": "npm install",
+    "prestart": "npm install",
     "start": "node server.js",
     "dev": "node --max-old-space-size=192 server.js"
   },
   "engines": {
-    "node": "20.x"
+    "node": ">=18.0.0"
   },
   "dependencies": {
     "cookie-parser": "^1.4.6",
