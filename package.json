@@ -1,6 +1,6 @@
 {
   "name": "mahan-panel-vless-ws-node",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
   "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
   "main": "server.js",

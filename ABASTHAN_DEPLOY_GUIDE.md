@@ -101,6 +101,13 @@ NO LIVE PORT
 | Environment | نیازی به `PORT` نیست؛ Abasthan خودش تزریق میکند |
 | Branch | برنچی که این تغییرات روی آن است (مثلاً `main` بعد از مرج PR) |
 
+> ⚠️ **این Build Command مخصوص Abasthan است.** روی پلتفرمهای مبتنی بر
+> **Nixpacks/Coolify** (مثل Belmo، Dokploy، Easypanel، Railway) فقط
+> `npm run build` بگذارید — چون Nixpacks خودش در فاز `install` یک `npm ci` اجرا
+> میکند و `npm ci` دوم با کش `/app/node_modules/.cache` برخورد کرده و خطای
+> `EBUSY ... rmdir '/app/node_modules/.cache'` میدهد. جزئیات:
+> `BELMO_DEPLOY_GUIDE.md` و فایل `nixpacks.toml`.
+
 > نمونهٔ واقعی دیگری از دیپلوی موفق روی Abasthan هم دقیقاً همین مقادیر را دارد:
 > `Build command: npm install && npm run build`، `Start command: npm start`،
 > `PORT` تزریق خودکار، health check روی `/health`

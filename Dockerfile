@@ -1,5 +1,9 @@
-# Deplexo-compatible image: the runtime root filesystem is READ-ONLY.
-# Everything writable must live on the /data volume or in /tmp.
+# Multi-platform image (Deplexo / Belmo-Coolify / any Docker host).
+#
+# On Deplexo the runtime root filesystem is READ-ONLY, so everything writable
+# must live on the /data volume or in /tmp. On Coolify/Belmo this is also the
+# RECOMMENDED build pack ("Dockerfile") because it skips Nixpacks' 600+ MB Nix
+# bootstrap and its node_modules/.cache BuildKit mount (which breaks npm ci).
 FROM node:22-alpine
 
 WORKDIR /app
@@ -33,7 +37,12 @@ EXPOSE 3000
 
 # Lightweight busybox wget (already in alpine). No npm/node subprocess and no
 # filesystem writes, so this works with a read-only root and a 128 MB plan.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1
+# ${PORT} is expanded by /bin/sh at runtime, so a host that injects PORT
+# (Abasthan, Belmo, Coolify) is health-checked on the right port.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-3000}/health" || exit 1
+
+# server.js drains WebSocket/SSE connections and flushes the DB on SIGTERM.
+STOPSIGNAL SIGTERM
 
 CMD ["node", "server.js"]

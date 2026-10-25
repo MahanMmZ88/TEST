@@ -25,7 +25,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'deplexo-compatible-2026-10-25-a';
+const BUILD_ID = 'multi-platform-2026-10-25-b';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
