@@ -1,0 +1,16 @@
+# Deplexo application configuration.
+# Explicit YAML values override saved dashboard settings on every redeployment.
+# Docs: https://docs.deplexo.com/reference/configuration/
+version: 1
+type: web
+build:
+  framework: dockerfile
+  dockerfile: Dockerfile
+  # With a Dockerfile build, Deplexo ignores build.install/build.command;
+  # `npm ci` runs inside the image where the filesystem is still writable.
+run:
+  # Empty clears a stale dashboard start command (e.g. "npm start", which used
+  # to trigger a prestart "npm install" against Deplexo's read-only root FS).
+  # The image's exec-form CMD ["node", "server.js"] is used instead.
+  command: ""
+  port: 3000

@@ -1,5 +1,15 @@
-node_modules
-npm-debug.log
 .git
 .gitignore
+.github
+node_modules
+npm-debug.log*
+*.log
+.env
+.env.*
+!.env.example
 *.md
+deplexo.yaml
+Dockerfile
+.dockerignore
+coverage
+*.tmp

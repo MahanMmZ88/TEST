@@ -16,47 +16,125 @@ const { WebSocketServer } = require('ws');
 const app = express();
 app.set('trust proxy', true);
 
-const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide PORT automatically.
-const BUILD_ID = 'server-only-subscription-layout-2026-06-20-a';
+// Deplexo injects PORT from `run.port` in deplexo.yaml. An invalid saved PORT can
+// stay in the environment while routing still uses 3000, so always validate it.
+function resolvePort() {
+  const raw = Number(process.env.PORT);
+  if (Number.isInteger(raw) && raw > 0 && raw <= 65535) return raw;
+  if (process.env.PORT) log('[WARN] Invalid PORT in environment - falling back to 3000');
+  return 3000;
+}
+const PORT = resolvePort();
+const BUILD_ID = 'deplexo-compatible-2026-10-25-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
-function resolveInitialDbPath() {
-  if (process.env.DB_PATH) return process.env.DB_PATH;
-  const defaultPath = path.join(__dirname, 'db.json');
+function envNumber(name, fallback, min, max) {
+  const raw = process.env[name];
+  const n = raw === undefined || String(raw).trim() === '' ? fallback : Number(raw);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.trunc(n))) : fallback;
+}
+
+// Node 20.3+/22 sizes its heap from the cgroup limit automatically. On Deplexo's
+// 128 MB free plan we also shrink the traffic buffers so off-heap allocations do
+// not push the process into the OOM killer.
+function constrainedMemoryMb() {
   try {
-    const testFile = path.join(__dirname, '.test-write-' + process.pid);
-    fs.writeFileSync(testFile, '');
-    fs.unlinkSync(testFile);
-    return defaultPath;
-  } catch (err) {
-    if (err.code === 'EROFS' || err.code === 'EACCES' || err.code === 'EPERM') {
-      const fallback = path.join(os.tmpdir(), 'db.json');
-      try {
-        if (fs.existsSync(defaultPath) && !fs.existsSync(fallback)) {
-          fs.copyFileSync(defaultPath, fallback);
-        }
-      } catch (_) {}
-      return fallback;
+    if (typeof process.constrainedMemory === 'function') {
+      const bytes = process.constrainedMemory();
+      if (Number.isFinite(bytes) && bytes > 0 && bytes < Number.MAX_SAFE_INTEGER) {
+        return Math.floor(bytes / (1024 * 1024));
+      }
     }
-    return defaultPath;
+  } catch (_) {}
+  return 0;
+}
+const CONSTRAINED_MEMORY_MB = constrainedMemoryMb();
+const LOW_MEMORY_MODE = CONSTRAINED_MEMORY_MB > 0 && CONSTRAINED_MEMORY_MB <= 192;
+
+// Deplexo's root filesystem is read-only at runtime. The only writable locations
+// are the persistent data volume (/data by default) and /tmp (100 MB, ephemeral).
+// DB_PATH can point at either; DB_FALLBACK_PATHS allows extra custom mounts.
+const DB_FILE_NAME = 'db.json';
+const SEED_DB_PATH = path.join(__dirname, DB_FILE_NAME);
+
+function dbCandidates() {
+  const list = [];
+  const add = (p) => {
+    if (!p) return;
+    const resolved = path.resolve(String(p).trim());
+    if (resolved && !list.includes(resolved)) list.push(resolved);
+  };
+  add(process.env.DB_PATH);
+  add(SEED_DB_PATH); // local development (writable source tree)
+  add(path.join('/data', DB_FILE_NAME)); // Deplexo persistent volume
+  for (const p of String(process.env.DB_FALLBACK_PATHS || '').split(',')) add(p);
+  add(path.join(os.tmpdir(), DB_FILE_NAME)); // last-resort ephemeral fallback
+  return list;
+}
+
+function dirIsWritable(dir) {
+  try {
+    const probe = path.join(dir, `.deplexo-write-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(probe, '');
+    fs.unlinkSync(probe);
+    return true;
+  } catch (_) {
+    return false;
   }
 }
+
+function fileIsWritable(filePath) {
+  if (!fs.existsSync(filePath)) return true;
+  try { fs.accessSync(filePath, fs.constants.W_OK); return true; } catch (_) { return false; }
+}
+
+function seedDbTo(targetPath) {
+  if (targetPath === SEED_DB_PATH || fs.existsSync(targetPath)) return;
+  try {
+    if (fs.existsSync(SEED_DB_PATH)) {
+      fs.copyFileSync(SEED_DB_PATH, targetPath);
+      log('[DB] Seeded database from image at', targetPath);
+    }
+  } catch (err) {
+    log('[DB] Could not seed', targetPath + ':', err.code || err.message);
+  }
+}
+
+function resolveInitialDbPath() {
+  for (const candidate of dbCandidates()) {
+    if (!dirIsWritable(path.dirname(candidate)) || !fileIsWritable(candidate)) {
+      log('[DB] Skipping unwritable location:', candidate);
+      continue;
+    }
+    seedDbTo(candidate);
+    return candidate;
+  }
+  log('[DB] WARNING: no writable database location found; changes will not be persisted');
+  return SEED_DB_PATH;
+}
 let DB_PATH = resolveInitialDbPath();
+
+function storageMode(dbPath) {
+  if (dbPath === SEED_DB_PATH) return 'local-file';
+  if (dbPath.startsWith('/data/')) return 'persistent-volume';
+  if (dbPath.startsWith(os.tmpdir())) return 'ephemeral-tmp';
+  return 'custom-path';
+}
 
 const PASSWORD_SALT = 'MAHAN_PANEL_NODE_WS_SALT_v2';
 const CONNECT_TIMEOUT_MS = 15000;
 const IDLE_TIMEOUT_MS = 120000;
 const MAX_FIRST_PACKET = 128 * 1024;
-const MAX_WS_PAYLOAD = 8 * 1024 * 1024;
-const WS_BACKPRESSURE_LIMIT = 4 * 1024 * 1024;
+const MAX_WS_PAYLOAD = envNumber('MAX_WS_PAYLOAD', 8 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024);
+const WS_BACKPRESSURE_LIMIT = envNumber('WS_BACKPRESSURE_LIMIT', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024);
 const WS_BACKPRESSURE_RESUME = 1 * 1024 * 1024;
 const MAX_UDP_PACKET_SIZE = 64 * 1024;
 const UDP_IDLE_TIMEOUT_MS = 60000;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
-const MAX_XHTTP_POST_SIZE = 4 * 1024 * 1024;
-const MAX_XHTTP_BUFFERED_POSTS = 32;
-const MAX_XHTTP_DOWNLINK_BUFFER = 4 * 1024 * 1024;
+const MAX_XHTTP_POST_SIZE = envNumber('MAX_XHTTP_POST_SIZE', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024);
+const MAX_XHTTP_BUFFERED_POSTS = envNumber('MAX_XHTTP_BUFFERED_POSTS', LOW_MEMORY_MODE ? 8 : 32, 2, 64);
+const MAX_XHTTP_DOWNLINK_BUFFER = envNumber('MAX_XHTTP_DOWNLINK_BUFFER', LOW_MEMORY_MODE ? 1024 * 1024 : 4 * 1024 * 1024, 256 * 1024, 16 * 1024 * 1024);
 const XHTTP_SESSION_TIMEOUT_MS = 300000;
 const XHTTP_RESPONSE_HEADERS = {
   'content-type': 'application/octet-stream',
@@ -186,6 +264,9 @@ let lastSelfPingUrlLog = '';
 // If not set, the URL is auto-detected from the first incoming request (rememberPublicSelfUrl).
 // KEEPALIVE_INTERVAL_MS controls ping frequency (default 4 minutes, well under 30-min sleep threshold).
 const KEEPALIVE_URL = String(process.env.KEEPALIVE_URL || '').trim();
+// Deplexo free tier is always-on, so self-pinging is optional there. Set
+// KEEPALIVE_ENABLED=0 to stop the extra requests (and their transfer usage).
+const KEEPALIVE_ENABLED = process.env.KEEPALIVE_ENABLED !== '0';
 const KEEPALIVE_INTERVAL_MS = Math.max(60000, Number(process.env.KEEPALIVE_INTERVAL_MS || 4 * 60 * 1000));
 let keepalivePingCount = 0;
 let keepaliveLastSuccessAt = 0;
@@ -206,6 +287,7 @@ app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
 
 function rememberPublicSelfUrl(req) {
+  if (!KEEPALIVE_ENABLED) return;
   const host = String(req.headers.host || '').trim();
   if (!host) return;
 
@@ -351,22 +433,26 @@ function normalizeUser(u) {
   };
 }
 
-function loadDB() {
+function readDbFile(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
   try {
-    if (fs.existsSync(DB_PATH)) {
-      const parsed = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-      DB.admin = parsed.admin || null;
-      DB.users = Array.isArray(parsed.users) ? parsed.users.map(normalizeUser).filter(Boolean) : [];
-    } else {
-      const defaultPath = path.join(__dirname, 'db.json');
-      if (defaultPath !== DB_PATH && fs.existsSync(defaultPath)) {
-        const parsed = JSON.parse(fs.readFileSync(defaultPath, 'utf8'));
-        DB.admin = parsed.admin || null;
-        DB.users = Array.isArray(parsed.users) ? parsed.users.map(normalizeUser).filter(Boolean) : [];
-      }
-    }
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
   } catch (err) {
-    log('[DB] Load failed:', err.message);
+    log('[DB] Cannot read/parse', filePath + ':', err.message);
+    return null;
+  }
+}
+
+function loadDB() {
+  let parsed = readDbFile(DB_PATH);
+  if (!parsed && DB_PATH !== SEED_DB_PATH) {
+    log('[DB] Falling back to seed database bundled in the image');
+    parsed = readDbFile(SEED_DB_PATH);
+  }
+  if (parsed) {
+    DB.admin = parsed.admin || null;
+    DB.users = Array.isArray(parsed.users) ? parsed.users.map(normalizeUser).filter(Boolean) : [];
   }
 
   if (!DB.admin) {
@@ -376,29 +462,40 @@ function loadDB() {
 
   scheduleSaveDB(true);
   log('[DB] Database path:', DB_PATH);
+  log('[DB] Storage mode:', storageMode(DB_PATH));
   log('[DB] Loaded users:', String(DB.users.length));
+}
+
+function writeDbFile(targetPath) {
+  try { fs.mkdirSync(path.dirname(targetPath), { recursive: true }); } catch (_) {}
+  const tmp = `${targetPath}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(DB, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, targetPath);
 }
 
 function saveDBNow() {
   if (dbSaveTimer) clearTimeout(dbSaveTimer);
   dbSaveTimer = null;
-  const writeTo = (targetPath) => {
-    const tmp = targetPath + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(DB, null, 2));
-    fs.renameSync(tmp, targetPath);
-  };
-  try {
-    writeTo(DB_PATH);
-  } catch (err) {
-    if ((err.code === 'EROFS' || err.code === 'EACCES') && !DB_PATH.startsWith(os.tmpdir())) {
-      const fallback = path.join(os.tmpdir(), 'db.json');
-      log('[DB] Read-only filesystem at', DB_PATH, '- switching to fallback at', fallback);
-      DB_PATH = fallback;
-      writeTo(DB_PATH);
-    } else {
-      throw err;
+
+  // On a read-only root filesystem (Deplexo), writing beside the source fails
+  // with EROFS/EACCES/EPERM/ENOENT. Try every writable location in order instead
+  // of crashing or silently losing the database.
+  const ordered = [DB_PATH, ...dbCandidates().filter((p) => p !== DB_PATH)];
+  let lastError = null;
+  for (const candidate of ordered) {
+    try {
+      writeDbFile(candidate);
+      if (candidate !== DB_PATH) {
+        log('[DB] Switched to writable fallback:', candidate);
+        DB_PATH = candidate;
+      }
+      return;
+    } catch (err) {
+      lastError = err;
+      log('[DB] Write failed at', candidate + ':', err.code || err.message);
     }
   }
+  throw lastError || new Error('No writable database location');
 }
 
 function scheduleSaveDB(immediate = false) {
@@ -2844,13 +2941,30 @@ function scheduleRealtimeBroadcast() {
   }, 100);
 }
 
-app.get('/health', (req, res) => {
-  res.type('text/plain').send(`ok - ${BUILD_ID}\n`);
+// Deplexo's startup/health probe accepts both /health and /healthz on starters.
+// Keep them unauthenticated, cheap and uncached; never touch the database here.
+function healthResponse(req, res) {
+  res.set('cache-control', 'no-store').type('text/plain').send(`ok - ${BUILD_ID}\n`);
+}
+app.get('/health', healthResponse);
+app.get('/healthz', healthResponse);
+
+app.get('/api/health', (req, res) => {
+  res.set('cache-control', 'no-store').json({
+    ok: true,
+    build: BUILD_ID,
+    node: process.version,
+    port: PORT,
+    db_path: DB_PATH,
+    storage: storageMode(DB_PATH),
+    memory_limit_mb: CONSTRAINED_MEMORY_MB || null,
+    low_memory_mode: LOW_MEMORY_MODE
+  });
 });
 
 app.get('/api/keepalive', requireAuth, (req, res) => {
   res.json({
-    enabled: true,
+    enabled: KEEPALIVE_ENABLED,
     url: KEEPALIVE_URL || selfPingHealthUrl || '(not set)',
     source: KEEPALIVE_URL ? 'KEEPALIVE_URL env' : (selfPingHealthUrl ? 'auto-detected' : 'none'),
     interval_ms: KEEPALIVE_INTERVAL_MS,
@@ -3501,7 +3615,9 @@ app.get('/panel', (req, res) => {
   if (!activeSessions.has(req.cookies.admin_session)) return res.redirect('/login');
   res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
 });
-app.get('/', (req, res) => res.redirect('/login'));
+// Deplexo's startup probe requests `/`. Serve the login page with HTTP 200
+// instead of a redirect so any health-check implementation accepts it.
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: MAX_WS_PAYLOAD });
@@ -3926,6 +4042,7 @@ setInterval(() => {
 }, 30000);
 
 setInterval(() => {
+  if (!KEEPALIVE_ENABLED) return;
   try {
     // KEEPALIVE_URL env var takes priority; fall back to auto-detected URL.
     const url = KEEPALIVE_URL ? `${KEEPALIVE_URL.replace(/\/+$/, '')}/health` : selfPingHealthUrl;
@@ -3960,25 +4077,57 @@ setInterval(() => {
   } catch (_) {}
 }, KEEPALIVE_INTERVAL_MS);
 
-process.on('SIGTERM', () => {
-  try { flushTrafficBuffers(); saveDBNow(); } catch (_) {}
-  process.exit(0);
-});
-process.on('SIGINT', () => {
-  try { flushTrafficBuffers(); saveDBNow(); } catch (_) {}
-  process.exit(0);
-});
+// Deplexo stops the previous container before starting its replacement, so a
+// SIGTERM must flush state and release sockets quickly instead of exiting while
+// requests are still in flight.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log('[INFO] Received', signal, '- draining connections');
+
+  try { flushTrafficBuffers(); saveDBNow(); }
+  catch (err) { log('[DB] Final save failed:', err && err.message ? err.message : String(err)); }
+
+  try { server.close(); } catch (_) {}
+  try { wss.close(); } catch (_) {}
+  try { for (const ws of Array.from(wss.clients)) ws.terminate(); } catch (_) {}
+  try { for (const res of Array.from(adminEventClients)) res.end(); } catch (_) {}
+  try {
+    for (const clients of Array.from(subEventClients.values())) {
+      for (const res of Array.from(clients)) res.end();
+    }
+  } catch (_) {}
+  try {
+    for (const conns of Array.from(activeConnections.values())) {
+      for (const conn of Array.from(conns.values())) {
+        try { if (typeof conn.closeFn === 'function') conn.closeFn(); } catch (_) {}
+      }
+    }
+  } catch (_) {}
+
+  setTimeout(() => {
+    try { server.closeAllConnections(); } catch (_) {}
+  }, 750).unref();
+  setTimeout(() => process.exit(0), 3000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('uncaughtException', (err) => log('[ERROR] Uncaught:', err && err.stack ? err.stack : String(err)));
 process.on('unhandledRejection', (err) => log('[ERROR] Unhandled:', err && err.stack ? err.stack : String(err)));
 
 loadDB();
 server.listen(PORT, '0.0.0.0', () => {
-  log('[INFO] Mahan Panel VLESS-WS/XHTTP active on port', String(PORT));
+  log('[INFO] Mahan Panel VLESS-WS/XHTTP active on 0.0.0.0:' + String(PORT));
   log('[INFO] WS path:', WS_PATH);
   log('[INFO] XHTTP path:', XHTTP_PATH);
   log('[INFO] Default admin:', 'admin / admin');
+  log('[INFO] Storage:', storageMode(DB_PATH), '-', DB_PATH);
+  if (CONSTRAINED_MEMORY_MB) log('[INFO] Container memory limit (MB):', String(CONSTRAINED_MEMORY_MB));
   // Keep-alive startup info
-  if (KEEPALIVE_URL) {
+  if (!KEEPALIVE_ENABLED) {
+    log('[KEEPALIVE] Disabled via KEEPALIVE_ENABLED=0 (Deplexo containers are always-on)');
+  } else if (KEEPALIVE_URL) {
     log('[KEEPALIVE] Explicit URL from env:', KEEPALIVE_URL, `(ping every ${Math.round(KEEPALIVE_INTERVAL_MS / 1000)}s)`);
     // Seed the URL immediately so pings start from boot, before any request arrives
     selfPingHealthUrl = `${KEEPALIVE_URL.replace(/\/+$/, '')}/health`;
