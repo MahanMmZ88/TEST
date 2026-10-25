@@ -5,7 +5,6 @@
   "main": "server.js",
   "scripts": {
     "build": "npm install",
-    "prestart": "node -e \"try{require('express')}catch{require('child_process').execSync('npm install --omit=dev',{stdio:'inherit'})}\"",
     "start": "node server.js",
     "dev": "node --max-old-space-size=192 server.js"
   },
