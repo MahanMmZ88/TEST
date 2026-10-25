@@ -3,11 +3,25 @@
 پنل مدیریت کانفیگ‌های VLESS روی WebSocket/XHTTP، با موتور داخلی Node.js (بدون xray-core).
 سازگار با **Abasthan** و **Deplexo** — دو پلتفرمی که رفتار مخالفی دارند:
 
-| | Abasthan | Deplexo |
-|---|---|---|
-| بیلد | محیط **تمیز**؛ Build Command باید وابستگیها را نصب کند | Dockerfile؛ `npm ci` داخل ایمیج |
-| استارت | `npm start` → `PORT` تزریق خودکار | CMD ایمیج `node server.js` |
-| فایل سیستم | قابلنوشتن | **فقطخواندنی** + volume پایدار `/data` |
+| | Abasthan | Deplexo | Belmo (Coolify) |
+|---|---|---|---|
+| بیلد | محیط **تمیز**؛ Build Command باید وابستگیها را نصب کند | Dockerfile؛ `npm ci` داخل ایمیج | Dockerfile (توصیه) یا Nixpacks |
+| استارت | `npm start` → `PORT` تزریق خودکار | CMD ایمیج `node server.js` | `node server.js` / `npm start` |
+| فایل سیستم | قابلنوشتن | **فقطخواندنی** + volume پایدار `/data` | قابلنوشتن (موقت) |
+
+**ماتریس Build Command — خیلی مهم:**
+
+| پلتفرم | Build Command |
+|---|---|
+| Abasthan | `npm ci && npm run build` |
+| **Belmo / Coolify (Nixpacks)** | خالی یا `npm run build` |
+| **Belmo / Coolify (Dockerfile)** | خالی |
+| Deplexo | خالی |
+
+> ⚠️ هرگز `npm ci && npm run build`ـه Abasthan را روی Nixpacks/Coolify کپی نکنید؛
+> Nixpacks خودش `npm ci` را در فاز install اجرا میکند و `npm ci` دوم با کش
+> `/app/node_modules/.cache` برخورد میکند → `EBUSY` → بیلد fail.
+> `nixpacks.toml` این پروژه جلویش را میگیرد.
 
 برای همین `scripts/ensure-deps.js` وجود دارد: **فقط وقتی وابستگیها واقعاً کم باشند**
 `npm ci` میکند. روی Deplexo یک no-op است و هیچ `npm install`ای در استارتاپ اجرا نمیشود
@@ -45,6 +59,14 @@ npm start              # http://localhost:3000/  (admin / admin)
    `[INFO] Boot: ... | host = 0.0.0.0` — و هیچ `npm install`ای در runtime.
 
 جزئیات کامل: **[DEPLEXO_DEPLOY_GUIDE.md](DEPLEXO_DEPLOY_GUIDE.md)**.
+
+## دیپلوی روی Belmo (Coolify)
+
+**توصیه:** تو دشبورد Build Pack را بگذارید **Dockerfile**، `Ports Exposes = 3000`،
+و هر سه فیلد Install/Build/Start Command را **خالی** کنید. اگر Nixpacks ماند،
+فقط `npm run build` بگذارید (نه `npm ci && npm run build`) و بگذارید
+`nixpacks.toml` بقیه را انجام دهد. جزئیات و عیبیابی:
+**[BELMO_DEPLOY_GUIDE.md](BELMO_DEPLOY_GUIDE.md)**.
 
 ### نکات کلیدی
 

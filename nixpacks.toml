@@ -1,0 +1,38 @@
+# Belmo / Coolify — Nixpacks v1.41.0 build plan.
+# Docs: https://nixpacks.com/docs/configuration/file
+#
+# IMPORTANT: Coolify passes --build-cmd / --start-cmd from the dashboard.
+# CLI flags have the HIGHEST priority, so clear the "Build Command" and
+# "Start Command" fields in General to let this file fully apply.
+# Even if they are left set, the empty cacheDirectories below removes the
+# BuildKit mount at /app/node_modules/.cache, which is what makes a second
+# `npm ci` fail with:
+#   npm error EBUSY: resource busy or locked, rmdir '/app/node_modules/.cache'
+#
+# Merge order in Nixpacks (src/nixpacks/plan/generator.rs):
+#   provider < file < environment < CLI
+# A `Some([])` from this file overrides the provider's cacheDirectories.
+
+providers = ["node"]
+
+# NOTE: no [variables] section on purpose. Coolify already injects NODE_ENV,
+# NPM_CONFIG_PRODUCTION, NIXPACKS_* as build secrets; duplicating them here can
+# produce empty ARG/ENV lines because Coolify runs its own docker build and does
+# not pass Nixpacks' --build-arg values.
+
+# Install dependencies exactly once, from the committed lockfile.
+[phases.install]
+cmds = ["npm ci --omit=dev --no-audit --no-fund"]
+
+# No npm ci here. The install phase already did it, and an Abasthan-style
+# "npm ci && npm run build" is what broke Coolify/Nixpacks deploys.
+[phases.build]
+cmds = ["npm run build"]
+# The Node provider caches /app/node_modules/.cache during the build phase.
+# npm ci deletes node_modules, so that mount causes EBUSY. Disable it.
+cacheDirectories = []
+
+# Bypass npm lifecycle entirely at runtime: fewer processes, no prestart
+# surprises on a read-only filesystem. Dependencies are already in the image.
+[start]
+cmd = "node server.js"
