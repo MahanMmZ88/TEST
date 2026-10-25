@@ -20,7 +20,29 @@ const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide P
 const BUILD_ID = 'server-only-subscription-layout-2026-06-20-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'db.json');
+
+function resolveInitialDbPath() {
+  if (process.env.DB_PATH) return process.env.DB_PATH;
+  const defaultPath = path.join(__dirname, 'db.json');
+  try {
+    const testFile = path.join(__dirname, '.test-write-' + process.pid);
+    fs.writeFileSync(testFile, '');
+    fs.unlinkSync(testFile);
+    return defaultPath;
+  } catch (err) {
+    if (err.code === 'EROFS' || err.code === 'EACCES' || err.code === 'EPERM') {
+      const fallback = path.join(os.tmpdir(), 'db.json');
+      try {
+        if (fs.existsSync(defaultPath) && !fs.existsSync(fallback)) {
+          fs.copyFileSync(defaultPath, fallback);
+        }
+      } catch (_) {}
+      return fallback;
+    }
+    return defaultPath;
+  }
+}
+let DB_PATH = resolveInitialDbPath();
 
 const PASSWORD_SALT = 'MAHAN_PANEL_NODE_WS_SALT_v2';
 const CONNECT_TIMEOUT_MS = 15000;
@@ -335,6 +357,13 @@ function loadDB() {
       const parsed = JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
       DB.admin = parsed.admin || null;
       DB.users = Array.isArray(parsed.users) ? parsed.users.map(normalizeUser).filter(Boolean) : [];
+    } else {
+      const defaultPath = path.join(__dirname, 'db.json');
+      if (defaultPath !== DB_PATH && fs.existsSync(defaultPath)) {
+        const parsed = JSON.parse(fs.readFileSync(defaultPath, 'utf8'));
+        DB.admin = parsed.admin || null;
+        DB.users = Array.isArray(parsed.users) ? parsed.users.map(normalizeUser).filter(Boolean) : [];
+      }
     }
   } catch (err) {
     log('[DB] Load failed:', err.message);
@@ -346,15 +375,30 @@ function loadDB() {
   if (!Array.isArray(DB.users)) DB.users = [];
 
   scheduleSaveDB(true);
+  log('[DB] Database path:', DB_PATH);
   log('[DB] Loaded users:', String(DB.users.length));
 }
 
 function saveDBNow() {
   if (dbSaveTimer) clearTimeout(dbSaveTimer);
   dbSaveTimer = null;
-  const tmp = DB_PATH + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(DB, null, 2));
-  fs.renameSync(tmp, DB_PATH);
+  const writeTo = (targetPath) => {
+    const tmp = targetPath + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(DB, null, 2));
+    fs.renameSync(tmp, targetPath);
+  };
+  try {
+    writeTo(DB_PATH);
+  } catch (err) {
+    if ((err.code === 'EROFS' || err.code === 'EACCES') && !DB_PATH.startsWith(os.tmpdir())) {
+      const fallback = path.join(os.tmpdir(), 'db.json');
+      log('[DB] Read-only filesystem at', DB_PATH, '- switching to fallback at', fallback);
+      DB_PATH = fallback;
+      writeTo(DB_PATH);
+    } else {
+      throw err;
+    }
+  }
 }
 
 function scheduleSaveDB(immediate = false) {
