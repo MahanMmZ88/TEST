@@ -1,15 +1,17 @@
 {
   "name": "mahan-panel-vless-ws-node",
-  "version": "2.0.0",
+  "version": "2.0.1",
+  "private": true,
   "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
   "main": "server.js",
   "scripts": {
-    "build": "npm install",
     "start": "node server.js",
-    "dev": "node --max-old-space-size=192 server.js"
+    "dev": "node server.js",
+    "build": "node --check server.js",
+    "check": "node --check server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.3.0"
   },
   "dependencies": {
     "cookie-parser": "^1.4.6",
