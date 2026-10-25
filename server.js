@@ -20,7 +20,7 @@ const PORT = Number(process.env.PORT || 3000); // Railway/Koyeb/Render provide P
 const BUILD_ID = 'server-only-subscription-layout-2026-06-20-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
-const DB_PATH = path.join(__dirname, 'db.json');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'db.json');
 
 const PASSWORD_SALT = 'MAHAN_PANEL_NODE_WS_SALT_v2';
 const CONNECT_TIMEOUT_MS = 15000;
