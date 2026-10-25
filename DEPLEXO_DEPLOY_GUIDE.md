@@ -54,6 +54,14 @@ Deplexo استفاده میکرد، نه `Dockerfile`ای که در ریپو ب�
 5. فقط `/health` وجود داشت؛ استارترها و پروبهای Deplexo معمولاً `/healthz` را هم چک میکنند.
 6. پلن رایگان 128MB RAM است؛ هیت V8 و بافرهای 4MB×32 میتوانستند OOM بدهند.
 
+> 📌 **بهروزرسانی 2026-10-25 (نسخه 2.1.0):** بعداً برای رفع خطای `no_live_port`
+> روی **Abasthan** یک `prestart` **شرطی** اضافه شد (`scripts/ensure-deps.js`).
+> برخلاف `prestart: npm install` قدیمی، این یکی فقط زمانی `npm ci` اجرا میکند که
+> `express`/`ws`/... واقعاً نصب نباشند. چون ایمیج Deplexo هنگام بیلد `npm ci` کرده،
+> روی Deplexo صرفاً `[deps] OK` چاپ میشود و هیچ نوشتهای روی FS فقطخواندنی انجام
+> نمیشود؛ ضمن اینکه `deplexo.yaml` همچنان CMD ایمیج (`node server.js`) را بهکار
+> میگیرد و اصلاً وارد لایفسیکل npm نمیشود. جزئیات در `ABASTHAN_DEPLOY_GUIDE.md`.
+
 ---
 
 ## 2. تحقیق انجامشده (منابع رسمی)
@@ -84,9 +92,11 @@ Deplexo استفاده میکرد، نه `Dockerfile`ای که در ریپو ب�
 
 | فایل | تغییر |
 |---|---|
-| `deplexo.yaml` ⭐ | فایل جدید: `framework: dockerfile`، `run.port: 3000`، `run.command: ""`، `build.install/command: ""` تاOverrideهای قدیمی دشبورد خنثی شوند. |
-| `package.json` | حذف کامل `prestart`؛ `build` دیگر `npm install` نیست (فقط `node --check`)؛ `start` = `node server.js`؛ `engines` ≥ 20.3.0؛ `private: true`. |
-| `Dockerfile` | `node:22-alpine`؛ `npm ci --omit=dev` **بدون** فالبک `npm install`؛ `COPY` فقط فایلهای لازم؛ ایجاد `/data` با مالک `node` قبل از `USER node`؛ `DB_PATH=/data/db.json`؛ `HEALTHCHECK` با busybox wget؛ `CMD ["node","server.js"]`. |
+| `deplexo.yaml` ⭐ | فایل جدید: `framework: dockerfile`، `run.port: 3000`، `run.command: ""`؛ یعنی CMD ایمیج استفاده میشود و هیچ لایفسیکل npm (و در نتیجه هیچ `prestart`ای) اجرا نمیشود. |
+| `package.json` | `prestart` قدیمی (`npm install`) **حذف** شد. در نسخه 2.1.0 یک `prestart` **شرطی** (`node scripts/ensure-deps.js`) برگشت که فقط وقتی وابستگیها کم هستند نصب میکند — روی ایمیج Deplexo یک no-op است. `start` = `node server.js`؛ `engines` ≥ 20.3.0؛ `private: true`. |
+| `scripts/ensure-deps.js` ⭐ | بوتاسترپ وابستگیها برای Abasthan؛ روی Deplexo چون `node_modules` داخل ایمیج است، `[deps] OK` چاپ کرده و خارج میشود، بدون اجرای `npm install`. |
+| `Dockerfile` | `node:22-alpine`؛ `npm ci --omit=dev` **بدون** فالبک `npm install`؛ `COPY` فایلهای لازم + `scripts/`؛ ایجاد `/data` با مالک `node` قبل از `USER node`؛ `DB_PATH=/data/db.json`؛ `HEALTHCHECK` با busybox wget؛ `CMD ["node","server.js"]`. |
+| `Procfile` / `.node-version` | `web: npm start` و پین کردن Node 22 برای دیتکتور Abasthan؛ روی بیلد Dockerfile بیتأثیرند. |
 | `.dockerignore` | حذف `.git`، `node_modules`، لاگها، `.env`، فایلهای md و کانفیگ از build context (ولی `db.json` و `public/` حفظ شدند). |
 | `.env.example` ⭐ | مستندسازی `PORT`، `DB_PATH`، `DB_FALLBACK_PATHS`، `KEEPALIVE_ENABLED` و تیونینگ حافظه. |
 | `.gitignore` | اضافه شدن `.env`، `*.log`، `.DS_Store`. |

@@ -1,13 +1,14 @@
 {
   "name": "mahan-panel-vless-ws-node",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "private": true,
   "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
   "main": "server.js",
   "scripts": {
+    "prestart": "node scripts/ensure-deps.js",
     "start": "node server.js",
     "dev": "node server.js",
-    "build": "node --check server.js",
+    "build": "node scripts/ensure-deps.js && node --check server.js",
     "check": "node --check server.js"
   },
   "engines": {

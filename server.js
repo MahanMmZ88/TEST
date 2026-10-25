@@ -3620,6 +3620,17 @@ app.get('/panel', (req, res) => {
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 
 const server = http.createServer(app);
+
+// Fail loudly and immediately if the port cannot be opened. Without this
+// handler the global uncaughtException listener only logs the error, the
+// process stays alive with NO listening socket, and platforms such as
+// Abasthan wait ~120s before reporting `no_live_port`.
+server.on('error', (err) => {
+  log('[FATAL] HTTP server cannot listen on 0.0.0.0:' + String(PORT) + ':',
+    err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: MAX_WS_PAYLOAD });
 
 server.on('upgrade', (req, socket, head) => {
@@ -4118,6 +4129,11 @@ process.on('unhandledRejection', (err) => log('[ERROR] Unhandled:', err && err.s
 
 loadDB();
 server.listen(PORT, '0.0.0.0', () => {
+  // Abasthan injects PORT; Deplexo injects it from `run.port`; local dev uses
+  // the 3000 fallback. Printing it makes the port scan result unambiguous.
+  log('[INFO] Boot: node ' + process.version +
+      ' | PORT env = ' + (process.env.PORT || '(unset)') +
+      ' | resolved = ' + String(PORT) + ' | host = 0.0.0.0');
   log('[INFO] Mahan Panel VLESS-WS/XHTTP active on 0.0.0.0:' + String(PORT));
   log('[INFO] WS path:', WS_PATH);
   log('[INFO] XHTTP path:', XHTTP_PATH);

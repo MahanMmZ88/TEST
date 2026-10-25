@@ -4,16 +4,19 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Install dependencies at BUILD time only. Never run npm install at startup:
-# npm would try to rewrite /app/package-lock.json and fail with EROFS.
-# npm ci (not npm install) keeps the committed lockfile authoritative.
+# Install dependencies at BUILD time only. `npm run start` must never need to
+# install anything here: npm would try to rewrite /app/package-lock.json and
+# fail with EROFS. npm ci (not npm install) keeps the lockfile authoritative.
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
-# Application code, seed database and static assets (read-only at runtime).
+# Application code, seed database, static assets and the dependency guard.
+# scripts/ is included so `prestart` is a harmless no-op even if a stale
+# dashboard "npm start" override is used instead of the image CMD.
 COPY server.js ./
 COPY db.json ./
 COPY public ./public
+COPY scripts ./scripts
 
 # Deplexo mounts a persistent named volume at /data. Creating the directory in
 # the image with the runtime user's ownership lets Docker initialize a fresh
