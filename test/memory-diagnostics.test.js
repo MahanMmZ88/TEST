@@ -63,12 +63,12 @@ function websocketUpgradeStatus(port) {
   });
 }
 
-async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true } = {}) {
+async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, users = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-memory-diagnostics-'));
   const dbPath = path.join(dir, 'db.json');
   const snapshot = path.join(dir, 'memory.json');
   const passwordHash = crypto.createHash('sha256').update('fixtureMAHAN_PANEL_NODE_WS_SALT_v2').digest('hex');
-  fs.writeFileSync(dbPath, JSON.stringify({ admin: { username: 'fixture', password_hash: passwordHash }, users: [] }));
+  fs.writeFileSync(dbPath, JSON.stringify({ admin: { username: 'fixture', password_hash: passwordHash }, users }));
   function setUsage(nextUsedMb) {
     const temp = `${snapshot}.tmp`;
     fs.writeFileSync(temp, JSON.stringify({ usedMb: nextUsedMb, limitMb }));
@@ -77,7 +77,8 @@ async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true } = {
   setUsage(usedMb);
   const port = await freePort();
   const child = spawn(process.execPath, [
-    '--require', path.join(__dirname, 'helpers/mock-memory-guard.js'), path.join(ROOT, 'server.js')
+    '--require', path.join(__dirname, 'helpers/mock-memory-guard.js'),
+    '--require', path.join(__dirname, 'helpers/loopback.js'), path.join(ROOT, 'server.js')
   ], {
     cwd: ROOT,
     env: {
@@ -132,12 +133,78 @@ async function stats(port, cookie) {
   return JSON.parse(result.body);
 }
 
+function captureBytes(stream, event) {
+  let data = Buffer.alloc(0);
+  let ended = null;
+  const waiters = [];
+  const settle = () => {
+    for (let i = waiters.length - 1; i >= 0; i--) {
+      const waiter = waiters[i];
+      if (data.length >= waiter.length) {
+        waiters.splice(i, 1);
+        waiter.resolve(data.subarray(0, waiter.length));
+      } else if (ended) {
+        waiters.splice(i, 1);
+        waiter.reject(ended);
+      }
+    }
+  };
+  stream.on(event, (chunk) => { data = Buffer.concat([data, Buffer.from(chunk)]); settle(); });
+  stream.on('close', () => { ended = new Error('stream closed before expected echo'); settle(); });
+  stream.on('error', (err) => { ended = err; settle(); });
+  return (length) => {
+    if (data.length >= length) return Promise.resolve(data.subarray(0, length));
+    if (ended) return Promise.reject(ended);
+    return new Promise((resolve, reject) => waiters.push({ length, resolve, reject }));
+  };
+}
+
+async function echoTarget(t) {
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('error', () => {});
+    socket.on('data', (data) => socket.write(data));
+    socket.on('close', () => sockets.delete(socket));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { for (const socket of sockets) socket.destroy(); server.close(); });
+  return server.address().port;
+}
+
+function vlessHeader(port) {
+  const uuid = Buffer.from('11111111111111111111111111111111', 'hex');
+  const name = Buffer.from('target.test');
+  const p = Buffer.alloc(2);
+  p.writeUInt16BE(port);
+  return Buffer.concat([Buffer.from([0]), uuid, Buffer.from([0, 1]), p, Buffer.from([2, name.length]), name]);
+}
+
+function downlink(port, sid) {
+  let req;
+  const response = new Promise((resolve, reject) => {
+    req = http.get({ host: '127.0.0.1', port, path: `/xhttp/${sid}` }, resolve);
+    req.on('error', reject);
+  });
+  response.catch(() => {});
+  return { response, destroy: () => req.destroy() };
+}
+
+function timeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timeout: ${label}`)), ms); })
+  ]).finally(() => clearTimeout(timer));
+}
+
 test('memory diagnostics', async (suite) => {
   await suite.test('dashboard reports the constrained cgroup rather than host RAM on a 1 GiB plan', async (t) => {
     const panel = await launchPanel(t);
     const snapshot = await health(panel.port);
     const dashboard = await stats(panel.port, await login(panel.port));
-    assert.equal(snapshot.build, 'memstats-2026-10-27-a');
+    assert.equal(snapshot.build, 'stability-2026-10-27-a');
     assert.equal(snapshot.low_memory_mode, false);
     assert.equal(snapshot.memory_guard.used_mb, 300);
     assert.equal(snapshot.memory_guard.limit_mb, 1024);
@@ -186,6 +253,50 @@ test('memory diagnostics', async (suite) => {
     assert.equal(snapshot.memory_guard.active, false);
     assert.ok(['proc-meminfo', 'cgroup-v2-raw', 'cgroup-v1-raw', 'os'].includes(dashboard.ram_source));
     assert.ok(dashboard.ram_total > 0);
+  });
+
+  await suite.test('hard pressure preserves established WS and XHTTP traffic while refusing new sessions', async (t) => {
+    const users = [{ id: 'pressure-user', remark: 'test', uuid: '11111111111111111111111111111111',
+      is_active: 1, traffic_limit: 0, connection_limit: 0 }];
+    const panel = await launchPanel(t, { users });
+    const port = await echoTarget(t);
+    const before = Buffer.from('before');
+    const after = Buffer.from('after');
+    const expectedBefore = Buffer.concat([Buffer.from([0, 0]), before]);
+    const expectedAll = Buffer.concat([expectedBefore, after]);
+
+    const ws = new WebSocket(`ws://127.0.0.1:${panel.port}/ws`);
+    t.after(() => ws.terminate());
+    const wsBytes = captureBytes(ws, 'message');
+    await timeout(once(ws, 'open'), 3000, 'WS before pressure');
+    ws.send(Buffer.concat([vlessHeader(port), before]));
+    assert.deepEqual(await timeout(wsBytes(expectedBefore.length), 3000, 'WS first echo'), expectedBefore);
+
+    const sid = 'pressure-existing-session';
+    const get = downlink(panel.port, sid);
+    t.after(get.destroy);
+    const post = await request(panel.port, 'POST', `/xhttp/${sid}/0`, Buffer.concat([vlessHeader(port), before]));
+    assert.equal(post.status, 200);
+    const res = await timeout(get.response, 3000, 'XHTTP before pressure');
+    t.after(() => res.destroy());
+    const xhttpBytes = captureBytes(res, 'data');
+    assert.deepEqual(await timeout(xhttpBytes(expectedBefore.length), 3000, 'XHTTP first echo'), expectedBefore);
+
+    panel.setUsage(860);
+    let current;
+    for (let i = 0; i < 50; i++) {
+      current = await health(panel.port);
+      if (current.memory_guard.state === 'hard') break;
+      await delay(20);
+    }
+    assert.equal(current.memory_guard.state, 'hard');
+    assert.equal(await websocketUpgradeStatus(panel.port), 503);
+    assert.equal((await request(panel.port, 'GET', '/xhttp/new-pressure-session')).status, 503);
+    ws.send(after);
+    assert.equal((await request(panel.port, 'POST', `/xhttp/${sid}/1`, after)).status, 200);
+    assert.deepEqual(await timeout(wsBytes(expectedAll.length), 3000, 'WS echo during pressure'), expectedAll);
+    assert.deepEqual(await timeout(xhttpBytes(expectedAll.length), 3000, 'XHTTP echo during pressure'), expectedAll);
+    assert.equal(ws.readyState, WebSocket.OPEN);
   });
 
   await suite.test('a simulated 84% cgroup reading enters hard pressure and rejects new WS/XHTTP attempts', async (t) => {

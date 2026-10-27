@@ -26,7 +26,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'memstats-2026-10-27-a';
+const BUILD_ID = 'stability-2026-10-27-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
@@ -162,7 +162,9 @@ function storageMode(dbPath) {
 const PASSWORD_SALT = 'MAHAN_PANEL_NODE_WS_SALT_v2';
 const CONNECT_TIMEOUT_MS = 15000;
 const IDLE_TIMEOUT_MS = 120000;
-const MAX_FIRST_PACKET = 128 * 1024;
+// Largest possible VLESS header (including 255-byte options and hostname).
+// Payloads are limited separately by the WebSocket and XHTTP transport caps.
+const MAX_VLESS_HEADER_BYTES = 1 + 16 + 1 + 255 + 1 + 2 + 1 + 1 + 255;
 const MAX_WS_PAYLOAD = lowMemCap(envNumber('MAX_WS_PAYLOAD', 8 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), 1024 * 1024);
 const WS_BACKPRESSURE_LIMIT = lowMemCap(envNumber('WS_BACKPRESSURE_LIMIT', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), LOW_WS_LIMIT);
 const WS_BACKPRESSURE_RESUME = LOW_MEMORY_MODE ? LOW_WS_RESUME : 1 * 1024 * 1024;
@@ -208,14 +210,13 @@ const ACTIVE_CLIENT_SPLIT_STABLE_MS = Math.max(2000, Number(process.env.ACTIVE_C
 const ACTIVE_CLIENT_CLOSE_GRACE_MS = Math.max(100, Number(process.env.ACTIVE_CLIENT_CLOSE_GRACE_MS || 500));
 // Cohort tuning: /23 fixes mobile/PaaS IP pool flips like 31.171.100.x <-> 31.171.101.x.
 const ACTIVE_CLIENT_IPV4_PREFIX = Math.max(16, Math.min(32, Number(process.env.ACTIVE_CLIENT_IPV4_PREFIX || 23)));
-// For WS, a single client can leave multiple zombie/reconnect sockets in the same cohort.
-// Keep a small number of newest sockets and close older duplicates after a short grace.
+// Legacy WS cohort knobs are retained for compatibility; open parallel WS
+// streams are not evicted merely because they share an endpoint.
 const WS_MAX_CONNECTIONS_PER_COHORT = Math.max(1, Number(process.env.WS_MAX_CONNECTIONS_PER_COHORT || 2));
 const WS_DUPLICATE_CLOSE_GRACE_MS = Math.max(250, Number(process.env.WS_DUPLICATE_CLOSE_GRACE_MS || 1500));
-// XHTTP raw request/session limiter: keeps packet-up bursts from accumulating many
-// stale server-side sessions while preserving the newest/active streams.
-// Keep the normal XHTTP concurrency even on small plans: trimming live
-// streams would look like a disconnect. Memory is bounded per stream instead.
+// Legacy XHTTP cohort thresholds apply only to already-closed stale entries;
+// a healthy session is never evicted for exceeding the cohort size. Memory
+// guard admission and per-stream buffer limits still apply.
 const XHTTP_MAX_CONNECTIONS_PER_COHORT = Math.max(2, Number(process.env.XHTTP_MAX_CONNECTIONS_PER_COHORT || 8));
 const XHTTP_MIN_IDLE_BEFORE_TRIM_MS = Math.max(5000, Number(process.env.XHTTP_MIN_IDLE_BEFORE_TRIM_MS || 15000));
 // Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
@@ -708,6 +709,13 @@ function removeConnection(userId, connectionId, reason = 'removed') {
   return existed;
 }
 
+function connectionTransportIsOpen(conn) {
+  // A quiet but open tunnel is not stale. Unknown transport state must not
+  // cause an otherwise valid connection to be closed solely for inactivity.
+  if (typeof conn?.isOpen !== 'function') return true;
+  try { return Boolean(conn.isOpen()); } catch (_) { return true; }
+}
+
 function pruneStaleConnections(userId, maxAge = ACTIVE_CONNECTION_STALE_MS) {
   const map = activeConnections.get(userId);
   if (!map) return 0;
@@ -715,7 +723,7 @@ function pruneStaleConnections(userId, maxAge = ACTIVE_CONNECTION_STALE_MS) {
   const now = Date.now();
   let removed = 0;
   for (const conn of Array.from(map.values())) {
-    if (now - conn.lastSeen > maxAge) {
+    if (now - conn.lastSeen > maxAge && !connectionTransportIsOpen(conn)) {
       try { conn.closeFn('connection stale'); } catch (_) {}
       if (removeConnection(userId, conn.id, 'stale')) removed += 1;
     }
@@ -1235,6 +1243,17 @@ function trimXhttpCohortConnections(userId) {
   const map = activeConnections.get(userId);
   if (!map) return 0;
   const now = Date.now();
+  // Most sessions are open. Avoid sorting every large live cohort twice a
+  // second just to discover there is nothing eligible for cleanup.
+  let hasClosedCandidate = false;
+  for (const conn of map.values()) {
+    if (conn.kind === 'xhttp' && !connectionTransportIsOpen(conn) &&
+        now - Number(conn.lastDataAt || conn.createdAt || 0) >= XHTTP_MIN_IDLE_BEFORE_TRIM_MS) {
+      hasClosedCandidate = true;
+      break;
+    }
+  }
+  if (!hasClosedCandidate) return 0;
   const groups = new Map();
 
   for (const conn of map.values()) {
@@ -1247,7 +1266,8 @@ function trimXhttpCohortConnections(userId) {
   for (const [clientKey, conns] of groups.entries()) {
     if (conns.length <= XHTTP_MAX_CONNECTIONS_PER_COHORT) continue;
 
-    // Keep newest / recently data-active streams first. Trim only old idle sessions.
+    // Keep newest / recently data-active streams first. A long-lived quiet
+    // session is still valid: only trim one whose transport is already closed.
     const rankedNewest = conns.slice().sort((a, b) => {
       const aActive = Number(a.lastDataAt || a.createdAt || 0);
       const bActive = Number(b.lastDataAt || b.createdAt || 0);
@@ -1257,7 +1277,8 @@ function trimXhttpCohortConnections(userId) {
     const protectedIds = new Set(rankedNewest.slice(0, XHTTP_MAX_CONNECTIONS_PER_COHORT).map((conn) => conn.id));
     const candidates = rankedNewest
       .slice(XHTTP_MAX_CONNECTIONS_PER_COHORT)
-      .filter((conn) => now - Number(conn.lastDataAt || conn.createdAt || 0) >= XHTTP_MIN_IDLE_BEFORE_TRIM_MS)
+      .filter((conn) => !connectionTransportIsOpen(conn) &&
+        now - Number(conn.lastDataAt || conn.createdAt || 0) >= XHTTP_MIN_IDLE_BEFORE_TRIM_MS)
       .sort((a, b) => Number(a.lastDataAt || a.createdAt || 0) - Number(b.lastDataAt || b.createdAt || 0));
 
     let currentSize = conns.length;
@@ -1308,6 +1329,7 @@ function registerConnection(userId, closeFn, meta = {}) {
     clientKey: deviceKey,
     kind: String(meta.kind || deviceMeta.transport || 'unknown'),
     closeFn,
+    isOpen: typeof meta.isOpen === 'function' ? meta.isOpen : null,
     createdAt: Date.now(),
     lastSeen: Date.now(),
     lastDataAt: 0,
@@ -1653,10 +1675,13 @@ function trimBoosterDnsCache() {
 function sortBoosterAddresses(addresses, profile, family = 0, host = '', port = 0) {
   const mem = getDestinationMemory(host, port, false);
   cleanBadAddresses(mem);
-  const source = (Array.isArray(addresses) ? addresses.slice() : []).filter((a) => a && a.address);
+  const wantedFamily = Number(family || 0);
+  const source = (Array.isArray(addresses) ? addresses.slice() : []).filter((a) =>
+    a && a.address && (!(wantedFamily === 4 || wantedFamily === 6) || Number(a.family || net.isIP(a.address)) === wantedFamily));
   let list = source.filter((a) => !isAddressTemporarilyBad(mem, a.address));
   if (!list.length) list = source;
-  const wantedFamily = Number(family || 0);
+  // A requested address family is a constraint, not a preference. In
+  // particular, udp4 cannot send an IPv6 answer selected by round-robin.
   const preferredFamily = wantedFamily || Number(mem?.preferredFamily || 0);
 
   if (preferredFamily === 4 || preferredFamily === 6) {
@@ -1698,6 +1723,15 @@ function selectBoosterAddress(entry, profile, family = 0, port = 0) {
   return sorted[idx];
 }
 
+function safeBoosterAddresses(records, port) {
+  return (Array.isArray(records) ? records : []).map((record) => {
+    const address = normalizeIpAddress(record?.address);
+    // Normalization can turn an IPv4-mapped IPv6 answer into IPv4, so trust
+    // the resulting address rather than the original DNS family field.
+    return { address, family: net.isIP(address) };
+  }).filter((record) => record.family && !isForbiddenTarget(record.address, port) && !isPrivateOrProxyIp(record.address));
+}
+
 function makeSmartDnsLookup(port, profile) {
   return (hostname, options, callback) => {
     const cb = typeof callback === 'function' ? callback : options;
@@ -1715,19 +1749,18 @@ function makeSmartDnsLookup(port, profile) {
     const cached = getCachedBoosterAddresses(host);
     if (cached) {
       const addresses = sortBoosterAddresses(cached.addresses, profile, family, host, port);
-      if (opts.all) return cb(null, addresses);
+      if (opts.all && addresses.length) return cb(null, addresses);
       const selected = selectBoosterAddress(cached, profile, family, port);
       if (selected) return cb(null, selected.address, selected.family);
     }
 
     dns.lookup(host, { all: true, verbatim: false }).then((records) => {
-      const safe = records
-        .map((r) => ({ address: normalizeIpAddress(r.address), family: Number(r.family || net.isIP(r.address)) }))
-        .filter((r) => r.address && r.family && !isForbiddenTarget(r.address, port) && !isPrivateOrProxyIp(r.address));
+      const safe = safeBoosterAddresses(records, port);
 
       if (!safe.length) throw new Error(`no public address for ${host}`);
       const entry = setCachedBoosterAddresses(host, safe);
       const addresses = sortBoosterAddresses(entry.addresses, profile, family, host, port);
+      if (!addresses.length) throw new Error(`no public address for requested family ${family}: ${host}`);
       if (opts.all) return cb(null, addresses);
       const selected = selectBoosterAddress(entry, profile, family, port) || addresses[0];
       return cb(null, selected.address, selected.family);
@@ -1755,9 +1788,7 @@ function resolveBoostedAddress(hostname, port, profile = BOOSTER_PROFILE_BALANCE
   }
 
   return dns.lookup(host, { all: true, verbatim: false }).then((records) => {
-    const safe = records
-      .map((r) => ({ address: normalizeIpAddress(r.address), family: Number(r.family || net.isIP(r.address)) }))
-      .filter((r) => r.address && r.family && !isForbiddenTarget(r.address, port) && !isPrivateOrProxyIp(r.address));
+    const safe = safeBoosterAddresses(records, port);
     if (!safe.length) throw new Error(`no public address for ${host}`);
     const entry = setCachedBoosterAddresses(host, safe);
     const selected = selectBoosterAddress(entry, profile, family, port);
@@ -1766,12 +1797,76 @@ function resolveBoostedAddress(hostname, port, profile = BOOSTER_PROFILE_BALANCE
   });
 }
 
-function getUdpSocketFamily(socket, host = '') {
-  try {
-    if (socket && typeof socket.type === 'function') return socket.type() === 'udp6' ? 6 : 4;
-  } catch (_) {}
-  const ipFamily = net.isIP(host);
-  return ipFamily === 6 ? 6 : 4;
+function createBoostedUdpTransport(host, port, profile, { onMessage, onError, onClose } = {}) {
+  let socket = null;
+  let ready = null;
+  let closed = false;
+  let pendingBytes = 0;
+  let pendingPackets = 0;
+  const maxPendingBytes = LOW_MEMORY_MODE ? 128 * 1024 : 1024 * 1024;
+  const maxPendingPackets = LOW_MEMORY_MODE ? 256 : 512;
+
+  function ensureSocket() {
+    if (ready) return ready;
+    const literalFamily = net.isIP(host);
+    // Prefer IPv4 for dual-stack names on typical PaaS networks, but an
+    // IPv6-only name must get an actual udp6 socket rather than a mismatched
+    // udp4 send. Both resolutions retain the same public-address checks.
+    const firstFamily = literalFamily === 6 ? 6 : 4;
+    let address = resolveBoostedAddress(host, port, profile, firstFamily);
+    if (!literalFamily) address = address.catch(() => closed ? null : resolveBoostedAddress(host, port, profile, 6));
+    ready = address.then((resolved) => {
+      if (closed) return null;
+      const family = net.isIP(resolved);
+      socket = dgram.createSocket(family === 6 ? 'udp6' : 'udp4');
+      socket.on('message', (message) => { if (!closed) onMessage?.(message); });
+      socket.on('error', (err) => { if (!closed) onError?.(err); });
+      socket.on('close', () => { if (!closed) onClose?.(); });
+      return { socket, family };
+    });
+    return ready;
+  }
+
+  return {
+    send(packet) {
+      // DNS and OS sends are asynchronous. Bound retained datagrams while a
+      // lookup/socket is slow; dropping UDP is preferable to unbounded memory.
+      if (closed || pendingPackets >= maxPendingPackets || pendingBytes + packet.length > maxPendingBytes) {
+        return Promise.resolve(false);
+      }
+      // The parser may pass a view into a much larger WS/HTTP buffer. Copy the
+      // datagram so a small pending packet cannot retain the whole frame.
+      const payload = Buffer.from(packet);
+      pendingPackets += 1;
+      pendingBytes += payload.length;
+      return ensureSocket().then(async (target) => {
+        if (!target || closed) return false;
+        const address = await resolveBoostedAddress(host, port, profile, target.family);
+        if (closed) return false;
+        return new Promise((resolve, reject) => {
+          try {
+            target.socket.send(payload, port, address, (err) => {
+              if (err) {
+                err.udpAddress = address;
+                reject(err);
+              } else resolve(true);
+            });
+          } catch (err) {
+            err.udpAddress = address;
+            reject(err);
+          }
+        });
+      }).finally(() => {
+        pendingPackets -= 1;
+        pendingBytes -= payload.length;
+      });
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      closeUdpSocket(socket);
+    }
+  };
 }
 
 function createUdpBurstState() {
@@ -1839,12 +1934,17 @@ function createBoostedTcpConnection(host, port, profile = BOOSTER_PROFILE_BALANC
   return socket;
 }
 
+function incompleteVlessRequest(message) {
+  const err = new Error(message);
+  err.code = 'VLESS_INCOMPLETE';
+  return err;
+}
+
 function parseVlessRequest(buffer, options = {}) {
   const allowUdp = options.allowUdp === true;
   const allowMux = options.allowMux === true;
   if (!Buffer.isBuffer(buffer)) buffer = Buffer.from(buffer);
-  if (buffer.length < 24) throw new Error(`request too short: ${buffer.length}`);
-  if (buffer.length > MAX_FIRST_PACKET) throw new Error(`first packet too large: ${buffer.length}`);
+  if (buffer.length < 18) throw incompleteVlessRequest(`request too short: ${buffer.length}`);
 
   let offset = 0;
   const version = buffer[offset++];
@@ -1854,7 +1954,7 @@ function parseVlessRequest(buffer, options = {}) {
   offset += 16;
 
   const optLen = buffer[offset++];
-  if (buffer.length < offset + optLen + 4) throw new Error('invalid options length');
+  if (buffer.length < offset + optLen + 1) throw incompleteVlessRequest('incomplete options or command');
   offset += optLen;
 
   const command = buffer[offset++];
@@ -1864,28 +1964,31 @@ function parseVlessRequest(buffer, options = {}) {
   if (command === 0x02 && !allowUdp) {
     throw new Error('UDP is not supported on this transport yet; use WebSocket UDP or disable UDP/xudp in client');
   }
+  // A MUX request has no port or address. Its complete header can be 19 bytes.
   if (command === 0x03) {
     if (!allowMux) throw new Error('MUX is not supported on this transport yet; disable MUX in client');
     return { version, user, command, host: 'v1.mux.cool', port: 0, payload: buffer.subarray(offset) };
   }
 
+  if (buffer.length < offset + 3) throw incompleteVlessRequest('incomplete port or address type');
   const port = buffer.readUInt16BE(offset);
   offset += 2;
   const addressType = buffer[offset++];
   let host;
 
   if (addressType === 0x01) {
-    if (buffer.length < offset + 4) throw new Error('invalid ipv4 address');
+    if (buffer.length < offset + 4) throw incompleteVlessRequest('incomplete ipv4 address');
     host = `${buffer[offset]}.${buffer[offset + 1]}.${buffer[offset + 2]}.${buffer[offset + 3]}`;
     offset += 4;
   } else if (addressType === 0x02) {
-    if (buffer.length < offset + 1) throw new Error('invalid domain length');
+    if (buffer.length < offset + 1) throw incompleteVlessRequest('incomplete domain length');
     const len = buffer[offset++];
-    if (len === 0 || buffer.length < offset + len) throw new Error('invalid domain');
+    if (len === 0) throw new Error('invalid domain');
+    if (buffer.length < offset + len) throw incompleteVlessRequest('incomplete domain');
     host = buffer.subarray(offset, offset + len).toString('utf8');
     offset += len;
   } else if (addressType === 0x03) {
-    if (buffer.length < offset + 16) throw new Error('invalid ipv6 address');
+    if (buffer.length < offset + 16) throw incompleteVlessRequest('incomplete ipv6 address');
     const parts = [];
     for (let i = 0; i < 8; i++) parts.push(buffer.readUInt16BE(offset + i * 2).toString(16));
     host = parts.join(':');
@@ -2014,8 +2117,9 @@ function drainUdpPackets(state, chunk, onPacket) {
     state.buffer = state.buffer.subarray(2 + packetLen);
     onPacket(packet);
   }
-  // Empty subarrays otherwise keep the last (possibly large) input buffer alive.
-  if (!state.buffer.length) state.buffer = Buffer.alloc(0);
+  // Even an incomplete datagram may be a small view into a large input frame.
+  // Keep only the bounded remainder rather than retaining the whole frame.
+  state.buffer = state.buffer.length ? Buffer.from(state.buffer) : Buffer.alloc(0);
 }
 
 function decodeEarlyDataFromProtocolHeader(header) {
@@ -2243,7 +2347,17 @@ class XHttpSession {
     this.hardPaceBytes = 0;
     this.hardPauseUntil = 0;
     this.unregisterPressure = memoryGuard.register(() => this.pumpDownlink());
-    this.cleanupTimer = setTimeout(() => this.close('session timeout'), XHTTP_SESSION_TIMEOUT_MS);
+    this.cleanupTimer = setTimeout(() => {
+      // The timeout still cleans up incomplete or detached sessions. An
+      // established session with an open downlink is not dead just because no
+      // application bytes have moved for a while.
+      if (!this.closed && this.established && this.downlinkRes &&
+          !this.downlinkRes.writableEnded && !this.downlinkRes.destroyed) {
+        this.cleanupTimer.refresh();
+        return;
+      }
+      this.close('session timeout');
+    }, XHTTP_SESSION_TIMEOUT_MS);
   }
 
   xhttpPressureLimit() {
@@ -2319,23 +2433,10 @@ class XHttpSession {
         this.aliveTimer = null;
         return;
       }
-      // Refresh lastSeen on ALL cohort connections so that trimming one
-      // specific connection (by trimXhttpCohortConnections) does NOT break
-      // the keepalive for the remaining connections. Without this, the
-      // ACTIVE_CONNECTION_STALE_MS=60s check in the cleanup interval
-      // prunes all connections ~60s after the referenced connection is
-      // trimmed, because unregisterConnection.touch() becomes a no-op.
-      // Dashboard online/offline is driven by real traffic packets
-      // (touchData), not by this keepalive.
-      if (this.user && this.clientKey) {
-        const connMap = activeConnections.get(this.user.id);
-        if (connMap) {
-          const now = Date.now();
-          for (const c of connMap.values()) {
-            if (c.clientKey === this.clientKey) c.lastSeen = now;
-          }
-        }
-      }
+      // Refresh only this session's transport liveness, not dashboard traffic.
+      // Touching an entire cohort from every session scales quadratically when
+      // a client opens many simultaneous XHTTP streams.
+      this.unregisterConnection?.touchLiveness?.();
     }, 1000);
 
     res.on('close', () => {
@@ -2392,8 +2493,9 @@ class XHttpSession {
             this.pendingPackets.delete(seq);
             this.nextSeq += 1;
             try {
-              if (seq === 0) await this.initialize(packet);
-              else await this.writeToRemote(packet);
+              // Packet boundaries need not coincide with the VLESS header.
+              // Reassemble it in sequence before forwarding later payloads.
+              await this._processStreamChunk(packet);
             } finally {
               xhttpQueuedPacketBytes = Math.max(0, xhttpQueuedPacketBytes - packet.length);
             }
@@ -2420,18 +2522,16 @@ class XHttpSession {
       return;
     }
 
-    this.streamInitBuffer = this.streamInitBuffer.length ? Buffer.concat([this.streamInitBuffer, chunk]) : Buffer.from(chunk);
-    if (this.streamInitBuffer.length > MAX_FIRST_PACKET) throw new Error('stream-up first packet too large');
-
+    const initial = this.streamInitBuffer.length ? Buffer.concat([this.streamInitBuffer, chunk]) : chunk;
     try {
-      await this.initialize(this.streamInitBuffer, { allowIncomplete: true });
+      await this.initialize(initial, { allowIncomplete: true });
       this.streamInitBuffer = Buffer.alloc(0);
     } catch (err) {
-      const msg = err && err.message ? err.message : '';
-      const incomplete = msg.includes('too short') || msg.includes('invalid options length') ||
-        msg.includes('invalid ipv4') || msg.includes('invalid domain length') ||
-        msg.includes('invalid domain') || msg.includes('invalid ipv6');
-      if (incomplete && !this.closed) return;
+      if (err.code === 'VLESS_INCOMPLETE' && !this.closed && initial.length < MAX_VLESS_HEADER_BYTES) {
+        // Retain only a bounded incomplete header, never an unbounded upload.
+        this.streamInitBuffer = Buffer.from(initial);
+        return;
+      }
       throw err;
     }
   }
@@ -2443,11 +2543,7 @@ class XHttpSession {
     try {
       request = parseVlessRequest(firstPacket, { allowUdp: true, allowMux: true });
     } catch (err) {
-      const msg = err && err.message ? err.message : '';
-      const incomplete = msg.includes('too short') || msg.includes('invalid options length') ||
-        msg.includes('invalid ipv4') || msg.includes('invalid domain length') ||
-        msg.includes('invalid domain') || msg.includes('invalid ipv6');
-      if (!options.allowIncomplete || !incomplete) this.close('bad vless request');
+      if (!(options.allowIncomplete && err.code === 'VLESS_INCOMPLETE')) this.close('bad vless request');
       throw err;
     }
 
@@ -2461,7 +2557,10 @@ class XHttpSession {
       this.close('client limit exceeded');
       throw new Error('client limit exceeded');
     }
-    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), { ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp', deviceMeta });
+    this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), {
+      ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp', deviceMeta,
+      isOpen: () => !this.closed
+    });
     this.clientKey = this.unregisterConnection.clientKey || this.clientKey;
     log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)} device=${this.clientKey}`);
 
@@ -2488,22 +2587,23 @@ class XHttpSession {
       this.established = true;
       this.flushDownlink();
 
-      const udpType = request.host.includes(':') ? 'udp6' : 'udp4';
-      this.udpSocket = dgram.createSocket(udpType);
-      this.udpSocket.on('message', (msg) => {
-        this.touchData();
-        try {
-          this.sendDownlink(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
-        } catch (err) {
-          log('[XHTTP UDP] Encode failed:', err.message);
-          this.close('udp encode failed');
-        }
+      this.udpSocket = createBoostedUdpTransport(request.host, request.port, this.boosterProfile, {
+        onMessage: (msg) => {
+          this.touchData();
+          if (this.udpIdleTimer?.refresh) this.udpIdleTimer.refresh();
+          try {
+            this.sendDownlink(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
+          } catch (err) {
+            log('[XHTTP UDP] Encode failed:', err.message);
+            this.close('udp encode failed');
+          }
+        },
+        onError: (err) => {
+          log('[XHTTP UDP] Error:', err && err.message ? err.message : 'unknown');
+          this.close('udp error');
+        },
+        onClose: () => this.close('udp closed')
       });
-      this.udpSocket.on('error', (err) => {
-        log('[XHTTP UDP] Error:', err && err.message ? err.message : 'unknown');
-        this.close('udp error');
-      });
-      this.udpSocket.on('close', () => this.close('udp closed'));
       this.udpIdleTimer = setTimeout(() => this.close('udp idle timeout'), this.boosterProfile.udpIdleTimeoutMs || UDP_IDLE_TIMEOUT_MS);
 
       return request.payload.length ? this.writeToRemote(request.payload) : Promise.resolve();
@@ -2531,6 +2631,9 @@ class XHttpSession {
       this.remote.once('connect', () => {
         if (this.closed || settled) return;
         clearTimeout(this.connectTimer);
+        // Keepalive/close events detect dead peers. A connected TCP socket can
+        // legitimately be quiet longer than a destination profile's idle time.
+        this.remote.setTimeout(0);
         this.established = true;
         this.flushDownlink();
         const firstWrite = request.payload.length ? this.writeToRemote(request.payload) : Promise.resolve();
@@ -2603,20 +2706,11 @@ class XHttpSession {
     if (shouldDropUdpForLatency(this.boosterProfile, this.udpBurstState, this.pendingDownlinkBytes || 0, this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER)) return;
     if (this.udpIdleTimer && this.udpIdleTimer.refresh) this.udpIdleTimer.refresh();
     updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
-    const family = getUdpSocketFamily(this.udpSocket, this.udpTargetHost);
-    resolveBoostedAddress(this.udpTargetHost, this.udpTargetPort, this.boosterProfile, family).then((address) => {
-      if (this.closed || !this.udpSocket) return;
-      this.udpSocket.send(packet, this.udpTargetPort, address, (err) => {
-        if (err) {
-          log('[XHTTP UDP] Send failed:', err.message);
-          markBoosterConnectFailure(this.udpTargetHost, this.udpTargetPort, address, err);
-          this.close('udp send failed');
-        }
-      });
-    }).catch((err) => {
-      log('[XHTTP UDP] Resolve failed:', err && err.message ? err.message : 'unknown');
-      markBoosterConnectFailure(this.udpTargetHost, this.udpTargetPort, '', err);
-      this.close('udp resolve failed');
+    this.udpSocket.send(packet).catch((err) => {
+      if (this.closed) return;
+      log('[XHTTP UDP] Send/resolve failed:', err && err.message ? err.message : 'unknown');
+      markBoosterConnectFailure(this.udpTargetHost, this.udpTargetPort, err?.udpAddress || '', err);
+      this.close('udp send or resolve failed');
     });
   }
 
@@ -2964,21 +3058,29 @@ class MuxHandler {
     const category = detectDestinationCategory({ host: target.host, port: target.port, command: target.network === 'udp' ? 0x02 : 0x01 });
     const session = { id: sessionId, target, category, remote: null, udp: null, connected: false, closed: false };
     this.sessions.set(sessionId, session);
+    const isCurrentSession = () => !this.closed && !session.closed && this.sessions.get(sessionId) === session;
     if (target.network === 'udp') this.udpBurstStates.set(sessionId, createUdpBurstState());
 
     if (target.network === 'udp') {
-      const udpType = target.host.includes(':') ? 'udp6' : 'udp4';
-      session.udp = dgram.createSocket(udpType);
+      session.udp = createBoostedUdpTransport(target.host, target.port, this.profile, {
+        onMessage: (msg) => {
+          if (!isCurrentSession()) return;
+          updateTraffic(this.user, msg.length, 'downlink', this.touch);
+          this.sendData(sessionId, msg, true);
+        },
+        onError: (err) => {
+          if (!isCurrentSession()) return;
+          log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
+          this.sendEnd(sessionId, true);
+          this.closeSession(sessionId, true);
+        },
+        onClose: () => {
+          if (!isCurrentSession()) return;
+          this.sendEnd(sessionId, false);
+          this.closeSession(sessionId, false, true);
+        }
+      });
       session.connected = true;
-      session.udp.on('message', (msg) => {
-        updateTraffic(this.user, msg.length, 'downlink', this.touch);
-        this.sendData(sessionId, msg, true);
-      });
-      session.udp.on('error', (err) => {
-        log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
-        this.sendEnd(sessionId, true);
-        this.closeSession(sessionId, true);
-      });
       return;
     }
 
@@ -2988,26 +3090,35 @@ class MuxHandler {
     }
     session.remote.setNoDelay(true);
     session.remote.setKeepAlive(true, 30000);
-    session.remote.setTimeout(this.profile.idleTimeoutMs || IDLE_TIMEOUT_MS);
+    // Bound connection attempts, but do not expire an established quiet TCP
+    // substream; the peer/socket lifecycle determines when it ends.
+    session.remote.setTimeout(this.profile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
     session.remote.once('connect', () => {
+      if (!isCurrentSession()) return;
       session.connected = true;
+      session.remote.setTimeout(0);
     });
     session.remote.on('data', (data) => {
+      if (!isCurrentSession()) return;
       updateTraffic(this.user, data.length, 'downlink', this.touch);
       this.sendData(sessionId, data);
     });
     session.remote.once('error', (err) => {
+      if (!isCurrentSession()) return;
       log(`[${this.label}] TCP error:`, `${target.host}:${target.port} ${err && err.message ? err.message : ''}`);
       this.sendEnd(sessionId, true);
       this.closeSession(sessionId, true);
     });
     session.remote.on('timeout', () => {
-      if (this.paused || this.blockedInputSocket === session.remote) return;
-      this.sendEnd(sessionId, false);
-      this.closeSession(sessionId, false);
+      if (!isCurrentSession() || session.connected) return;
+      this.sendEnd(sessionId, true);
+      this.closeSession(sessionId, true);
     });
     session.remote.on('close', () => {
-      if (!session.closed) this.sendEnd(sessionId, false);
+      // A late close from an old socket must not close a newly opened stream
+      // that reused the same MUX session ID.
+      if (!isCurrentSession()) return;
+      this.sendEnd(sessionId, false);
       this.closeSession(sessionId, false, true);
     });
   }
@@ -3023,20 +3134,10 @@ class MuxHandler {
       const effectiveProfile = session.category === 'game' ? BOOSTER_PROFILE_LATENCY : this.profile;
       if (shouldDropUdpForLatency(effectiveProfile, burstState, 0, effectiveProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT)) return;
       updateTraffic(this.user, data.length, 'uplink', this.touch);
-      const family = getUdpSocketFamily(session.udp, session.target.host);
-      resolveBoostedAddress(session.target.host, session.target.port, this.profile, family).then((address) => {
-        if (!session.udp || session.closed) return;
-        session.udp.send(data, session.target.port, address, (err) => {
-          if (err) {
-            log(`[${this.label}] UDP send failed:`, err.message);
-            markBoosterConnectFailure(session.target.host, session.target.port, address, err);
-            this.sendEnd(sessionId, true);
-            this.closeSession(sessionId, true);
-          }
-        });
-      }).catch((err) => {
-        log(`[${this.label}] UDP resolve failed:`, err && err.message ? err.message : 'unknown');
-        markBoosterConnectFailure(session.target.host, session.target.port, '', err);
+      session.udp.send(data).catch((err) => {
+        if (session.closed) return;
+        log(`[${this.label}] UDP send/resolve failed:`, err && err.message ? err.message : 'unknown');
+        markBoosterConnectFailure(session.target.host, session.target.port, err?.udpAddress || '', err);
         this.sendEnd(sessionId, true);
         this.closeSession(sessionId, true);
       });
@@ -3714,7 +3815,8 @@ app.get('/api/debug/active', requireAuth, (req, res) => {
       WS_DASHBOARD_OFFLINE_MS,
       WS_TERMINATE_MS,
       XHTTP_MAX_CONNECTIONS_PER_COHORT,
-      XHTTP_MIN_IDLE_BEFORE_TRIM_MS
+      XHTTP_MIN_IDLE_BEFORE_TRIM_MS,
+      XHTTP_CLOSES_LIVE_COHORT_STREAMS: false
     },
     users
   });
@@ -4152,6 +4254,9 @@ server.on('upgrade', (req, socket, head) => {
 
 wss.on('connection', (ws, req) => {
   ws.binaryType = 'nodebuffer';
+  // Kernel keepalive can detect a dead peer without WebSocket protocol pings or
+  // artificially marking dashboard traffic as active.
+  try { req.socket.setKeepAlive(true, 30000); req.socket.setNoDelay(true); } catch (_) {}
   ws.isAlive = true;
   ws._mahan = null;
 
@@ -4162,6 +4267,7 @@ wss.on('connection', (ws, req) => {
   let established = false;
   let closed = false;
   let firstPacketHandled = false;
+  let firstPacketBuffer = Buffer.alloc(0);
   let responseHeaderSent = false;
   let udpMode = false;
   let muxMode = false;
@@ -4213,7 +4319,11 @@ wss.on('connection', (ws, req) => {
   let connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), boosterProfile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
 
   function handleIdleTimeout() {
-    if (!closed && (clientInputPaused || remotePausedByPressure)) {
+    // A healthy established tunnel can be silent for minutes or hours. Do not
+    // evict it based on silence; TCP keepalive and close/error events handle
+    // dead peers. UDP retains its separate bounded idle timeout.
+    if (!closed && ((established && ws.readyState === ws.OPEN && !req.socket.destroyed) ||
+        clientInputPaused || remotePausedByPressure)) {
       unregisterConnection?.touchLiveness?.();
       idleTimer = setTimeout(handleIdleTimeout, boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
       return;
@@ -4393,20 +4503,11 @@ wss.on('connection', (ws, req) => {
     if (shouldDropUdpForLatency(boosterProfile, udpBurstState, ws.bufferedAmount, boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT)) return;
     if (udpIdleTimer && udpIdleTimer.refresh) udpIdleTimer.refresh();
     updateTraffic(user, packet.length, 'uplink', () => unregisterConnection?.touchData?.());
-    const family = getUdpSocketFamily(udpSocket, udpTargetHost);
-    resolveBoostedAddress(udpTargetHost, udpTargetPort, boosterProfile, family).then((address) => {
-      if (closed || !udpSocket) return;
-      udpSocket.send(packet, udpTargetPort, address, (err) => {
-        if (err) {
-          log('[UDP] Send failed:', err.message);
-          markBoosterConnectFailure(udpTargetHost, udpTargetPort, address, err);
-          closeAll(1011, 'udp send failed');
-        }
-      });
-    }).catch((err) => {
-      log('[UDP] Resolve failed:', err && err.message ? err.message : 'unknown');
-      markBoosterConnectFailure(udpTargetHost, udpTargetPort, '', err);
-      closeAll(1011, 'udp resolve failed');
+    udpSocket.send(packet).catch((err) => {
+      if (closed) return;
+      log('[UDP] Send/resolve failed:', err && err.message ? err.message : 'unknown');
+      markBoosterConnectFailure(udpTargetHost, udpTargetPort, err?.udpAddress || '', err);
+      closeAll(1011, 'udp send or resolve failed');
     });
   }
 
@@ -4415,15 +4516,21 @@ wss.on('connection', (ws, req) => {
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
     if (!firstPacketHandled) {
-      firstPacketHandled = true;
+      const initial = firstPacketBuffer.length ? Buffer.concat([firstPacketBuffer, chunk]) : chunk;
       let request;
       try {
-        request = parseVlessRequest(chunk, { allowUdp: true, allowMux: true });
+        request = parseVlessRequest(initial, { allowUdp: true, allowMux: true });
       } catch (err) {
+        if (err.code === 'VLESS_INCOMPLETE' && initial.length < MAX_VLESS_HEADER_BYTES) {
+          firstPacketBuffer = Buffer.from(initial);
+          return;
+        }
         log('[VLESS] Bad request:', err.message);
         closeAll(1008, 'bad vless request');
         return;
       }
+      firstPacketHandled = true;
+      firstPacketBuffer = Buffer.alloc(0);
 
       user = request.user;
       boosterProfile = chooseBoosterProfile(request, 'ws');
@@ -4439,7 +4546,10 @@ wss.on('connection', (ws, req) => {
         closeAll(1008, 'client limit exceeded');
         return;
       }
-      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), { ip: clientIp, clientKey, kind: 'ws', deviceMeta });
+      unregisterConnection = registerConnection(user.id, (reason) => closeAll(1000, reason), {
+        ip: clientIp, clientKey, kind: 'ws', deviceMeta,
+        isOpen: () => !closed && ws.readyState === ws.OPEN && !req.socket.destroyed
+      });
       ws._mahan = { userId: user.id, clientKey: unregisterConnection.clientKey || clientKey, connectionId: unregisterConnection.id, closeAll, createdAt: Date.now(), lastPongAt: Date.now(), missedPongs: 0, dashboardOffline: false };
       log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)} device=${unregisterConnection.clientKey || clientKey}`);
 
@@ -4452,7 +4562,12 @@ wss.on('connection', (ws, req) => {
           user,
           label: 'WS MUX',
           profile: boosterProfile,
-          touch: () => unregisterConnection?.touchData?.(),
+          touch: () => {
+            // MUX downlink traffic also keeps the outer WebSocket alive, even
+            // when the client has not sent an uplink frame recently.
+            refreshIdleTimer();
+            unregisterConnection?.touchData?.();
+          },
           send: (chunk, meta) => sendToWs(chunk, meta),
           close: (reason) => closeAll(1000, reason || 'mux closed'),
           onInputPause: pauseClientInput,
@@ -4477,22 +4592,23 @@ wss.on('connection', (ws, req) => {
 
         udpTargetHost = request.host;
         udpTargetPort = request.port;
-        const udpType = request.host.includes(':') ? 'udp6' : 'udp4';
-        udpSocket = dgram.createSocket(udpType);
-        udpSocket.on('message', (msg) => {
-          refreshIdleTimer();
-          try {
-            sendToWs(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
-          } catch (err) {
-            log('[UDP] Encode failed:', err.message);
-            closeAll(1011, 'udp encode failed');
-          }
+        udpSocket = createBoostedUdpTransport(request.host, request.port, boosterProfile, {
+          onMessage: (msg) => {
+            refreshIdleTimer();
+            if (udpIdleTimer?.refresh) udpIdleTimer.refresh();
+            try {
+              sendToWs(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
+            } catch (err) {
+              log('[UDP] Encode failed:', err.message);
+              closeAll(1011, 'udp encode failed');
+            }
+          },
+          onError: (err) => {
+            log('[UDP] Error:', err && err.message ? err.message : 'unknown');
+            closeAll(1011, 'udp error');
+          },
+          onClose: () => closeAll(1000, 'udp closed')
         });
-        udpSocket.on('error', (err) => {
-          log('[UDP] Error:', err && err.message ? err.message : 'unknown');
-          closeAll(1011, 'udp error');
-        });
-        udpSocket.on('close', () => closeAll(1000, 'udp closed'));
 
         udpIdleTimer = setTimeout(() => closeAll(1000, 'udp idle timeout'), boosterProfile.udpIdleTimeoutMs || UDP_IDLE_TIMEOUT_MS);
 
@@ -4517,6 +4633,7 @@ wss.on('connection', (ws, req) => {
       remote.once('connect', () => {
         if (closed) return;
         clearTimeout(connectTimer);
+        remote.setTimeout(0);
         established = true;
         sendVlessResponseHeader(request.version);
         if (request.payload.length) {
@@ -4620,7 +4737,9 @@ wss.on('connection', (ws, req) => {
   const earlyData = decodeEarlyDataFromProtocolHeader(req.headers['sec-websocket-protocol']);
   if (earlyData) {
     log('[WS] Early data:', `${earlyData.length} bytes`);
-    setImmediate(() => handleClientData(earlyData));
+    // Early data precedes every WebSocket message, including messages already
+    // buffered by the upgrade. Process it before returning to the event loop.
+    handleClientData(earlyData);
   }
 });
 
@@ -4632,17 +4751,10 @@ const wsHeartbeatInterval = null;
 wss.on('close', () => { if (wsHeartbeatInterval) clearInterval(wsHeartbeatInterval); });
 
 setInterval(() => {
-  const now = Date.now();
-  for (const [userId, map] of Array.from(activeConnections.entries())) {
-    for (const conn of Array.from(map.values())) {
-      // Do NOT close a connection just because it has no traffic bytes. A VPN can
-      // be connected and idle for seconds/minutes. Only heartbeat/socket staleness
-      // should remove it; explicit client close is handled immediately by close events.
-      if (now - conn.lastSeen > ACTIVE_CONNECTION_STALE_MS) {
-        try { conn.closeFn('connection stale'); } catch (_) {}
-        removeConnection(userId, conn.id, 'stale cleaner');
-      }
-    }
+  for (const userId of Array.from(activeConnections.keys())) {
+    // The same transport-aware check is used by admission and dashboard paths;
+    // silence alone is not proof that a tunnel has disconnected.
+    pruneStaleConnections(userId, ACTIVE_CONNECTION_STALE_MS);
     trimXhttpCohortConnections(userId);
     pruneClientSlots(userId);
   }

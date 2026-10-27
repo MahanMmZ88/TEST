@@ -113,11 +113,19 @@ async function target(t, handler) {
   return server.address().port;
 }
 
-async function udpTarget(t) {
-  const socket = dgram.createSocket('udp4');
+async function udpTarget(t, family = 4) {
+  const socket = dgram.createSocket(family === 6 ? 'udp6' : 'udp4');
   socket.on('message', (message, from) => socket.send(message, from.port, from.address));
-  socket.bind(0, '127.0.0.1');
-  await once(socket, 'listening');
+  socket.bind(0, family === 6 ? '::1' : '127.0.0.1');
+  try {
+    await once(socket, 'listening');
+  } catch (err) {
+    if (family === 6 && ['EAFNOSUPPORT', 'EADDRNOTAVAIL', 'EPROTONOSUPPORT'].includes(err.code)) {
+      t.skip(`IPv6 loopback unavailable: ${err.code}`);
+      return null;
+    }
+    throw err;
+  }
   t.after(() => socket.close());
   return socket.address().port;
 }
@@ -225,6 +233,9 @@ function downlink(sessionId) {
     req = http.get({ host: '127.0.0.1', port: panel.port, path: `/xhttp/${sessionId}` }, resolve);
     req.on('error', reject);
   });
+  // Some assertions can fail before the response is awaited; avoid a late
+  // rejected request when test cleanup destroys the pending downlink.
+  response.catch(() => {});
   return { response, destroy: () => req.destroy() };
 }
 
@@ -437,7 +448,7 @@ test('transport integration', async (suite) => {
       const hostname = Buffer.from(targetInfo.host);
       const p = Buffer.alloc(2);
       p.writeUInt16BE(targetInfo.port);
-      metadata = Buffer.concat([base, Buffer.from([1]), p, Buffer.from([2, hostname.length]), hostname]);
+      metadata = Buffer.concat([base, Buffer.from([targetInfo.network === 'udp' ? 2 : 1]), p, Buffer.from([2, hostname.length]), hostname]);
     }
     const metaLen = Buffer.alloc(2);
     metaLen.writeUInt16BE(metadata.length);
@@ -498,6 +509,385 @@ test('transport integration', async (suite) => {
     const actual = await timeout(sink.completed, 15000, 'MUX upload');
     assert.deepEqual(actual, { total: data.length, hash: sha(data) });
     assert.equal(ws.readyState, WebSocket.OPEN);
+  });
+
+  await suite.test('WebSocket accepts a VLESS header split across messages', async (t) => {
+    const payload = Buffer.from('fragmented websocket header');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const result = collectWs(ws, payload.length);
+    await once(ws, 'open');
+    const header = vlessHeader(port);
+    for (const byte of header) ws.send(Buffer.from([byte]));
+    ws.send(payload);
+    assert.deepEqual(await timeout(result, 3000, 'fragmented WS header'), { total: payload.length, hash: sha(payload) });
+    assert.equal(ws.readyState, WebSocket.OPEN);
+  });
+
+  await suite.test('WebSocket early data and the next frame form one VLESS header in order', async (t) => {
+    const payload = Buffer.from('early data split header');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const header = vlessHeader(port);
+    const early = header.subarray(0, 18).toString('base64url');
+    const ws = new WebSocket(`ws://127.0.0.1:${panel.port}/ws`, early, { perMessageDeflate: false });
+    ws.on('error', () => {});
+    t.after(() => ws.terminate());
+    const result = collectWs(ws, payload.length);
+    await once(ws, 'open');
+    ws.send(Buffer.concat([header.subarray(18), payload]));
+    assert.deepEqual(await timeout(result, 3000, 'early WS data'), { total: payload.length, hash: sha(payload) });
+  });
+
+  await suite.test('a standalone MUX VLESS header receives a response before any MUX frame', async (t) => {
+    const payload = Buffer.from('mux standalone header');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const headerReceived = once(ws, 'message');
+    await once(ws, 'open');
+    ws.send(vlessHeader(0, '', 3));
+    const [header] = await timeout(headerReceived, 3000, 'standalone WS MUX header');
+    assert.deepEqual(Buffer.from(header), Buffer.from([0, 0]));
+    const dataReceived = new Promise((resolve, reject) => {
+      ws.once('message', (raw) => {
+        const frame = Buffer.from(raw);
+        if (frame.length < 8 || frame[4] !== 2 || frame.readUInt16BE(6) !== payload.length) return reject(new Error('bad MUX echo frame'));
+        resolve(frame.subarray(8));
+      });
+      ws.once('error', reject);
+      ws.once('close', () => reject(new Error('MUX closed before echo')));
+    });
+    ws.send(muxFrame(1, 1, { host: 'target.test', port }, payload));
+    assert.deepEqual(await timeout(dataReceived, 3000, 'standalone WS MUX echo'), payload);
+  });
+
+  await suite.test('XHTTP packet-up reassembles a VLESS header split across posts', async (t) => {
+    const payload = Buffer.from('fragmented packet-up header');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const sid = 'split-vless-header-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const header = vlessHeader(port);
+    const first = await timeout(request('POST', panel.port, `/xhttp/${sid}/0`, header.subarray(0, 10)), 3000, 'split XHTTP seq0');
+    assert.equal(first.status, 200);
+    const second = await timeout(request('POST', panel.port, `/xhttp/${sid}/1`, Buffer.concat([header.subarray(10), payload])), 3000, 'split XHTTP seq1');
+    assert.equal(second.status, 200);
+    const res = await timeout(get.response, 3000, 'split XHTTP response');
+    t.after(() => res.destroy());
+    assert.deepEqual(await timeout(collectHttp(res, payload.length), 3000, 'split XHTTP echo'), { total: payload.length, hash: sha(payload) });
+  });
+
+  await suite.test('XHTTP stream-up reassembles a VLESS header split across upload chunks', async (t) => {
+    const payload = Buffer.from('fragmented stream-up header');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const sid = 'split-stream-header-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const upload = http.request({ host: '127.0.0.1', port: panel.port, method: 'POST', path: `/xhttp/${sid}`,
+      headers: { 'content-type': 'application/octet-stream' } });
+    upload.on('error', () => {});
+    t.after(() => upload.destroy());
+    const header = vlessHeader(port);
+    upload.write(header.subarray(0, 18));
+    await delay(50);
+    upload.write(header.subarray(18, 22));
+    await delay(50);
+    upload.write(Buffer.concat([header.subarray(22), payload]));
+    const res = await timeout(get.response, 3000, 'split stream-up response');
+    t.after(() => res.destroy());
+    assert.deepEqual(await timeout(collectHttp(res, payload.length), 3000, 'split stream-up echo'),
+      { total: payload.length, hash: sha(payload) });
+    upload.end();
+  });
+
+  await suite.test('XHTTP packet-up accepts a split standalone MUX header before MUX frames', async (t) => {
+    const payload = Buffer.from('packet MUX echo');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const sid = 'split-packet-mux-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const header = vlessHeader(0, '', 3);
+    assert.equal((await request('POST', panel.port, `/xhttp/${sid}/0`, header.subarray(0, 10))).status, 200);
+    assert.equal((await request('POST', panel.port, `/xhttp/${sid}/1`, header.subarray(10))).status, 200);
+    const res = await timeout(get.response, 3000, 'packet MUX response');
+    t.after(() => res.destroy());
+    const [responseHeader] = await timeout(once(res, 'data'), 3000, 'packet MUX VLESS header');
+    assert.deepEqual(Buffer.from(responseHeader), Buffer.from([0, 0]));
+    const echo = once(res, 'data');
+    assert.equal((await request('POST', panel.port, `/xhttp/${sid}/2`,
+      muxFrame(1, 1, { host: 'target.test', port }, payload))).status, 200);
+    const [raw] = await timeout(echo, 3000, 'packet MUX echo');
+    const frame = Buffer.from(raw);
+    assert.equal(frame[4], 2);
+    assert.equal(frame.readUInt16BE(6), payload.length);
+    assert.deepEqual(frame.subarray(8), payload);
+  });
+
+  await suite.test('XHTTP stream-up accepts a standalone 19-byte MUX VLESS header', async (t) => {
+    const sid = 'standalone-mux-stream-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const upload = http.request({ host: '127.0.0.1', port: panel.port, method: 'POST', path: `/xhttp/${sid}`,
+      headers: { 'content-type': 'application/octet-stream' } });
+    upload.on('error', () => {});
+    t.after(() => upload.destroy());
+    const requestHeader = vlessHeader(0, '', 3);
+    upload.write(requestHeader.subarray(0, 18));
+    await delay(50);
+    upload.write(requestHeader.subarray(18));
+    const res = await timeout(get.response, 3000, 'standalone XHTTP MUX response');
+    t.after(() => res.destroy());
+    const [header] = await timeout(once(res, 'data'), 3000, 'standalone XHTTP MUX header');
+    assert.deepEqual(Buffer.from(header), Buffer.from([0, 0]));
+    upload.end();
+  });
+
+  await suite.test('WebSocket UDP repeatedly resolves a dual-stack hostname using the socket family', async (t) => {
+    const port = await udpTarget(t);
+    const payloads = [Buffer.from('ws-one'), Buffer.from('ws-two'), Buffer.from('ws-three')];
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const echoes = new Promise((resolve, reject) => {
+      let headerSeen = false;
+      const received = [];
+      ws.on('message', (raw) => {
+        const data = Buffer.from(raw);
+        if (!headerSeen) { headerSeen = true; return; }
+        if (data.length < 2 || data.readUInt16BE(0) !== data.length - 2) return reject(new Error('invalid WS UDP datagram'));
+        received.push(data.subarray(2));
+        if (received.length === payloads.length) return resolve(received);
+        ws.send(udpFrame(payloads[received.length]));
+      });
+      ws.once('close', () => reject(new Error('dual-stack WS UDP closed')));
+      ws.once('error', reject);
+    });
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(port, 'dual-ws.test', 2), udpFrame(payloads[0])]));
+    assert.deepEqual(await timeout(echoes, 5000, 'dual-stack WS UDP'), payloads);
+  });
+
+  await suite.test('XHTTP UDP repeatedly resolves a dual-stack hostname using the socket family', async (t) => {
+    const port = await udpTarget(t);
+    const payloads = [Buffer.from('xhttp-one'), Buffer.from('xhttp-two'), Buffer.from('xhttp-three')];
+    const sid = 'dual-stack-udp-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const post = await timeout(request('POST', panel.port, `/xhttp/${sid}/0`,
+      Buffer.concat([vlessHeader(port, 'dual-xhttp.test', 2), udpFrame(payloads[0])])), 3000, 'dual XHTTP init');
+    assert.equal(post.status, 200);
+    const res = await timeout(get.response, 3000, 'dual XHTTP response');
+    t.after(() => res.destroy());
+    const echoes = new Promise((resolve, reject) => {
+      let buffer = Buffer.alloc(0), headerSeen = false;
+      const received = [];
+      res.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (!headerSeen) {
+          if (buffer.length < 2) return;
+          if (buffer[0] !== 0 || buffer[1] !== 0) return reject(new Error('bad XHTTP VLESS header'));
+          buffer = buffer.subarray(2);
+          headerSeen = true;
+        }
+        while (buffer.length >= 2 && buffer.length >= 2 + buffer.readUInt16BE(0)) {
+          const length = buffer.readUInt16BE(0);
+          received.push(buffer.subarray(2, 2 + length));
+          buffer = buffer.subarray(2 + length);
+          if (received.length === payloads.length) return resolve(received);
+          const seq = received.length;
+          request('POST', panel.port, `/xhttp/${sid}/${seq}`, udpFrame(payloads[seq])).then((r) => {
+            if (r.status !== 200) reject(new Error(`XHTTP UDP POST returned ${r.status}`));
+          }, reject);
+        }
+      });
+      res.once('end', () => reject(new Error('dual-stack XHTTP UDP closed')));
+      res.once('error', reject);
+    });
+    assert.deepEqual(await timeout(echoes, 5000, 'dual-stack XHTTP UDP'), payloads);
+  });
+
+  await suite.test('MUX UDP repeatedly resolves a dual-stack hostname using the socket family', async (t) => {
+    const port = await udpTarget(t);
+    const payloads = [Buffer.from('mux-one'), Buffer.from('mux-two'), Buffer.from('mux-three')];
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const echoes = new Promise((resolve, reject) => {
+      let headerSeen = false;
+      const received = [];
+      ws.on('message', (raw) => {
+        const frame = Buffer.from(raw);
+        if (!headerSeen) { headerSeen = true; return; }
+        if (frame.length < 8 || frame[4] !== 2 || frame.readUInt16BE(6) !== frame.length - 8) return reject(new Error('invalid MUX UDP frame'));
+        received.push(frame.subarray(8));
+        if (received.length === payloads.length) return resolve(received);
+        ws.send(muxFrame(1, 2, null, payloads[received.length]));
+      });
+      ws.once('close', () => reject(new Error('dual-stack MUX closed')));
+      ws.once('error', reject);
+    });
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(0, '', 3), muxFrame(1, 1, { host: 'dual-mux.test', port, network: 'udp' }, payloads[0])]));
+    assert.deepEqual(await timeout(echoes, 5000, 'dual-stack MUX UDP'), payloads);
+  });
+
+  await suite.test('WebSocket reassembles the maximum VLESS options and hostname header', async (t) => {
+    const payload = Buffer.from('maximum options');
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const base = vlessHeader(port, 'a'.repeat(255));
+    const header = Buffer.concat([base.subarray(0, 17), Buffer.from([255]), Buffer.alloc(255, 7), base.subarray(18)]);
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const result = collectWs(ws, payload.length);
+    await once(ws, 'open');
+    for (let i = 0; i < header.length; i += 11) ws.send(header.subarray(i, i + 11));
+    ws.send(payload);
+    assert.deepEqual(await timeout(result, 3000, 'header with options'), { total: payload.length, hash: sha(payload) });
+  });
+
+  await suite.test('valid first WebSocket and XHTTP messages may include payload larger than the header limit', async (t) => {
+    const payload = bytes(256 * 1024, 13);
+    const port = await target(t, (socket) => socket.on('data', (chunk) => socket.write(chunk)));
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const wsResult = collectWs(ws, payload.length);
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(port), payload]));
+    assert.deepEqual(await timeout(wsResult, 5000, 'large first WS payload'), { total: payload.length, hash: sha(payload) });
+
+    const sid = 'large-initial-payload-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const post = await timeout(request('POST', panel.port, `/xhttp/${sid}/0`, Buffer.concat([vlessHeader(port), payload])), 5000, 'large first XHTTP payload');
+    assert.equal(post.status, 200);
+    const res = await timeout(get.response, 3000, 'large first XHTTP downlink');
+    t.after(() => res.destroy());
+    assert.deepEqual(await timeout(collectHttp(res, payload.length), 5000, 'large first XHTTP echo'), { total: payload.length, hash: sha(payload) });
+  });
+
+  await suite.test('the low-memory WebSocket message-size cap remains enforced', async (t) => {
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const closed = once(ws, 'close');
+    await once(ws, 'open');
+    ws.send(Buffer.alloc(1024 * 1024 + 1));
+    const [code] = await timeout(closed, 3000, 'oversized WS frame');
+    assert.equal(code, 1009);
+    assert.equal((await request('GET', panel.port, '/api/health')).status, 200);
+  });
+
+  await suite.test('fragmented malformed requests and private targets are rejected', async (t) => {
+    for (const header of [
+      Buffer.concat([vlessHeader(443).subarray(0, 22), Buffer.from([0])]), // zero-length domain
+      vlessHeader(443, '127.0.0.1') // forbidden target
+    ]) {
+      const ws = openWs();
+      t.after(() => ws.terminate());
+      const closed = once(ws, 'close');
+      await once(ws, 'open');
+      ws.send(header.subarray(0, 18));
+      ws.send(header.subarray(18));
+      const [code] = await timeout(closed, 3000, 'invalid fragmented VLESS request');
+      assert.equal(code, 1008);
+    }
+    assert.equal((await request('GET', panel.port, '/api/health')).status, 200);
+  });
+
+  await suite.test('UDP rejects hostnames resolving only to private addresses', async (t) => {
+    const port = await udpTarget(t);
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const closed = once(ws, 'close');
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(port, 'private-dns.test', 2), udpFrame(Buffer.from('private'))]));
+    const [code] = await timeout(closed, 3000, 'private DNS rejection');
+    assert.equal(code, 1011);
+    assert.equal((await request('GET', panel.port, '/api/health')).status, 200);
+  });
+
+  await suite.test('UDP uses the actual family of an IPv4-mapped DNS answer', async (t) => {
+    const port = await udpTarget(t);
+    const payload = Buffer.from('mapped IPv4');
+    const framed = udpFrame(payload);
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const result = collectWs(ws, framed.length);
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(port, 'mapped-ws.test', 2), framed]));
+    assert.deepEqual(await timeout(result, 3000, 'mapped IPv4 UDP'), { total: framed.length, hash: sha(framed) });
+  });
+
+  await suite.test('closing UDP during a slow lookup leaves the server healthy', async (t) => {
+    const port = await udpTarget(t);
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(port, 'slow-udp.test', 2), udpFrame(Buffer.from('before-close'))]));
+    await delay(40);
+    const closed = once(ws, 'close');
+    ws.close();
+    await timeout(closed, 3000, 'close while resolving UDP');
+    await delay(500);
+    assert.equal((await request('GET', panel.port, '/api/health')).status, 200);
+  });
+
+  await suite.test('WebSocket UDP supports a public IPv6-only hostname', async (t) => {
+    const port = await udpTarget(t, 6);
+    if (port === null) return;
+    const payload = Buffer.from('ws ipv6 only');
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const result = new Promise((resolve, reject) => {
+      let headerSeen = false;
+      ws.on('message', (raw) => {
+        const data = Buffer.from(raw);
+        if (!headerSeen) { headerSeen = true; return; }
+        resolve(data);
+      });
+      ws.once('close', () => reject(new Error('IPv6 WS UDP closed')));
+      ws.once('error', reject);
+    });
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(port, 'v6-only-ws.test', 2), udpFrame(payload)]));
+    assert.deepEqual(await timeout(result, 5000, 'IPv6 WS UDP'), udpFrame(payload));
+  });
+
+  await suite.test('XHTTP UDP supports a public IPv6-only hostname', async (t) => {
+    const port = await udpTarget(t, 6);
+    if (port === null) return;
+    const payload = Buffer.from('xhttp ipv6 only');
+    const sid = 'v6-only-udp-test';
+    const get = downlink(sid);
+    t.after(get.destroy);
+    const post = await timeout(request('POST', panel.port, `/xhttp/${sid}/0`,
+      Buffer.concat([vlessHeader(port, 'v6-only-xhttp.test', 2), udpFrame(payload)])), 3000, 'IPv6 XHTTP init');
+    assert.equal(post.status, 200);
+    const res = await timeout(get.response, 3000, 'IPv6 XHTTP response');
+    t.after(() => res.destroy());
+    const framed = udpFrame(payload);
+    assert.deepEqual(await timeout(collectHttp(res, framed.length), 5000, 'IPv6 XHTTP UDP'),
+      { total: framed.length, hash: sha(framed) });
+  });
+
+  await suite.test('MUX UDP supports a public IPv6-only hostname', async (t) => {
+    const port = await udpTarget(t, 6);
+    if (port === null) return;
+    const payload = Buffer.from('mux ipv6 only');
+    const ws = openWs();
+    t.after(() => ws.terminate());
+    const result = new Promise((resolve, reject) => {
+      let headerSeen = false;
+      ws.on('message', (raw) => {
+        const frame = Buffer.from(raw);
+        if (!headerSeen) { headerSeen = true; return; }
+        if (frame.length < 8 || frame[4] !== 2 || frame.readUInt16BE(6) !== payload.length) return reject(new Error('invalid IPv6 MUX UDP frame'));
+        resolve(frame.subarray(8));
+      });
+      ws.once('close', () => reject(new Error('IPv6 MUX closed')));
+      ws.once('error', reject);
+    });
+    await once(ws, 'open');
+    ws.send(Buffer.concat([vlessHeader(0, '', 3), muxFrame(1, 1, { host: 'v6-only-mux.test', port, network: 'udp' }, payload)]));
+    assert.deepEqual(await timeout(result, 5000, 'IPv6 MUX UDP'), payload);
   });
 
   await suite.test('traffic callbacks produce no uncaught exceptions or unhandled rejections', () => {

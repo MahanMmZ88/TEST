@@ -23,6 +23,8 @@ const burst = process.argv.includes('burst');
 const cold = process.argv.includes('cold');
 const transport = process.argv.includes('mux') ? 'mux' : process.argv.includes('xhttp') ? 'xhttp' : 'ws';
 const light = process.argv.includes('light') || transport === 'mux';
+const largeInitial = process.argv.includes('large-initial');
+const initialPayload = largeInitial ? Buffer.alloc(768 * 1024, 0x63) : null;
 const uuid = '11111111111111111111111111111111';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sourceChunk = Buffer.alloc(16 * 1024, 0x5a);
@@ -32,6 +34,8 @@ let rejected = 0;
 let serverSockets = new Set();
 const muxPayloads = new Set();
 let logs = '';
+let receivedInitialBytes = 0;
+let invalidInitialBytes = false;
 
 function sudo(...args) { return execFileSync('sudo', ['-n', ...args], { encoding: 'utf8' }); }
 function number(file) { return Number(fs.readFileSync(path.join(group, file), 'utf8').trim()); }
@@ -56,11 +60,16 @@ function header(port) {
   return Buffer.concat([Buffer.from([0]), Buffer.from(uuid, 'hex'), Buffer.from([0, 1]), p,
     Buffer.from([2, host.length]), host]);
 }
+function firstPacket(port) {
+  const request = header(port);
+  return initialPayload ? Buffer.concat([request, initialPayload]) : request;
+}
+
 function openClient(port, upstreamPort) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, { perMessageDeflate: false });
     const entry = { ws, bytes: 0, closed: false, resume: () => ws.resume(), close: () => ws.terminate() };
-    ws.once('open', () => ws.send(header(upstreamPort)));
+    ws.once('open', () => ws.send(firstPacket(upstreamPort)));
     ws.once('error', reject);
     ws.once('close', () => { entry.closed = true; });
     ws.once('unexpected-response', (req, res) => {
@@ -154,7 +163,7 @@ function openXhttpClient(port, upstreamPort, index) {
       });
     });
     getReq.on('error', fail);
-    const body = header(upstreamPort);
+    const body = firstPacket(upstreamPort);
     postReq = http.request({ host: '127.0.0.1', port, path: `/xhttp/${sid}/0`, method: 'POST',
       headers: { 'content-type': 'application/octet-stream', 'content-length': body.length } }, (res) => {
       res.resume();
@@ -179,6 +188,10 @@ async function run() {
     socket.on('error', () => {});
     socket.on('close', () => serverSockets.delete(socket));
     if (transport === 'mux') socket.on('data', (data) => muxPayloads.add(data.toString()));
+    else if (largeInitial) socket.on('data', (data) => {
+      receivedInitialBytes += data.length;
+      if (!data.every((byte) => byte === 0x63)) invalidInitialBytes = true;
+    });
     let sent = 0;
     function pump() {
       while (!socket.destroyed && (!light || sent < 256 * 1024)) {
@@ -276,12 +289,16 @@ async function run() {
   assert.equal(events().oom_kill, 0, `OOM-killed while clients were stalled; logs: ${logs}`);
   assert.ok(clients.length > 0, 'no client was admitted');
   assert.equal(clients.length + rejected, count);
-  if (light) assert.equal(rejected, 0, 'a transient burst should be delayed, not rejected');
+  if (light && !largeInitial) assert.equal(rejected, 0, 'a transient burst should be delayed, not rejected');
   assert.ok(clients.every((c) => !c.closed), 'an admitted client was closed during throttling');
   for (const client of clients) client.resume();
   await sleep(1500);
   assert.equal(events().oom_kill, 0, `OOM-killed after resuming; logs: ${logs}`);
   assert.ok(clients.every((c) => !c.closed && c.bytes > 65536), 'a client did not resume transferring');
+  if (largeInitial) {
+    assert.equal(invalidInitialBytes, false, 'large initial payload was corrupted');
+    assert.equal(receivedInitialBytes, clients.length * initialPayload.length, 'large initial payload lost bytes');
+  }
   const finalHealth = await health(port);
   assert.ok(finalHealth?.ok, 'health endpoint failed after load');
   const peak = number('memory.peak');
@@ -291,6 +308,8 @@ async function run() {
     burst,
     light,
     cold_node_binary: cold,
+    initial_payload_bytes_per_client: initialPayload?.length || 0,
+    received_initial_bytes: receivedInitialBytes,
     admitted_clients: clients.length,
     rejected_new_clients: rejected,
     limit_mb: 128,
