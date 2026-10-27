@@ -12,6 +12,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const QRCode = require('qrcode');
 const { WebSocketServer } = require('ws');
+const { MemoryGuard } = require('./scripts/memory-guard');
 
 const app = express();
 app.set('trust proxy', true);
@@ -25,7 +26,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'multi-platform-2026-10-25-b';
+const BUILD_ID = 'lowmem-2026-10-27-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
@@ -35,22 +36,58 @@ function envNumber(name, fallback, min, max) {
   return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.trunc(n))) : fallback;
 }
 
-// Node 20.3+/22 sizes its heap from the cgroup limit automatically. On Deplexo's
-// 128 MB free plan we also shrink the traffic buffers so off-heap allocations do
-// not push the process into the OOM killer.
-function constrainedMemoryMb() {
-  try {
-    if (typeof process.constrainedMemory === 'function') {
-      const bytes = process.constrainedMemory();
-      if (Number.isFinite(bytes) && bytes > 0 && bytes < Number.MAX_SAFE_INTEGER) {
-        return Math.floor(bytes / (1024 * 1024));
-      }
-    }
-  } catch (_) {}
-  return 0;
+// Prefer cgroup accounting, including a limiting parent cgroup. On hosts that
+// do not expose it, MEMORY_LIMIT_MB provides an explicit ceiling and RSS is an
+// estimate (it cannot include other processes or kernel socket memory).
+const CONFIGURED_MEMORY_LIMIT_MB = envNumber('MEMORY_LIMIT_MB', 0, 0, 1048576);
+const memoryProbe = new MemoryGuard({ enabled: false, limitMb: CONFIGURED_MEMORY_LIMIT_MB });
+memoryProbe.sample();
+const CONSTRAINED_MEMORY_MB = Math.floor(memoryProbe.detectedLimitBytes / (1024 * 1024));
+const EFFECTIVE_MEMORY_LIMIT_MB = Math.floor(memoryProbe.limitResolvedBytes / (1024 * 1024));
+const LOW_MEMORY_MODE = EFFECTIVE_MEMORY_LIMIT_MB > 0 && EFFECTIVE_MEMORY_LIMIT_MB <= 192;
+// Small plans need extra headroom for kernel TCP buffers, which can grow between
+// sampling ticks. Larger plans keep the less conservative default thresholds.
+const memoryThresholds = LOW_MEMORY_MODE
+  ? { soft: 0.60, hard: 0.72, recover: 0.53 }
+  : { soft: 0.62, hard: 0.78, recover: 0.55 };
+const memoryGuard = new MemoryGuard({
+  enabled: process.env.MEMORY_GUARD !== '0',
+  limitMb: CONFIGURED_MEMORY_LIMIT_MB,
+  cgroup: memoryProbe.cgroup,
+  defaultRatios: memoryThresholds,
+  softRatio: Number(process.env.MEMORY_GUARD_SOFT || memoryThresholds.soft),
+  hardRatio: Number(process.env.MEMORY_GUARD_HARD || memoryThresholds.hard),
+  recoverRatio: Number(process.env.MEMORY_GUARD_RECOVER || memoryThresholds.recover),
+  intervalMs: Number(process.env.MEMORY_GUARD_INTERVAL_MS || 200),
+  admissionWindowMs: envNumber('MEMORY_GUARD_BURST_WINDOW_MS', 300, 50, 5000),
+  onLevelChange: (level, previous, stats) => {
+    log('[MEM] Pressure', `${previous} -> ${level} (${stats.state}) used=${stats.used_mb}MB limit=${stats.limit_mb}MB source=${stats.usage_source}`);
+  }
+});
+memoryGuard.sample();
+// A newly opened TCP tunnel can charge several MiB of kernel socket buffers
+// after the WS handshake. Temporarily project that cost so a simultaneous
+// burst cannot all pass the gate before cgroup usage catches up.
+const ADMISSION_RESERVE_BYTES = LOW_MEMORY_MODE
+  ? envNumber('MEMORY_GUARD_ADMISSION_MB', 10, 0, 64) * 1024 * 1024 : 0;
+const ADMISSION_WAIT_MS = envNumber('MEMORY_GUARD_WAIT_MS', LOW_MEMORY_MODE ? 3000 : 0, 0, 5000);
+const MAX_PENDING_ADMISSIONS = LOW_MEMORY_MODE ? 32 : 128;
+
+// Node + express + ws + qrcode already cost ~60 MB RSS on a cold start. On a
+// 128 MB container that leaves ~65 MB, so traffic buffers must stay in the low
+// hundreds of KB instead of the multi-MB "speed" defaults.
+function lowMemCap(value, cap) {
+  return LOW_MEMORY_MODE ? Math.min(value, cap) : value;
 }
-const CONSTRAINED_MEMORY_MB = constrainedMemoryMb();
-const LOW_MEMORY_MODE = CONSTRAINED_MEMORY_MB > 0 && CONSTRAINED_MEMORY_MB <= 192;
+// Hard caps for low-memory hosts. Values are bytes unless noted.
+const LOW_WS_LIMIT = 256 * 1024;
+const LOW_WS_RESUME = 64 * 1024;
+const LOW_XHTTP_LIMIT = 256 * 1024;
+const LOW_SOCKET_HWM = 16 * 1024;
+// At hard pressure a fast client may drain the JS queue instantly, yet rapid
+// allocations can still outrun the sampler. Pace TCP reads for a short time.
+const HARD_PACE_BYTES = 64 * 1024;
+const HARD_PACE_MS = 25;
 
 // Deplexo's root filesystem is read-only at runtime. The only writable locations
 // are the persistent data volume (/data by default) and /tmp (100 MB, ephemeral).
@@ -126,15 +163,18 @@ const PASSWORD_SALT = 'MAHAN_PANEL_NODE_WS_SALT_v2';
 const CONNECT_TIMEOUT_MS = 15000;
 const IDLE_TIMEOUT_MS = 120000;
 const MAX_FIRST_PACKET = 128 * 1024;
-const MAX_WS_PAYLOAD = envNumber('MAX_WS_PAYLOAD', 8 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024);
-const WS_BACKPRESSURE_LIMIT = envNumber('WS_BACKPRESSURE_LIMIT', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024);
-const WS_BACKPRESSURE_RESUME = 1 * 1024 * 1024;
+const MAX_WS_PAYLOAD = lowMemCap(envNumber('MAX_WS_PAYLOAD', 8 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), 1024 * 1024);
+const WS_BACKPRESSURE_LIMIT = lowMemCap(envNumber('WS_BACKPRESSURE_LIMIT', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), LOW_WS_LIMIT);
+const WS_BACKPRESSURE_RESUME = LOW_MEMORY_MODE ? LOW_WS_RESUME : 1 * 1024 * 1024;
 const MAX_UDP_PACKET_SIZE = 64 * 1024;
 const UDP_IDLE_TIMEOUT_MS = 60000;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
-const MAX_XHTTP_POST_SIZE = envNumber('MAX_XHTTP_POST_SIZE', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024);
+const MAX_XHTTP_POST_SIZE = lowMemCap(envNumber('MAX_XHTTP_POST_SIZE', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), 1024 * 1024);
 const MAX_XHTTP_BUFFERED_POSTS = envNumber('MAX_XHTTP_BUFFERED_POSTS', LOW_MEMORY_MODE ? 8 : 32, 2, 64);
-const MAX_XHTTP_DOWNLINK_BUFFER = envNumber('MAX_XHTTP_DOWNLINK_BUFFER', LOW_MEMORY_MODE ? 1024 * 1024 : 4 * 1024 * 1024, 256 * 1024, 16 * 1024 * 1024);
+const MAX_XHTTP_DOWNLINK_BUFFER = lowMemCap(envNumber('MAX_XHTTP_DOWNLINK_BUFFER', LOW_MEMORY_MODE ? 1024 * 1024 : 4 * 1024 * 1024, 256 * 1024, 16 * 1024 * 1024), LOW_XHTTP_LIMIT);
+// Global, not merely per-session: parallel/out-of-order POSTs from many
+// sessions must not accumulate an unbounded amount of memory.
+const MAX_XHTTP_QUEUED_BYTES = envNumber('MAX_XHTTP_QUEUED_BYTES', LOW_MEMORY_MODE ? 4 * 1024 * 1024 : 64 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024);
 const XHTTP_SESSION_TIMEOUT_MS = 300000;
 const XHTTP_RESPONSE_HEADERS = {
   'content-type': 'application/octet-stream',
@@ -174,6 +214,8 @@ const WS_MAX_CONNECTIONS_PER_COHORT = Math.max(1, Number(process.env.WS_MAX_CONN
 const WS_DUPLICATE_CLOSE_GRACE_MS = Math.max(250, Number(process.env.WS_DUPLICATE_CLOSE_GRACE_MS || 1500));
 // XHTTP raw request/session limiter: keeps packet-up bursts from accumulating many
 // stale server-side sessions while preserving the newest/active streams.
+// Keep the normal XHTTP concurrency even on small plans: trimming live
+// streams would look like a disconnect. Memory is bounded per stream instead.
 const XHTTP_MAX_CONNECTIONS_PER_COHORT = Math.max(2, Number(process.env.XHTTP_MAX_CONNECTIONS_PER_COHORT || 8));
 const XHTTP_MIN_IDLE_BEFORE_TRIM_MS = Math.max(5000, Number(process.env.XHTTP_MIN_IDLE_BEFORE_TRIM_MS || 15000));
 // Hybrid WS Fast Liveness: dashboard can go offline before transport termination.
@@ -188,12 +230,27 @@ const DEBUG_ACTIVE_CLIENTS = process.env.DEBUG_ACTIVE_CLIENTS === '1';
 // It does not change user configs; each connection is tuned after the VLESS target is parsed.
 const SMART_BOOSTER_ENABLED = process.env.SMART_BOOSTER === '0' ? false : true;
 const BOOSTER_DNS_TTL_MS = Math.max(5000, Number(process.env.BOOSTER_DNS_TTL_MS || 60000));
-const BOOSTER_DNS_CACHE_MAX = Math.max(64, Number(process.env.BOOSTER_DNS_CACHE_MAX || 512));
-const BOOSTER_DEST_MEMORY_MAX = Math.max(128, Number(process.env.BOOSTER_DEST_MEMORY_MAX || 2048));
+const BOOSTER_DNS_CACHE_MAX = lowMemCap(Math.max(64, Number(process.env.BOOSTER_DNS_CACHE_MAX || 512)), 64);
+const BOOSTER_DEST_MEMORY_MAX = lowMemCap(Math.max(128, Number(process.env.BOOSTER_DEST_MEMORY_MAX || 2048)), 128);
+// Reject a new mux substream at the limit; never evict an existing one.
+const MAX_MUX_SESSIONS = envNumber('MAX_MUX_SESSIONS', LOW_MEMORY_MODE ? 32 : 0, 0, 4096);
 const BOOSTER_BAD_ADDRESS_TTL_MS = Math.max(10000, Number(process.env.BOOSTER_BAD_ADDRESS_TTL_MS || 120000));
 const BOOSTER_UDP_BURST_WINDOW_MS = Math.max(50, Number(process.env.BOOSTER_UDP_BURST_WINDOW_MS || 250));
 const BOOSTER_UDP_BURST_PACKETS = Math.max(8, Number(process.env.BOOSTER_UDP_BURST_PACKETS || 80));
-const BOOSTER_PROFILE_BALANCED = Object.freeze({
+// The "smart booster" picks a profile per destination. Its speed/stable
+// presets allow multi-MiB queues and otherwise override low-memory settings.
+// Clamp the thresholds (they are limits, not preallocated buffer sizes).
+function clampProfileForMemory(profile) {
+  if (!LOW_MEMORY_MODE) return Object.freeze(profile);
+  return Object.freeze({
+    ...profile,
+    wsBackpressureLimit: Math.min(profile.wsBackpressureLimit, WS_BACKPRESSURE_LIMIT),
+    wsBackpressureResume: Math.min(profile.wsBackpressureResume, LOW_WS_RESUME),
+    xhttpDownlinkBufferLimit: Math.min(profile.xhttpDownlinkBufferLimit, MAX_XHTTP_DOWNLINK_BUFFER),
+    socketHighWaterMark: Math.min(profile.socketHighWaterMark, LOW_SOCKET_HWM)
+  });
+}
+const BOOSTER_PROFILE_BALANCED = clampProfileForMemory({
   name: 'balanced',
   wsBackpressureLimit: 4 * 1024 * 1024,
   wsBackpressureResume: 1 * 1024 * 1024,
@@ -206,7 +263,7 @@ const BOOSTER_PROFILE_BALANCED = Object.freeze({
   socketHighWaterMark: 64 * 1024,
   allowMux: true
 });
-const BOOSTER_PROFILE_LATENCY = Object.freeze({
+const BOOSTER_PROFILE_LATENCY = clampProfileForMemory({
   name: 'latency',
   wsBackpressureLimit: 512 * 1024,
   wsBackpressureResume: 128 * 1024,
@@ -219,7 +276,7 @@ const BOOSTER_PROFILE_LATENCY = Object.freeze({
   socketHighWaterMark: 16 * 1024,
   allowMux: false
 });
-const BOOSTER_PROFILE_SPEED = Object.freeze({
+const BOOSTER_PROFILE_SPEED = clampProfileForMemory({
   name: 'speed',
   wsBackpressureLimit: 16 * 1024 * 1024,
   wsBackpressureResume: 4 * 1024 * 1024,
@@ -232,7 +289,7 @@ const BOOSTER_PROFILE_SPEED = Object.freeze({
   socketHighWaterMark: 256 * 1024,
   allowMux: true
 });
-const BOOSTER_PROFILE_STABLE = Object.freeze({
+const BOOSTER_PROFILE_STABLE = clampProfileForMemory({
   name: 'stable',
   wsBackpressureLimit: 8 * 1024 * 1024,
   wsBackpressureResume: 2 * 1024 * 1024,
@@ -312,6 +369,22 @@ app.use(express.static(path.join(__dirname, 'public')));
 function log(message, extra = '') {
   const suffix = extra ? ` ${extra}` : '';
   console.log(`[${new Date().toISOString()}] ${message}${suffix}`);
+}
+
+// Drop only disposable caches under pressure; never close a live stream to
+// reclaim memory. The guard cannot guarantee avoidance of every OOM (e.g. a
+// huge allocation between samples, or memory consumed by another process).
+memoryGuard.onHard(() => shedMemory());
+let lastCacheShedAt = 0;
+function shedMemory() {
+  const now = Date.now();
+  if (now - lastCacheShedAt < 5000) return;
+  lastCacheShedAt = now;
+  if (boosterDnsCache.size > 32) boosterDnsCache.clear();
+  if (boosterDestMemory.size > 32) boosterDestMemory.clear();
+  for (const [ip, state] of loginAttempts) {
+    if (!state || (Number(state.lockedUntil || 0) <= now && Number(state.firstAt || 0) + LOGIN_WINDOW_MS < now)) loginAttempts.delete(ip);
+  }
 }
 
 function debugActive(message, data = null) {
@@ -1390,6 +1463,34 @@ function closeUdpSocket(socket) {
   }
 }
 
+// Used by XHTTP and MUX uploads. A false return from socket.write means the
+// producer must wait for drain; continuing to write would buffer without limit.
+function waitForSocketEvent(socket, event) {
+  return new Promise((resolve, reject) => {
+    if (!socket || socket.destroyed) return reject(new Error('remote socket closed'));
+    const cleanup = () => {
+      socket.removeListener(event, onReady);
+      socket.removeListener('error', onError);
+      socket.removeListener('close', onClose);
+    };
+    const onReady = () => { cleanup(); resolve(); };
+    const onError = (err) => { cleanup(); reject(err); };
+    const onClose = () => { cleanup(); reject(new Error('remote socket closed')); };
+    socket.once(event, onReady);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+  });
+}
+
+function writeSocketWithBackpressure(socket, data) {
+  if (!socket || socket.destroyed) return Promise.reject(new Error('remote socket closed'));
+  try {
+    return socket.write(data) ? Promise.resolve() : waitForSocketEvent(socket, 'drain');
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
 function isForbiddenTarget(host, port) {
   const h = String(host || '').toLowerCase();
   if (!h || port <= 0 || port > 65535) return true;
@@ -1913,6 +2014,8 @@ function drainUdpPackets(state, chunk, onPacket) {
     state.buffer = state.buffer.subarray(2 + packetLen);
     onPacket(packet);
   }
+  // Empty subarrays otherwise keep the last (possibly large) input buffer alive.
+  if (!state.buffer.length) state.buffer = Buffer.alloc(0);
 }
 
 function decodeEarlyDataFromProtocolHeader(header) {
@@ -2012,26 +2115,93 @@ async function sendQrSvg(res, payload) {
   res.send(svg);
 }
 
+// Bound simultaneous packet-up bodies across sessions. Waiters keep their HTTP
+// request paused, letting TCP backpressure the client instead of allocating a
+// full body for every POST at once. This does not limit the streaming endpoint.
+const MAX_PACKET_READERS = LOW_MEMORY_MODE ? 4 : 32;
+const MAX_PACKET_WAITERS = LOW_MEMORY_MODE ? 64 : 512;
+let activePacketReaders = 0;
+const packetReaderWaiters = [];
+
+function acquirePacketReader(req) {
+  return new Promise((resolve, reject) => {
+    let waiting = false;
+    const cancel = () => {
+      if (!waiting) return;
+      waiting = false;
+      const index = packetReaderWaiters.indexOf(grant);
+      if (index >= 0) packetReaderWaiters.splice(index, 1);
+      req.removeListener('aborted', cancel);
+      reject(new Error('request aborted'));
+    };
+    const grant = () => {
+      waiting = false;
+      req.removeListener('aborted', cancel);
+      if (req.destroyed) return reject(new Error('request aborted'));
+      activePacketReaders += 1;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activePacketReaders -= 1;
+        while (activePacketReaders < MAX_PACKET_READERS && packetReaderWaiters.length) {
+          packetReaderWaiters.shift()();
+        }
+      });
+    };
+    if (activePacketReaders < MAX_PACKET_READERS) return grant();
+    if (packetReaderWaiters.length >= MAX_PACKET_WAITERS) {
+      const err = new Error('xhttp packet readers busy');
+      err.statusCode = 503;
+      return reject(err);
+    }
+    waiting = true;
+    packetReaderWaiters.push(grant);
+    req.once('aborted', cancel);
+  });
+}
+
 function readRequestBody(req, limit) {
   return new Promise((resolve, reject) => {
+    if (req.destroyed || req.aborted) return reject(new Error('request aborted'));
+    const declaredLength = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > limit) {
+      req.resume();
+      return reject(new Error('request body too large'));
+    }
     const chunks = [];
     let size = 0;
-    req.on('data', (chunk) => {
+    const cleanup = () => {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAborted);
+    };
+    const onError = (err) => { cleanup(); reject(err); };
+    const onAborted = () => onError(new Error('request aborted'));
+    const onEnd = () => { cleanup(); resolve(Buffer.concat(chunks, size)); };
+    const onData = (chunk) => {
       size += chunk.length;
       if (size > limit) {
+        cleanup();
+        chunks.length = 0;
+        req.resume(); // drain without retaining data so a 413 can be returned
         reject(new Error('request body too large'));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-    req.on('aborted', () => reject(new Error('request aborted')));
+    };
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onError);
+    req.once('aborted', onAborted);
   });
 }
 
 const xhttpSessions = new Map();
+const pendingXhttpAdmissions = new Map();
+let pendingMuxAdmissions = 0;
+let xhttpQueuedPacketBytes = 0;
 
 class XHttpSession {
   constructor(sessionId) {
@@ -2060,7 +2230,7 @@ class XHttpSession {
     this.downlinkRes = null;
     this.nextSeq = 0;
     this.pendingPackets = new Map();
-    this.pendingRemoteWrites = [];
+    this.packetDrain = null;
     this.pendingDownlinkChunks = [];
     this.pendingDownlinkBytes = 0;
     this.streamInitBuffer = Buffer.alloc(0);
@@ -2068,7 +2238,42 @@ class XHttpSession {
     this.aliveTimer = null;
     this.lastActivity = Date.now();
     this.connectTimer = null;
+    this.pressureRetryTimer = null;
+    this.remotePausedByPressure = false;
+    this.hardPaceBytes = 0;
+    this.hardPauseUntil = 0;
+    this.unregisterPressure = memoryGuard.register(() => this.pumpDownlink());
     this.cleanupTimer = setTimeout(() => this.close('session timeout'), XHTTP_SESSION_TIMEOUT_MS);
+  }
+
+  xhttpPressureLimit() {
+    const base = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
+    return memoryGuard.limitFor(Math.min(base, LOW_MEMORY_MODE ? LOW_XHTTP_LIMIT : base), 32 * 1024);
+  }
+
+  setRemotePaused(paused) {
+    if (this.remotePausedByPressure === paused) return;
+    this.remotePausedByPressure = paused;
+    const r = this.remote;
+    if (r && !r.destroyed) {
+      try { if (paused) r.pause(); else r.resume(); } catch (_) {}
+    }
+    if (this.muxHandler && typeof this.muxHandler.setPaused === 'function') this.muxHandler.setPaused(paused);
+  }
+
+  schedulePressureRetry() {
+    const paceRemaining = Math.max(0, this.hardPauseUntil - Date.now());
+    if (this.closed || this.pressureRetryTimer || (!this.pendingDownlinkChunks.length && !paceRemaining)) return;
+    this.pressureRetryTimer = setTimeout(() => {
+      this.pressureRetryTimer = null;
+      this.pumpDownlink();
+    }, paceRemaining ? Math.min(100, paceRemaining) : 100);
+  }
+
+  downlinkBufferedBytes() {
+    const res = this.downlinkRes;
+    if (!res || res.writableEnded || res.destroyed) return 0;
+    return Number(res.writableLength || 0);
   }
 
   refresh() {
@@ -2134,40 +2339,68 @@ class XHttpSession {
     }, 1000);
 
     res.on('close', () => {
-      // In packet-up mode this is the only download pipe; closing it ends the session.
-      if (!this.closed) this.close('downlink closed');
+      // Ignore an older response that was just replaced by a new downlink.
+      if (!this.closed && this.downlinkRes === res) this.close('downlink closed');
     });
-    res.on('error', () => this.close('downlink error'));
+    res.on('error', () => { if (this.downlinkRes === res) this.close('downlink error'); });
+    // Node's writableLength is the real HTTP backpressure signal. Without this
+    // drain hook the pump would only retry on the guard tick.
+    res.on('drain', () => this.pumpDownlink());
 
-    this.flushDownlink();
+    this.pumpDownlink();
   }
 
   async processPacket(seq, data) {
     if (this.closed) throw new Error('session closed');
     if (!Number.isSafeInteger(seq) || seq < 0) throw new Error('invalid sequence');
-    if (this.pendingPackets.size > MAX_XHTTP_BUFFERED_POSTS) throw new Error('too many buffered posts');
+    // A retry of an already processed/queued packet is not a new packet.
+    if (seq < this.nextSeq || this.pendingPackets.has(seq)) return;
+    // Always allow the next expected packet: otherwise a full out-of-order
+    // queue could prevent the one packet capable of draining it from arriving.
+    if (seq !== this.nextSeq && this.pendingPackets.size >= MAX_XHTTP_BUFFERED_POSTS) {
+      const err = new Error('too many buffered posts');
+      err.statusCode = 503;
+      throw err;
+    }
 
+    const packet = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    // Reserve one extra POST for the expected sequence so out-of-order packets
+    // cannot fill the entire budget and deadlock the packet that drains them.
+    const ceiling = MAX_XHTTP_QUEUED_BYTES + (seq === this.nextSeq ? MAX_XHTTP_POST_SIZE : 0);
+    if (xhttpQueuedPacketBytes + packet.length > ceiling) {
+      const err = new Error('xhttp packet backlog full');
+      err.statusCode = 503;
+      throw err;
+    }
+    xhttpQueuedPacketBytes += packet.length;
     this.refresh();
-    // XHTTP packet-up request from the client is real client-side activity even
-    // when the body is tiny/empty keepalive-like traffic.
     this.touchData();
-    debugActive('xhttp-packet', { sid: this.sessionId, seq, bytes: data?.length || 0, endpointKey: this.unregisterConnection?.clientKey || this.clientKey || '' });
-    this.pendingPackets.set(seq, Buffer.isBuffer(data) ? data : Buffer.from(data));
+    debugActive('xhttp-packet', { sid: this.sessionId, seq, bytes: packet.length, endpointKey: this.unregisterConnection?.clientKey || this.clientKey || '' });
+    this.pendingPackets.set(seq, packet);
     await this.drainPackets();
   }
 
   async drainPackets() {
-    while (!this.closed && this.pendingPackets.has(this.nextSeq)) {
-      const seq = this.nextSeq;
-      const packet = this.pendingPackets.get(seq);
-      this.pendingPackets.delete(seq);
-      this.nextSeq += 1;
-
-      if (seq === 0) {
-        await this.initialize(packet);
-      } else {
-        this.writeToRemote(packet);
+    // Multiple POSTs can arrive concurrently. Only one writer may drain this
+    // map, or later packets could overtake initialization or a slow write.
+    while (!this.closed && (this.packetDrain || this.pendingPackets.has(this.nextSeq))) {
+      if (!this.packetDrain) {
+        this.packetDrain = (async () => {
+          while (!this.closed && this.pendingPackets.has(this.nextSeq)) {
+            const seq = this.nextSeq;
+            const packet = this.pendingPackets.get(seq);
+            this.pendingPackets.delete(seq);
+            this.nextSeq += 1;
+            try {
+              if (seq === 0) await this.initialize(packet);
+              else await this.writeToRemote(packet);
+            } finally {
+              xhttpQueuedPacketBytes = Math.max(0, xhttpQueuedPacketBytes - packet.length);
+            }
+          }
+        })().finally(() => { this.packetDrain = null; });
       }
+      await this.packetDrain;
     }
   }
 
@@ -2183,7 +2416,7 @@ class XHttpSession {
     debugActive('xhttp-stream-chunk', { sid: this.sessionId, bytes: chunk.length, endpointKey: this.unregisterConnection?.clientKey || this.clientKey || '' });
 
     if (this.established || this.remote || this.udpMode || this.muxMode) {
-      this.writeToRemote(chunk);
+      await this.writeToRemote(chunk);
       return;
     }
 
@@ -2241,12 +2474,11 @@ class XHttpSession {
         label: 'XHTTP MUX',
         profile: this.boosterProfile,
         touch: () => this.touchData(),
-        send: (chunk) => this.sendDownlink(chunk),
+        send: (chunk, meta) => this.sendDownlink(chunk, meta),
         close: (reason) => this.close(reason || 'mux closed')
       });
-      if (request.payload.length) this.writeToRemote(request.payload);
-      this.flushRemoteWrites();
-      return Promise.resolve();
+      if (this.remotePausedByPressure) this.muxHandler.setPaused(true);
+      return request.payload.length ? this.writeToRemote(request.payload) : Promise.resolve();
     }
 
     if (request.command === 0x02) {
@@ -2260,11 +2492,8 @@ class XHttpSession {
       this.udpSocket = dgram.createSocket(udpType);
       this.udpSocket.on('message', (msg) => {
         this.touchData();
-        const buffered = this.pendingDownlinkBytes || 0;
-        const limit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
-        if (shouldDropUdpForLatency(this.boosterProfile, this.udpDownlinkBurstState, buffered, limit)) return;
         try {
-          this.sendDownlink(encodeUdpPacket(msg), { accountDownlink: true, bytes: msg.length });
+          this.sendDownlink(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
         } catch (err) {
           log('[XHTTP UDP] Encode failed:', err.message);
           this.close('udp encode failed');
@@ -2277,44 +2506,42 @@ class XHttpSession {
       this.udpSocket.on('close', () => this.close('udp closed'));
       this.udpIdleTimer = setTimeout(() => this.close('udp idle timeout'), this.boosterProfile.udpIdleTimeoutMs || UDP_IDLE_TIMEOUT_MS);
 
-      if (request.payload.length) this.writeToRemote(request.payload);
-      this.flushRemoteWrites();
-      return Promise.resolve();
+      return request.payload.length ? this.writeToRemote(request.payload) : Promise.resolve();
     }
 
     return new Promise((resolve, reject) => {
       let settled = false;
-      this.connectTimer = setTimeout(() => {
+      const fail = (err) => {
         if (settled) return;
         settled = true;
+        clearTimeout(this.connectTimer);
+        reject(err);
+      };
+      this.connectTimer = setTimeout(() => {
+        fail(new Error('connect timeout'));
         this.close('connect timeout');
-        reject(new Error('connect timeout'));
       }, this.boosterProfile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
 
       this.remote = createBoostedTcpConnection(request.host, request.port, this.boosterProfile);
+      if (this.remotePausedByPressure) this.remote.pause();
       this.remote.setNoDelay(true);
       this.remote.setKeepAlive(true, 30000);
       this.remote.setTimeout(this.boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
 
       this.remote.once('connect', () => {
-        if (this.closed) return;
-        if (settled) return;
-        settled = true;
+        if (this.closed || settled) return;
         clearTimeout(this.connectTimer);
         this.established = true;
         this.flushDownlink();
-        if (request.payload.length) this.writeToRemote(request.payload);
-        this.flushRemoteWrites();
-        resolve();
+        const firstWrite = request.payload.length ? this.writeToRemote(request.payload) : Promise.resolve();
+        firstWrite.then(() => {
+          if (!settled) { settled = true; resolve(); }
+        }, fail);
       });
 
       this.remote.once('error', (err) => {
         log('[XHTTP Remote] Error:', `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
-        if (!settled) {
-          settled = true;
-          clearTimeout(this.connectTimer);
-          reject(err);
-        }
+        fail(err);
         this.close('remote error');
       });
 
@@ -2322,22 +2549,32 @@ class XHttpSession {
         this.touchData();
         this.sendDownlink(chunk, { accountDownlink: true, bytes: chunk.length });
       });
-      this.remote.on('drain', () => this.flushRemoteWrites());
-      this.remote.on('timeout', () => this.close('remote timeout'));
-      this.remote.on('close', () => this.close('remote closed'));
+      this.remote.on('timeout', () => {
+        if (!this.closed && (this.remotePausedByPressure || this.pendingDownlinkChunks.length > 0 || this.remote?.writableNeedDrain)) {
+          this.refresh();
+          return;
+        }
+        this.close('remote timeout');
+      });
+      this.remote.on('close', () => {
+        fail(new Error('remote closed'));
+        this.close('remote closed');
+      });
     });
   }
 
-  writeToRemote(chunk) {
-    if (this.closed) return;
+  async writeToRemote(chunk) {
+    if (this.closed) throw new Error('session closed');
     if (!chunk || chunk.length === 0) return;
 
     if (this.muxMode) {
       try {
-        this.muxHandler?.feed(chunk);
+        await this.muxHandler?.feed(chunk);
+        if (this.closed) throw new Error('session closed');
       } catch (err) {
         log('[XHTTP MUX] Bad frame:', err.message);
         this.close('bad mux frame');
+        throw err;
       }
       return;
     }
@@ -2348,19 +2585,17 @@ class XHttpSession {
       } catch (err) {
         log('[XHTTP UDP] Bad packet:', err.message);
         this.close('bad udp packet');
+        throw err;
       }
       return;
     }
 
-    if (!this.remote || !this.established || this.remote.destroyed) {
-      this.pendingRemoteWrites.push(chunk);
-      return;
-    }
-
+    const remote = this.remote;
+    if (!remote || remote.destroyed) throw new Error('remote socket closed');
+    if (!this.established) await waitForSocketEvent(remote, 'connect');
+    if (this.closed || remote.destroyed) throw new Error('remote socket closed');
     updateTraffic(this.user, chunk.length, 'uplink', () => this.touchData());
-    if (!this.remote.write(chunk)) {
-      // Let Node socket backpressure work; later packets remain queued if needed.
-    }
+    await writeSocketWithBackpressure(remote, chunk);
   }
 
   sendUdpPacket(packet) {
@@ -2385,42 +2620,28 @@ class XHttpSession {
     });
   }
 
-  flushRemoteWrites() {
-    if (this.muxMode || this.udpMode) {
-      while (this.pendingRemoteWrites.length) this.writeToRemote(this.pendingRemoteWrites.shift());
-      return;
-    }
-    if (!this.remote || !this.established || this.remote.destroyed) return;
-    while (this.pendingRemoteWrites.length) {
-      const chunk = this.pendingRemoteWrites.shift();
-      updateTraffic(this.user, chunk.length, 'uplink', () => this.touchData());
-      if (!this.remote.write(chunk)) break;
-    }
-  }
-
   sendDownlink(chunk, meta = {}) {
     if (this.closed) return;
-    const item = { chunk, accountBytes: meta.accountDownlink ? Number(meta.bytes || chunk.length || 0) : 0 };
-    if (!this.downlinkRes || this.downlinkRes.writableEnded || this.downlinkRes.destroyed) {
-      this.pendingDownlinkChunks.push(item);
-      this.pendingDownlinkBytes += chunk.length;
-      adaptXhttpDownlinkProfile(this, this.pendingDownlinkBytes);
-      const downlinkLimit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
-      if (this.pendingDownlinkBytes > downlinkLimit) {
-        this.close('downlink buffer overflow');
+    if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
+    const limit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
+    // Only datagrams can be dropped under pressure; dropping any TCP chunk
+    // corrupts the stream, even if the destination was classified as a game.
+    if (meta.udp && shouldDropUdpForLatency(this.boosterProfile, this.udpDownlinkBurstState, this.pendingDownlinkBytes, limit)) return;
+    if (meta.udp && (this.pendingDownlinkChunks.length > 0 || this.downlinkBufferedBytes() >= this.xhttpPressureLimit())) return;
+    if (LOW_MEMORY_MODE && memoryGuard.isHard() && !meta.udp) {
+      this.hardPaceBytes += chunk.length;
+      if (this.hardPaceBytes >= HARD_PACE_BYTES) {
+        this.hardPaceBytes = 0;
+        this.hardPauseUntil = Date.now() + HARD_PACE_MS;
       }
-      return;
     }
-    this.flushDownlink();
-    if (!this.downlinkRes.writableEnded) {
-      const ok = this.downlinkRes.write(chunk, () => {
-        if (item.accountBytes > 0 && !this.closed) {
-          updateTraffic(this.user, item.accountBytes, 'downlink', () => this.touchData());
-          recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesDown: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + item.accountBytes });
-        }
-      });
-      if (!ok) adaptXhttpDownlinkProfile(this, Math.max(this.pendingDownlinkBytes, chunk.length));
-    }
+    adaptXhttpDownlinkProfile(this, this.pendingDownlinkBytes);
+    this.pendingDownlinkChunks.push({
+      chunk,
+      accountBytes: meta.accountDownlink ? Number(meta.bytes || chunk.length || 0) : 0
+    });
+    this.pendingDownlinkBytes += chunk.length;
+    this.pumpDownlink();
   }
 
   sendVlessResponseHeader() {
@@ -2429,21 +2650,57 @@ class XHttpSession {
     this.downlinkRes.write(Buffer.from([this.version, 0x00]));
   }
 
-  flushDownlink() {
-    if (this.closed || !this.downlinkRes || this.downlinkRes.writableEnded) return;
-    if (this.established) this.sendVlessResponseHeader();
-    while (this.pendingDownlinkChunks.length && !this.downlinkRes.writableEnded) {
-      const item = this.pendingDownlinkChunks.shift();
-      const chunk = item.chunk || item;
-      const accountBytes = Number(item.accountBytes || 0);
-      this.pendingDownlinkBytes -= chunk.length;
-      this.downlinkRes.write(chunk, () => {
-        if (accountBytes > 0 && !this.closed) {
-          updateTraffic(this.user, accountBytes, 'downlink', () => this.touchData());
-          recordBoosterFlowMetric(this.boosterProfile?._boosterFlow, { bytesDown: Number(this.boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + accountBytes });
-        }
-      });
+  // Single writer for the XHTTP downlink. Previously res.write() was called on
+  // every remote 'data' event even when it returned false, so Node buffers grew
+  // without bound and the OOM killer won. Now the queue is bounded, the remote
+  // socket is paused (TCP window shrinks) and the session is never closed just
+  // because the client is slow.
+  pumpDownlink() {
+    if (this.closed) return;
+    const res = this.downlinkRes;
+    const canWrite = Boolean(res && !res.writableEnded && !res.destroyed);
+    if (canWrite && this.established) this.sendVlessResponseHeader();
+
+    const limit = this.xhttpPressureLimit();
+    const resumeAt = Math.max(16 * 1024, Math.floor(limit / 2));
+
+    if (canWrite) {
+      while (this.pendingDownlinkChunks.length) {
+        const item = this.pendingDownlinkChunks[0];
+        const chunk = item.chunk || item;
+        const buffered = this.downlinkBufferedBytes();
+        const allowance = Math.max(limit, chunk.length);
+        if (buffered + chunk.length > allowance) break;
+        this.pendingDownlinkChunks.shift();
+        this.pendingDownlinkBytes = Math.max(0, this.pendingDownlinkBytes - chunk.length);
+        const accountBytes = Number(item.accountBytes || 0);
+        const ok = res.write(chunk, () => {
+          if (accountBytes > 0 && !this.closed) {
+            updateTraffic(this.user, accountBytes, 'downlink', () => this.touchData());
+          }
+          this.pumpDownlink();
+        });
+        if (!ok) adaptXhttpDownlinkProfile(this, Math.max(this.pendingDownlinkBytes, this.downlinkBufferedBytes()));
+      }
     }
+
+    const waiting = this.pendingDownlinkChunks.length > 0;
+    if (!memoryGuard.isHard()) { this.hardPaceBytes = 0; this.hardPauseUntil = 0; }
+    const pacing = this.hardPauseUntil > Date.now();
+    const pauseThreshold = memoryGuard.isHard() ? 0 : resumeAt;
+    const mustPause = pacing || waiting || (!canWrite && this.pendingDownlinkBytes > 0) || this.downlinkBufferedBytes() > pauseThreshold;
+    if (mustPause) {
+      this.setRemotePaused(true);
+      this.refresh(); // stay "alive" in the panel while deliberately stalled
+      this.schedulePressureRetry();
+    } else {
+      this.setRemotePaused(false);
+    }
+  }
+
+  flushDownlink() {
+    // Kept for the initialize/connect call sites; the pump is now the only writer.
+    this.pumpDownlink();
   }
 
   close(reason = 'closed') {
@@ -2452,7 +2709,9 @@ class XHttpSession {
     clearTimeout(this.cleanupTimer);
     clearTimeout(this.connectTimer);
     clearTimeout(this.udpIdleTimer);
+    clearTimeout(this.pressureRetryTimer);
     clearInterval(this.aliveTimer);
+    if (this.unregisterPressure) { this.unregisterPressure(); this.unregisterPressure = null; }
     if (this.unregisterConnection) this.unregisterConnection();
     destroySocket(this.remote);
     closeUdpSocket(this.udpSocket);
@@ -2460,9 +2719,11 @@ class XHttpSession {
     if (this.downlinkRes && !this.downlinkRes.writableEnded) {
       try { this.downlinkRes.end(); } catch (_) {}
     }
+    for (const packet of this.pendingPackets.values()) {
+      xhttpQueuedPacketBytes = Math.max(0, xhttpQueuedPacketBytes - packet.length);
+    }
     this.pendingPackets.clear();
     this.streamInitBuffer = Buffer.alloc(0);
-    this.pendingRemoteWrites = [];
     this.pendingDownlinkChunks = [];
     this.pendingDownlinkBytes = 0;
     xhttpSessions.delete(this.sessionId);
@@ -2473,33 +2734,128 @@ class XHttpSession {
 }
 
 function getXHttpSession(sessionId) {
-  let session = xhttpSessions.get(sessionId);
-  if (!session || session.closed) {
-    session = new XHttpSession(sessionId);
-    xhttpSessions.set(sessionId, session);
-  }
-  return session;
+  const existing = xhttpSessions.get(sessionId);
+  if (existing && !existing.closed) return Promise.resolve(existing);
+  const pending = pendingXhttpAdmissions.get(sessionId);
+  if (pending) return pending;
+  const create = () => {
+    let session = xhttpSessions.get(sessionId);
+    if (!session || session.closed) {
+      session = new XHttpSession(sessionId);
+      xhttpSessions.set(sessionId, session);
+    }
+    return session;
+  };
+  if (memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) return Promise.resolve(create());
+  const busy = () => {
+    memoryGuard.recordAdmissionRejection();
+    const err = new Error('memory pressure: retry new session');
+    err.statusCode = 503;
+    return err;
+  };
+  if (!ADMISSION_WAIT_MS || pendingXhttpAdmissions.size >= MAX_PENDING_ADMISSIONS) return Promise.reject(busy());
+  // GET and POST for the same XHTTP session share one pending admission, so a
+  // transient burst waits instead of failing both halves of the connection.
+  const deadline = Date.now() + ADMISSION_WAIT_MS;
+  const admission = new Promise((resolve, reject) => {
+    const retry = () => {
+      if (memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) return resolve(create());
+      if (Date.now() >= deadline) return reject(busy());
+      setTimeout(retry, 100).unref();
+    };
+    setTimeout(retry, 100).unref();
+  });
+  pendingXhttpAdmissions.set(sessionId, admission);
+  const forget = () => {
+    if (pendingXhttpAdmissions.get(sessionId) === admission) pendingXhttpAdmissions.delete(sessionId);
+  };
+  admission.then(forget, forget);
+  return admission;
 }
 
 class MuxHandler {
-  constructor({ user, send, close, touch = null, label = 'MUX', profile = BOOSTER_PROFILE_BALANCED }) {
+  constructor({ user, send, close, touch = null, label = 'MUX', profile = BOOSTER_PROFILE_BALANCED,
+    onInputPause = null, onInputResume = null }) {
     this.user = user;
     this.profile = profile || BOOSTER_PROFILE_BALANCED;
     this.send = send;
     this.closeTransport = close;
     this.touch = touch;
     this.label = label;
+    this.onInputPause = onInputPause;
+    this.onInputResume = onInputResume;
     this.buffer = Buffer.alloc(0);
     this.sessions = new Map();
     this.udpBurstStates = new Map();
     this.closed = false;
+    this.paused = false;
+    this.blockedInputSocket = null;
+    this.pendingAdmissionFrame = null;
+    this.admissionTimer = null;
+    this.inputWaiters = [];
+    this.inputUnblock = null;
+  }
+
+  // Backpressure for mux sub-streams. Pausing reads here (rather than dropping
+  // frames) keeps the outer WebSocket connected and the TCP streams intact.
+  setPaused(paused) {
+    this.paused = Boolean(paused);
+    for (const session of this.sessions.values()) {
+      const r = session && session.remote;
+      if (!r || r.destroyed) continue;
+      try { if (this.paused) r.pause(); else r.resume(); } catch (_) {}
+    }
+  }
+
+  inputIsBlocked() {
+    return Boolean(this.blockedInputSocket || this.pendingAdmissionFrame);
+  }
+
+  continueInput() {
+    if (this.closed) return;
+    try {
+      this.parseInput();
+    } catch (err) {
+      log(`[${this.label}] Bad frame:`, err.message);
+      this.closeTransport('bad mux frame');
+      this.close();
+      return;
+    }
+    if (!this.inputIsBlocked() && !this.closed) {
+      this.onInputResume?.();
+      for (const resolve of this.inputWaiters.splice(0)) resolve();
+    }
+  }
+
+  blockInput(socket) {
+    if (this.closed || this.inputIsBlocked()) return;
+    this.blockedInputSocket = socket;
+    this.onInputPause?.();
+    const resume = () => {
+      socket.removeListener('drain', resume);
+      socket.removeListener('close', resume);
+      if (this.closed || this.blockedInputSocket !== socket) return;
+      this.blockedInputSocket = null;
+      this.inputUnblock = null;
+      this.continueInput();
+    };
+    this.inputUnblock = () => {
+      socket.removeListener('drain', resume);
+      socket.removeListener('close', resume);
+    };
+    socket.once('drain', resume);
+    socket.once('close', resume);
   }
 
   feed(chunk) {
     if (this.closed || !chunk || chunk.length === 0) return;
     this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : Buffer.from(chunk);
+    this.parseInput();
+    if (this.inputIsBlocked()) return new Promise((resolve) => this.inputWaiters.push(resolve));
+  }
 
-    while (this.buffer.length >= 2) {
+  parseInput() {
+    while (!this.closed && !this.inputIsBlocked() && this.buffer.length >= 2) {
       const metaLen = this.buffer.readUInt16BE(0);
       if (metaLen > 512) throw new Error('mux invalid metadata length');
       if (this.buffer.length < 2 + metaLen) break;
@@ -2532,14 +2888,64 @@ class MuxHandler {
         frameLen += 2 + dataLen;
       }
 
-      this.buffer = this.buffer.subarray(frameLen);
+      const remaining = this.buffer.subarray(frameLen);
+      this.buffer = remaining.length ? remaining : Buffer.alloc(0);
       this.handleFrame({ sessionId, status, option, target, data });
     }
+  }
+
+  waitForAdmission(frame) {
+    if (!ADMISSION_WAIT_MS || pendingMuxAdmissions >= MAX_PENDING_ADMISSIONS) {
+      memoryGuard.recordAdmissionRejection();
+      this.sendEnd(frame.sessionId, true);
+      return;
+    }
+    this.pendingAdmissionFrame = frame;
+    pendingMuxAdmissions += 1;
+    this.onInputPause?.();
+    const deadline = Date.now() + ADMISSION_WAIT_MS;
+    const retry = () => {
+      if (this.closed || !this.pendingAdmissionFrame) return;
+      const allowed = memoryGuard.admit(ADMISSION_RESERVE_BYTES, false);
+      if (!allowed && Date.now() < deadline) {
+        this.admissionTimer = setTimeout(retry, 100);
+        return;
+      }
+      const waiting = this.pendingAdmissionFrame;
+      this.pendingAdmissionFrame = null;
+      this.admissionTimer = null;
+      pendingMuxAdmissions -= 1;
+      try {
+        if (!allowed) {
+          memoryGuard.recordAdmissionRejection();
+          this.sendEnd(waiting.sessionId, true);
+        } else {
+          this.openSession(waiting.sessionId, waiting.target);
+          if (waiting.option & MUX_OPTION_DATA) this.writeSession(waiting.sessionId, waiting.data);
+        }
+        this.continueInput();
+      } catch (err) {
+        log(`[${this.label}] Admission failed:`, err.message);
+        this.closeTransport('mux admission failed');
+        this.close();
+      }
+    };
+    this.admissionTimer = setTimeout(retry, 100);
   }
 
   handleFrame(frame) {
     if (frame.status === MUX_STATUS_KEEPALIVE) return;
     if (frame.status === MUX_STATUS_NEW) {
+      if (!this.sessions.has(frame.sessionId)) {
+        if (MAX_MUX_SESSIONS && this.sessions.size >= MAX_MUX_SESSIONS) {
+          this.sendEnd(frame.sessionId, true);
+          return;
+        }
+        if (!memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) {
+          this.waitForAdmission(frame);
+          return;
+        }
+      }
       this.openSession(frame.sessionId, frame.target);
       if (frame.option & MUX_OPTION_DATA) this.writeSession(frame.sessionId, frame.data);
       return;
@@ -2556,7 +2962,7 @@ class MuxHandler {
   openSession(sessionId, target) {
     this.closeSession(sessionId, false, true);
     const category = detectDestinationCategory({ host: target.host, port: target.port, command: target.network === 'udp' ? 0x02 : 0x01 });
-    const session = { id: sessionId, target, category, remote: null, udp: null, connected: false, pending: [], pendingBytes: 0, closed: false };
+    const session = { id: sessionId, target, category, remote: null, udp: null, connected: false, closed: false };
     this.sessions.set(sessionId, session);
     if (target.network === 'udp') this.udpBurstStates.set(sessionId, createUdpBurstState());
 
@@ -2566,7 +2972,7 @@ class MuxHandler {
       session.connected = true;
       session.udp.on('message', (msg) => {
         updateTraffic(this.user, msg.length, 'downlink', this.touch);
-        this.sendData(sessionId, msg);
+        this.sendData(sessionId, msg, true);
       });
       session.udp.on('error', (err) => {
         log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
@@ -2577,17 +2983,14 @@ class MuxHandler {
     }
 
     session.remote = createBoostedTcpConnection(target.host, target.port, this.profile);
+    if (this.paused) {
+      try { session.remote.pause(); } catch (_) {}
+    }
     session.remote.setNoDelay(true);
     session.remote.setKeepAlive(true, 30000);
     session.remote.setTimeout(this.profile.idleTimeoutMs || IDLE_TIMEOUT_MS);
     session.remote.once('connect', () => {
       session.connected = true;
-      while (session.pending.length && session.remote && !session.remote.destroyed) {
-        const p = session.pending.shift();
-        session.pendingBytes = Math.max(0, Number(session.pendingBytes || 0) - p.length);
-        updateTraffic(this.user, p.length, 'uplink', this.touch);
-        if (!session.remote.write(p)) break;
-      }
     });
     session.remote.on('data', (data) => {
       updateTraffic(this.user, data.length, 'downlink', this.touch);
@@ -2599,6 +3002,7 @@ class MuxHandler {
       this.closeSession(sessionId, true);
     });
     session.remote.on('timeout', () => {
+      if (this.paused || this.blockedInputSocket === session.remote) return;
       this.sendEnd(sessionId, false);
       this.closeSession(sessionId, false);
     });
@@ -2639,23 +3043,25 @@ class MuxHandler {
       return;
     }
 
-    if (!session.remote || session.remote.destroyed || !session.connected) {
-      const pendingLimit = this.profile.name === 'speed' ? 2 * 1024 * 1024 : 512 * 1024;
-      session.pendingBytes = Number(session.pendingBytes || 0) + data.length;
-      if (session.pendingBytes > pendingLimit) {
-        log(`[${this.label}] Pending overflow:`, `${sessionId} ${formatBytes(session.pendingBytes)}`);
-        this.sendEnd(sessionId, true);
-        this.closeSession(sessionId, true);
-        return;
-      }
-      session.pending.push(Buffer.from(data));
-      return;
-    }
+    if (!session.remote || session.remote.destroyed) return;
     updateTraffic(this.user, data.length, 'uplink', this.touch);
-    session.remote.write(data);
+    // net.Socket accepts writes while connecting. Stop parsing further mux
+    // frames when its write buffer is full, and resume only on drain/close.
+    try {
+      if (!session.remote.write(data)) this.blockInput(session.remote);
+    } catch (err) {
+      this.sendEnd(sessionId, true);
+      this.closeSession(sessionId, true);
+    }
   }
 
-  sendData(sessionId, data) {
+  sendData(sessionId, data, udp = false) {
+    // Preserve a UDP datagram as one mux frame, so overload cannot drop half of
+    // it. TCP data is always delivered in order and can be backpressured.
+    if (udp && data.length <= 65535) {
+      this.send(encodeMuxFrame(sessionId, MUX_STATUS_KEEP, MUX_OPTION_DATA, null, data), { udp: true });
+      return;
+    }
     for (const chunk of splitMuxData(data)) {
       this.send(encodeMuxFrame(sessionId, MUX_STATUS_KEEP, MUX_OPTION_DATA, null, chunk));
     }
@@ -2671,7 +3077,6 @@ class MuxHandler {
     session.closed = true;
     destroySocket(session.remote);
     closeUdpSocket(session.udp);
-    session.pending = [];
     this.sessions.delete(sessionId);
     this.udpBurstStates.delete(sessionId);
     if (hasError && !silent) log(`[${this.label}] Session closed with error:`, String(sessionId));
@@ -2680,6 +3085,16 @@ class MuxHandler {
   close() {
     if (this.closed) return;
     this.closed = true;
+    this.inputUnblock?.();
+    this.inputUnblock = null;
+    this.blockedInputSocket = null;
+    if (this.pendingAdmissionFrame) {
+      pendingMuxAdmissions -= 1;
+      this.pendingAdmissionFrame = null;
+    }
+    clearTimeout(this.admissionTimer);
+    this.admissionTimer = null;
+    for (const resolve of this.inputWaiters.splice(0)) resolve();
     for (const id of Array.from(this.sessions.keys())) this.closeSession(id, false, true);
     this.buffer = Buffer.alloc(0);
   }
@@ -2807,9 +3222,16 @@ function readMemoryStatValue(filePath, key) {
 }
 
 function getSystemMemoryStats() {
-  // Dashboard RAM should match what users expect from `free -h`:
-  // (MemTotal - MemAvailable) / MemTotal. Some PaaS images (Railway) don't ship
-  // the `free` binary, but /proc/meminfo is still available and is what free uses.
+  // On a small plan /proc/meminfo may describe the entire host rather than the
+  // limit that can OOM-kill this service. Use cgroup (or explicitly labelled
+  // RSS fallback) there; retain the existing host view on larger plans.
+  if (LOW_MEMORY_MODE && !memoryGuard.enabled) memoryGuard.sample();
+  if (LOW_MEMORY_MODE && memoryGuard.limitResolvedBytes && memoryGuard.usedBytes) {
+    const total = memoryGuard.limitResolvedBytes;
+    const used = memoryGuard.usedBytes;
+    return { total, used, percent: Math.round((used / total) * 100), source: memoryGuard.usageSource };
+  }
+  // Fallback to host statistics when no process/container limit is available.
   try {
     const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
     const totalKb = Number((meminfo.match(/^MemTotal:\s+(\d+)/m) || [])[1] || 0);
@@ -2957,8 +3379,16 @@ app.get('/api/health', (req, res) => {
     port: PORT,
     db_path: DB_PATH,
     storage: storageMode(DB_PATH),
-    memory_limit_mb: CONSTRAINED_MEMORY_MB || null,
-    low_memory_mode: LOW_MEMORY_MODE
+    memory_limit_mb: EFFECTIVE_MEMORY_LIMIT_MB || null,
+    detected_memory_limit_mb: CONSTRAINED_MEMORY_MB || null,
+    low_memory_mode: LOW_MEMORY_MODE,
+    memory_guard: {
+      ...memoryGuard.stats(),
+      pending_ws_upgrades: pendingWsUpgrades,
+      pending_xhttp_sessions: pendingXhttpAdmissions.size,
+      pending_mux_streams: pendingMuxAdmissions,
+      xhttp_packet_buffer_bytes: xhttpQueuedPacketBytes
+    }
   });
 });
 
@@ -2980,19 +3410,26 @@ app.options(`${XHTTP_PATH}/*`, (req, res) => {
   res.end();
 });
 
-app.get([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
+app.get([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], async (req, res) => {
   const sessionId = String(req.params.sessionId || '').trim();
   if (sessionId.length < 1 || sessionId.length > 256) {
     res.writeHead(400, XHTTP_RESPONSE_HEADERS);
     res.end();
     return;
   }
-  const session = getXHttpSession(sessionId);
-  session.attachDownlink(req, res);
+  try {
+    const session = await getXHttpSession(sessionId);
+    if (req.destroyed || res.destroyed) return;
+    session.attachDownlink(req, res);
+  } catch (err) {
+    if (err.statusCode === 503) res.setHeader('Retry-After', '1');
+    res.writeHead(err.statusCode || 500, XHTTP_RESPONSE_HEADERS);
+    res.end();
+  }
 });
 
 // XHTTP stream-up upload channel: one long-lived POST carrying ordered VLESS bytes.
-app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) => {
+app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], async (req, res) => {
   const sessionId = String(req.params.sessionId || '').trim();
   if (sessionId.length < 1 || sessionId.length > 256) {
     res.writeHead(400, XHTTP_RESPONSE_HEADERS);
@@ -3000,7 +3437,16 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
     return;
   }
 
-  const session = getXHttpSession(sessionId);
+  let session;
+  try { session = await getXHttpSession(sessionId); }
+  catch (err) {
+    if (err.statusCode === 503) res.setHeader('Retry-After', '1');
+    res.writeHead(err.statusCode || 500, XHTTP_RESPONSE_HEADERS);
+    res.end();
+    req.resume();
+    return;
+  }
+  if (req.destroyed || res.destroyed) return;
   if (!session.clientIp || session.clientIp === 'unknown') {
     session.clientIp = getClientIp(req);
     session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
@@ -3024,9 +3470,8 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], (req, res) =
   });
 
   req.on('end', () => {
-    session.streamQueue.finally(() => {
-      if (!res.writableEnded) res.end();
-    });
+    const finish = () => { if (!res.writableEnded) res.end(); };
+    session.streamQueue.then(finish, finish);
   });
   req.on('error', () => {
     failed = true;
@@ -3048,9 +3493,11 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
     return;
   }
 
+  let releaseReader;
   try {
+    const session = await getXHttpSession(sessionId);
+    releaseReader = await acquirePacketReader(req);
     const body = await readRequestBody(req, MAX_XHTTP_POST_SIZE);
-    const session = getXHttpSession(sessionId);
     if (!session.clientIp || session.clientIp === 'unknown') {
       session.clientIp = getClientIp(req);
       session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
@@ -3060,8 +3507,15 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
     res.end();
   } catch (err) {
     log('[XHTTP] POST failed:', err && err.message ? err.message : 'unknown');
-    if (!res.headersSent) res.writeHead(err && err.message === 'request body too large' ? 413 : 500, XHTTP_RESPONSE_HEADERS);
+    const status = err?.statusCode || (err?.message === 'request body too large' ? 413 : 500);
+    if (!res.headersSent) {
+      if (status === 503) res.setHeader('Retry-After', '1');
+      res.writeHead(status, XHTTP_RESPONSE_HEADERS);
+    }
     try { res.end(); } catch (_) {}
+    if (!req.destroyed) req.resume();
+  } finally {
+    releaseReader?.();
   }
 });
 
@@ -3632,6 +4086,57 @@ server.on('error', (err) => {
 });
 
 const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: MAX_WS_PAYLOAD });
+let pendingWsUpgrades = 0;
+
+function rejectWsUpgrade(socket) {
+  memoryGuard.recordAdmissionRejection();
+  socket.once('error', () => {});
+  socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n');
+}
+
+function admitWsUpgrade(req, socket, head) {
+  const upgrade = (wasPaused) => {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+      if (wasPaused && !socket.destroyed) socket.resume();
+    });
+  };
+  if (memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) return upgrade(false);
+  // A brief burst need not look like a disconnect: hold a small, bounded number
+  // of handshakes while the previous burst settles, then try again. When the
+  // service remains full, return 503 instead of killing existing connections.
+  if (!ADMISSION_WAIT_MS || pendingWsUpgrades >= MAX_PENDING_ADMISSIONS) return rejectWsUpgrade(socket);
+  pendingWsUpgrades += 1;
+  socket.pause();
+  const deadline = Date.now() + ADMISSION_WAIT_MS;
+  let timer;
+  let done = false;
+  const cleanup = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    socket.removeListener('close', onClose);
+    socket.removeListener('error', onError);
+    pendingWsUpgrades -= 1;
+  };
+  const onClose = () => cleanup();
+  const onError = () => { cleanup(); socket.destroy(); };
+  socket.once('close', onClose);
+  socket.once('error', onError);
+  const retry = () => {
+    if (done || socket.destroyed) return cleanup();
+    if (memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) {
+      cleanup();
+      return upgrade(true);
+    }
+    if (Date.now() >= deadline) {
+      cleanup();
+      return rejectWsUpgrade(socket);
+    }
+    timer = setTimeout(retry, 100);
+  };
+  timer = setTimeout(retry, 100);
+}
 
 server.on('upgrade', (req, socket, head) => {
   let url;
@@ -3642,7 +4147,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  admitWsUpgrade(req, socket, head);
 });
 
 wss.on('connection', (ws, req) => {
@@ -3668,11 +4173,24 @@ wss.on('connection', (ws, req) => {
   const udpBurstState = createUdpBurstState();
   const udpDownlinkBurstState = createUdpBurstState();
   const pendingClientChunks = [];
+  let remoteWriteBlocked = false;
+  let clientInputPaused = false;
   let wsAlive = true;
   let lastPongAt = Date.now();
   let lastPingAt = 0;
   let wsDashboardMarkedOffline = false;
   let boosterProfile = BOOSTER_PROFILE_BALANCED;
+
+  // Bounded downlink queue + adaptive backpressure. All WS writes go through
+  // pumpDownlink(), so a slow client can no longer make ws.bufferedAmount grow
+  // into the OOM killer (and no connection is closed to shed load).
+  const downlinkQueue = [];
+  let downlinkQueueBytes = 0;
+  let downlinkRetryTimer = null;
+  let remotePausedByPressure = false;
+  let hardPaceBytes = 0;
+  let hardPauseUntil = 0;
+  const unregisterPressure = memoryGuard.register(() => pumpDownlink());
 
   let wsPingTimer = null;
   function markWsDashboardOffline() {
@@ -3691,12 +4209,21 @@ wss.on('connection', (ws, req) => {
   }
   scheduleWsPing();
 
-  let idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
+  let idleTimer = setTimeout(handleIdleTimeout, boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
   let connectTimer = setTimeout(() => closeAll(1013, 'connect timeout'), boosterProfile.connectTimeoutMs || CONNECT_TIMEOUT_MS);
+
+  function handleIdleTimeout() {
+    if (!closed && (clientInputPaused || remotePausedByPressure)) {
+      unregisterConnection?.touchLiveness?.();
+      idleTimer = setTimeout(handleIdleTimeout, boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
+      return;
+    }
+    closeAll(1000, 'idle timeout');
+  }
 
   function resetIdleTimer() {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => closeAll(1000, 'idle timeout'), boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
+    idleTimer = setTimeout(handleIdleTimeout, boosterProfile.idleTimeoutMs || IDLE_TIMEOUT_MS);
   }
 
   function resetConnectTimer() {
@@ -3721,42 +4248,112 @@ wss.on('connection', (ws, req) => {
     clearTimeout(connectTimer);
     clearTimeout(wsPingTimer);
     clearTimeout(udpIdleTimer);
+    clearTimeout(downlinkRetryTimer);
+    unregisterPressure();
     if (unregisterConnection) unregisterConnection();
+    downlinkQueue.length = 0;
+    downlinkQueueBytes = 0;
+    pendingClientChunks.length = 0;
     destroySocket(remote);
     closeUdpSocket(udpSocket);
     muxHandler?.close();
     safeCloseWebSocket(ws, code, reason);
   }
 
-  function sendToWs(chunk, meta = {}) {
-    if (closed || ws.readyState !== ws.OPEN) return false;
-    const backpressureLimit = boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT;
-    const backpressureResume = boosterProfile.wsBackpressureResume || WS_BACKPRESSURE_RESUME;
-    if (meta.udp && shouldDropUdpForLatency(boosterProfile, udpDownlinkBurstState, ws.bufferedAmount, backpressureLimit)) return false;
-    if (ws.bufferedAmount > backpressureLimit) {
-      if (remote) remote.pause();
-      const interval = setInterval(() => {
-        if (closed || ws.readyState !== ws.OPEN) { clearInterval(interval); return; }
-        if (ws.bufferedAmount < backpressureResume) {
-          clearInterval(interval);
-          if (remote) remote.resume();
-        }
-      }, 25);
+  function wsPressureLimit() {
+    const base = boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT;
+    return memoryGuard.limitFor(Math.min(base, LOW_MEMORY_MODE ? LOW_WS_LIMIT : base), 32 * 1024);
+  }
+
+  function wsPressureResume() {
+    const profileResume = boosterProfile.wsBackpressureResume || WS_BACKPRESSURE_RESUME;
+    return Math.max(16 * 1024, Math.min(Math.floor(wsPressureLimit() / 2), Math.floor(profileResume * memoryGuard.scale())));
+  }
+
+  function setRemotePaused(paused) {
+    if (paused === remotePausedByPressure) return;
+    remotePausedByPressure = paused;
+    if (remote && !remote.destroyed) {
+      try { if (paused) remote.pause(); else remote.resume(); } catch (_) {}
     }
-    ws.send(chunk, { binary: true }, (err) => {
+    if (muxHandler && typeof muxHandler.setPaused === 'function') muxHandler.setPaused(paused);
+  }
+
+  function scheduleDownlinkRetry() {
+    const paceRemaining = Math.max(0, hardPauseUntil - Date.now());
+    if (closed || downlinkRetryTimer || (!downlinkQueue.length && !paceRemaining)) return;
+    downlinkRetryTimer = setTimeout(() => {
+      downlinkRetryTimer = null;
+      pumpDownlink();
+    }, paceRemaining ? Math.min(100, paceRemaining) : 100);
+  }
+
+  function writeWsChunk(item) {
+    ws.send(item.chunk, { binary: true }, (err) => {
       if (err) {
         log('[WS] Send failed:', err.message);
         closeAll(1011, 'websocket send failed');
         return;
       }
-      if (meta.accountDownlink && user) {
-        const bytes = Number(meta.bytes || chunk.length || 0);
+      if (item.accountDownlink && user) {
+        const bytes = Number(item.bytes || item.chunk.length || 0);
         if (bytes > 0) {
           updateTraffic(user, bytes, 'downlink', () => unregisterConnection?.touchData?.());
-          recordBoosterFlowMetric(boosterProfile?._boosterFlow, { bytesDown: Number(boosterProfile?._boosterFlow?.metrics?.bytesDown || 0) + bytes });
         }
       }
+      pumpDownlink();
     });
+  }
+
+  // The only place that writes to the WebSocket. Bounded queue + upstream
+  // pause means RAM stops growing; resume happens as soon as the client drains
+  // or the memory guard recovers, so the connection is never dropped.
+  function pumpDownlink() {
+    if (closed || ws.readyState !== ws.OPEN) return;
+    const limit = wsPressureLimit();
+    const resumeAt = wsPressureResume();
+    while (downlinkQueue.length) {
+      const item = downlinkQueue[0];
+      const allowance = Math.max(limit, item.chunk.length);
+      if (ws.bufferedAmount + item.chunk.length > allowance) break;
+      downlinkQueue.shift();
+      downlinkQueueBytes -= item.chunk.length;
+      writeWsChunk(item);
+    }
+    if (!memoryGuard.isHard()) { hardPaceBytes = 0; hardPauseUntil = 0; }
+    const pacing = hardPauseUntil > Date.now();
+    const pauseThreshold = memoryGuard.isHard() ? 0 : resumeAt;
+    const mustPause = pacing || downlinkQueue.length > 0 || ws.bufferedAmount > pauseThreshold;
+    if (mustPause) {
+      setRemotePaused(true);
+      refreshIdleTimer();
+      scheduleDownlinkRetry();
+    } else {
+      setRemotePaused(false);
+    }
+  }
+
+  function sendToWs(chunk, meta = {}) {
+    if (closed || ws.readyState !== ws.OPEN) return false;
+    const baseLimit = boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT;
+    if (meta.udp && shouldDropUdpForLatency(boosterProfile, udpDownlinkBurstState, ws.bufferedAmount, baseLimit)) return false;
+    // UDP datagrams may be discarded; TCP stream bytes may not.
+    if (meta.udp && (downlinkQueue.length > 0 || ws.bufferedAmount >= wsPressureLimit())) return false;
+    if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
+    if (LOW_MEMORY_MODE && memoryGuard.isHard() && !meta.udp) {
+      hardPaceBytes += chunk.length;
+      if (hardPaceBytes >= HARD_PACE_BYTES) {
+        hardPaceBytes = 0;
+        hardPauseUntil = Date.now() + HARD_PACE_MS;
+      }
+    }
+    downlinkQueue.push({
+      chunk,
+      accountDownlink: Boolean(meta.accountDownlink),
+      bytes: Number(meta.bytes || chunk.length || 0)
+    });
+    downlinkQueueBytes += chunk.length;
+    pumpDownlink();
     return true;
   }
 
@@ -3766,13 +4363,29 @@ wss.on('connection', (ws, req) => {
     sendToWs(Buffer.from([version, 0x00]));
   }
 
+  function pauseClientInput() {
+    if (clientInputPaused || closed) return;
+    clientInputPaused = true;
+    // Stop reading WS messages while the destination cannot keep up. Merely
+    // checking socket.write(false) without pausing leaves an unbounded queue.
+    ws.pause();
+  }
+
+  function resumeClientInput() {
+    if (!clientInputPaused || closed) return;
+    clientInputPaused = false;
+    ws.resume();
+  }
+
   function flushPendingClientChunks() {
     if (!remote || remote.destroyed || !established) return;
-    while (pendingClientChunks.length) {
+    while (!remoteWriteBlocked && pendingClientChunks.length) {
       const chunk = pendingClientChunks.shift();
       updateTraffic(user, chunk.length, 'uplink', () => unregisterConnection?.touchData?.());
-      if (!remote.write(chunk)) break;
+      if (!remote.write(chunk)) remoteWriteBlocked = true;
     }
+    if (remoteWriteBlocked || pendingClientChunks.length) pauseClientInput();
+    else resumeClientInput();
   }
 
   function sendUdpPacket(packet) {
@@ -3840,9 +4453,12 @@ wss.on('connection', (ws, req) => {
           label: 'WS MUX',
           profile: boosterProfile,
           touch: () => unregisterConnection?.touchData?.(),
-          send: (chunk) => sendToWs(chunk),
-          close: (reason) => closeAll(1000, reason || 'mux closed')
+          send: (chunk, meta) => sendToWs(chunk, meta),
+          close: (reason) => closeAll(1000, reason || 'mux closed'),
+          onInputPause: pauseClientInput,
+          onInputResume: resumeClientInput
         });
+        if (remotePausedByPressure) muxHandler.setPaused(true);
         try {
           if (request.payload.length) muxHandler.feed(request.payload);
           while (pendingClientChunks.length) muxHandler.feed(pendingClientChunks.shift());
@@ -3890,6 +4506,9 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
+      // Hold subsequent WS messages until the target connects, instead of
+      // accumulating an unlimited pendingClientChunks array during DNS/connect.
+      pauseClientInput();
       remote = createBoostedTcpConnection(request.host, request.port, boosterProfile);
       remote.setNoDelay(true);
       remote.setKeepAlive(true, 30000);
@@ -3902,10 +4521,7 @@ wss.on('connection', (ws, req) => {
         sendVlessResponseHeader(request.version);
         if (request.payload.length) {
           updateTraffic(user, request.payload.length, 'uplink', () => unregisterConnection?.touchData?.());
-          if (!remote.write(request.payload)) {
-            // Do not pause the underlying WebSocket HTTP socket. Pausing req.socket
-            // can stall WS frames/control flow and cause reconnect loops under load.
-          }
+          if (!remote.write(request.payload)) remoteWriteBlocked = true;
         }
         flushPendingClientChunks();
       });
@@ -3921,11 +4537,22 @@ wss.on('connection', (ws, req) => {
       });
 
       remote.on('drain', () => {
+        remoteWriteBlocked = false;
         flushPendingClientChunks();
       });
 
-      remote.on('timeout', () => closeAll(1000, 'remote timeout'));
+      remote.on('timeout', () => {
+        // While throttled the socket is deliberately quiet. Keep it open.
+        if (!closed && (remotePausedByPressure || clientInputPaused || downlinkQueue.length > 0 || ws.bufferedAmount > 0)) {
+          refreshIdleTimer();
+          return;
+        }
+        closeAll(1000, 'remote timeout');
+      });
       remote.on('close', () => closeAll(1000, 'remote closed'));
+      if (remotePausedByPressure) {
+        try { remote.pause(); } catch (_) {}
+      }
       return;
     }
 
@@ -3954,14 +4581,16 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    if (!established) {
+    if (!established || remoteWriteBlocked || pendingClientChunks.length) {
       pendingClientChunks.push(chunk);
+      pauseClientInput();
       return;
     }
 
     updateTraffic(user, chunk.length, 'uplink', () => unregisterConnection?.touchData?.());
     if (!remote.write(chunk)) {
-      // Let Node TCP backpressure apply naturally; never pause req.socket for WS.
+      remoteWriteBlocked = true;
+      pauseClientInput();
     }
   }
 
@@ -4095,6 +4724,7 @@ let shuttingDown = false;
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  memoryGuard.stop();
   log('[INFO] Received', signal, '- draining connections');
 
   try { flushTrafficBuffers(); saveDBNow(); }
@@ -4128,6 +4758,7 @@ process.on('uncaughtException', (err) => log('[ERROR] Uncaught:', err && err.sta
 process.on('unhandledRejection', (err) => log('[ERROR] Unhandled:', err && err.stack ? err.stack : String(err)));
 
 loadDB();
+memoryGuard.start();
 server.listen(PORT, '0.0.0.0', () => {
   // Abasthan injects PORT; Deplexo injects it from `run.port`; local dev uses
   // the 3000 fallback. Printing it makes the port scan result unambiguous.
@@ -4139,7 +4770,12 @@ server.listen(PORT, '0.0.0.0', () => {
   log('[INFO] XHTTP path:', XHTTP_PATH);
   log('[INFO] Default admin:', 'admin / admin');
   log('[INFO] Storage:', storageMode(DB_PATH), '-', DB_PATH);
-  if (CONSTRAINED_MEMORY_MB) log('[INFO] Container memory limit (MB):', String(CONSTRAINED_MEMORY_MB));
+  if (EFFECTIVE_MEMORY_LIMIT_MB) log('[INFO] Effective memory limit (MB):', String(EFFECTIVE_MEMORY_LIMIT_MB));
+  log('[INFO] Memory guard:', JSON.stringify(memoryGuard.stats()));
+  if (LOW_MEMORY_MODE) log('[INFO] Low-memory mode: lower per-connection buffers enabled');
+  if (memoryGuard.usageSource === 'rss' && EFFECTIVE_MEMORY_LIMIT_MB > 0) {
+    log('[WARN] cgroup usage unavailable; RSS excludes other processes and kernel memory');
+  }
   // Keep-alive startup info
   if (!KEEPALIVE_ENABLED) {
     log('[KEEPALIVE] Disabled via KEEPALIVE_ENABLED=0 (Deplexo containers are always-on)');
