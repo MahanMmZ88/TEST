@@ -1,6 +1,6 @@
 # اجرای کم‌حافظه: برنامهٔ ۱۲۸ MiB
 
-نسخهٔ `2.3.0` · شناسهٔ بیلد `lowmem-2026-10-27-a`
+نسخهٔ `2.3.0` · شناسهٔ بیلد `memstats-2026-10-27-a`
 
 ## چه چیزی ممکن است؟
 
@@ -100,7 +100,7 @@ cgroup v2 قابل‌نوشتن، `sudo` بدون رمز، `runuser` و Python �
 
 ```bash
 curl -s https://YOUR-HOST/health
-# ok - lowmem-2026-10-27-a
+# ok - memstats-2026-10-27-a
 curl -s https://YOUR-HOST/api/health
 ```
 

@@ -82,9 +82,18 @@ MEMORY_LIMIT_MB=128
 NODE_OPTIONS=--max-old-space-size=48 --max-semi-space-size=1
 ```
 
-بعد از Redeploy، `GET /api/health` و فیلد `memory_guard` را بررسی کنید. جزئیات،
-محدودیت‌ها و نتایج تست واقعی cgroup: **[LOW_MEMORY_128MB_GUIDE.md](LOW_MEMORY_128MB_GUIDE.md)**.
-تست رگرسیون: `npm test`.
+بعد از Redeploy، `GET /api/health` و فیلد `memory_guard` را بررسی کنید. در پلن‌های
+بزرگ‌تر هم گارد به‌طور پیش‌فرض در ۶۲٪ وارد حالت `soft` و در ۷۸٪ وارد حالت `hard`
+می‌شود؛ در حالت `hard` اتصال جدید ممکن است رد شود، حتی اگر هیچ اتصالی برقرار نباشد.
+برای تشخیص، مقدار `rejected_new_connections` را پیش و پس از تلاش برای اتصال مقایسه کنید.
+
+وقتی سقف حافظه مشخص باشد، عدد RAM داشبورد و گارد از یک مبنا استفاده می‌کنند.
+مصرف cgroup شامل cache و حافظهٔ کرنل نیز هست و لزوماً فقط مصرف Node نیست؛ منبع
+اندازه‌گیری در `ram_source` و `memory_guard.usage_source` گزارش می‌شود. fallback
+از نوع `rss` فقط یک تخمین از مصرف پردازش است.
+
+جزئیات، محدودیت‌ها و نتایج تست واقعی cgroup:
+**[LOW_MEMORY_128MB_GUIDE.md](LOW_MEMORY_128MB_GUIDE.md)**. تست رگرسیون: `npm test`.
 
 ### نکات کلیدی
 

@@ -26,7 +26,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'lowmem-2026-10-27-a';
+const BUILD_ID = 'memstats-2026-10-27-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
@@ -3222,11 +3222,11 @@ function readMemoryStatValue(filePath, key) {
 }
 
 function getSystemMemoryStats() {
-  // On a small plan /proc/meminfo may describe the entire host rather than the
-  // limit that can OOM-kill this service. Use cgroup (or explicitly labelled
-  // RSS fallback) there; retain the existing host view on larger plans.
-  if (LOW_MEMORY_MODE && !memoryGuard.enabled) memoryGuard.sample();
-  if (LOW_MEMORY_MODE && memoryGuard.limitResolvedBytes && memoryGuard.usedBytes) {
+  // On any container plan, /proc/meminfo may describe the host rather than the
+  // memory budget that can OOM-kill this service. Report the same limit and
+  // usage used by the guard, with the RSS fallback explicitly labelled.
+  if (!memoryGuard.enabled) memoryGuard.sample();
+  if (memoryGuard.limitResolvedBytes && memoryGuard.usedBytes) {
     const total = memoryGuard.limitResolvedBytes;
     const used = memoryGuard.usedBytes;
     return { total, used, percent: Math.round((used / total) * 100), source: memoryGuard.usageSource };
