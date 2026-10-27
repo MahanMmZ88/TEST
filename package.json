@@ -1,6 +1,6 @@
 {
   "name": "mahan-panel-vless-ws-node",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
   "main": "server.js",
@@ -8,8 +8,10 @@
     "prestart": "node scripts/ensure-deps.js",
     "start": "node server.js",
     "dev": "node server.js",
-    "build": "node scripts/ensure-deps.js && node --check server.js",
-    "check": "node --check server.js"
+    "build": "node scripts/ensure-deps.js && node --check server.js && node --check scripts/memory-guard.js",
+    "check": "node --check server.js && node --check scripts/memory-guard.js",
+    "test": "node --test test/*.test.js",
+    "test:cgroup": "node test/cgroup-stress.js"
   },
   "engines": {
     "node": ">=20.3.0"

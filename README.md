@@ -68,13 +68,30 @@ npm start              # http://localhost:3000/  (admin / admin)
 `nixpacks.toml` بقیه را انجام دهد. جزئیات و عیبیابی:
 **[BELMO_DEPLOY_GUIDE.md](BELMO_DEPLOY_GUIDE.md)**.
 
+## پلن ۱۲۸ مگابایتی (کاهش خطر OOM و حفظ اتصال‌ها)
+
+گارد حافظه مصرف cgroup را پایش می‌کند و همراه backpressure، بافرهای WS/XHTTP را
+در فشار کم می‌کند و جریان TCP را موقتاً آهسته می‌کند. اتصال‌های برقرارشده برای
+آزادکردن حافظه عمداً بسته نمی‌شوند، اما در بار مداوم ممکن است اتصال جدید بعد از
+انتظار `503` بگیرد. OOM یا نبودِ قطعی در همهٔ شرایط قابل تضمین نیست.
+
+برای یک سرویس ۱۲۸ MiB، در Environment داشبورد:
+
+```text
+MEMORY_LIMIT_MB=128
+NODE_OPTIONS=--max-old-space-size=48 --max-semi-space-size=1
+```
+
+بعد از Redeploy، `GET /api/health` و فیلد `memory_guard` را بررسی کنید. جزئیات،
+محدودیت‌ها و نتایج تست واقعی cgroup: **[LOW_MEMORY_128MB_GUIDE.md](LOW_MEMORY_128MB_GUIDE.md)**.
+تست رگرسیون: `npm test`.
+
 ### نکات کلیدی
 
 - سرور همیشه روی `0.0.0.0` و `process.env.PORT` (فالبک 3000) گوش میدهد؛
   `/`, `/health`, `/healthz` همگی 200 هستند، `/api/health` وضعیت storage/RAM را میگوید.
 - دیتابیس روی volume پایدار `/data/db.json`؛ در صورت عدم دسترسی به `/tmp` فالبک میکند.
 - متغیرها: `.env.example` را ببینید.
-- پلن رایگان Deplexo فقط 128MB RAM / 0.25 CPU دارد؛ حالت کمحافظه بافرهای XHTTP را کوچک میکند.
 
 > ⚠️ **هشدار مهم:** قوانین [Deplexo](https://docs.deplexo.com/reference/acceptable-use/#proxy-vpn-and-traffic-relay-services)
 > اجرای سرور پروکسی/VPN/تانل ترافیک عمومی را حتی خصوصی ممنوع کرده است. رفع مشکلات فنی
