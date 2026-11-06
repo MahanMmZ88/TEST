@@ -63,7 +63,7 @@ function websocketUpgradeStatus(port) {
   });
 }
 
-async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, users = [] } = {}) {
+async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, users = [], countGuardPumps = false, nodeOptions = '' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-memory-diagnostics-'));
   const dbPath = path.join(dir, 'db.json');
   const snapshot = path.join(dir, 'memory.json');
@@ -86,7 +86,9 @@ async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, user
       PORT: String(port), DB_PATH: dbPath, PANEL_TEST_MEMORY_SNAPSHOT: snapshot,
       MEMORY_LIMIT_MB: '', MEMORY_GUARD: guard ? '1' : '0',
       MEMORY_GUARD_SOFT: '', MEMORY_GUARD_HARD: '', MEMORY_GUARD_RECOVER: '',
-      MEMORY_GUARD_WAIT_MS: '', NODE_OPTIONS: '', KEEPALIVE_ENABLED: '0'
+      MEMORY_GUARD_INTERVAL_MS: countGuardPumps ? '5000' : '',
+      PANEL_TEST_COUNT_GUARD_PUMPS: countGuardPumps ? '1' : '0',
+      MEMORY_GUARD_WAIT_MS: '', NODE_OPTIONS: nodeOptions, KEEPALIVE_ENABLED: '0'
     },
     stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -204,7 +206,7 @@ test('memory diagnostics', async (suite) => {
     const panel = await launchPanel(t);
     const snapshot = await health(panel.port);
     const dashboard = await stats(panel.port, await login(panel.port));
-    assert.equal(snapshot.build, 'stability-2026-10-27-a');
+    assert.equal(snapshot.build, 'udp-stability-2026-11-06-a');
     assert.equal(snapshot.low_memory_mode, false);
     assert.equal(snapshot.memory_guard.used_mb, 300);
     assert.equal(snapshot.memory_guard.limit_mb, 1024);
@@ -212,6 +214,14 @@ test('memory diagnostics', async (suite) => {
     assert.equal(dashboard.ram_used, 300 * MB);
     assert.equal(dashboard.ram_total, 1024 * MB);
     assert.equal(dashboard.ram_usage, 29);
+  });
+
+  await suite.test('health exposes a lingering 128 MiB heap setting after a 1 GiB upgrade', async (t) => {
+    const panel = await launchPanel(t, { nodeOptions: '--max-old-space-size=48 --max-semi-space-size=1' });
+    const snapshot = await health(panel.port);
+    assert.equal(snapshot.memory_limit_mb, 1024);
+    assert.ok(snapshot.node_heap.limit_mb >= 48 && snapshot.node_heap.limit_mb <= 64);
+    assert.ok(snapshot.node_heap.used_mb > 0 && snapshot.node_heap.used_mb < snapshot.node_heap.limit_mb);
   });
 
   await suite.test('dashboard retains cgroup-based reporting for 128 MiB plans', async (t) => {
@@ -253,6 +263,45 @@ test('memory diagnostics', async (suite) => {
     assert.equal(snapshot.memory_guard.active, false);
     assert.ok(['proc-meminfo', 'cgroup-v2-raw', 'cgroup-v1-raw', 'os'].includes(dashboard.ram_source));
     assert.ok(dashboard.ram_total > 0);
+  });
+
+  await suite.test('connection churn does not repump all established WS flows per admission', async (t) => {
+    const users = [{ id: 'churn-user', remark: 'test', uuid: '11111111111111111111111111111111',
+      is_active: 1, traffic_limit: 0, connection_limit: 0 }];
+    const panel = await launchPanel(t, { users, countGuardPumps: true });
+    const port = await echoTarget(t);
+    const clients = [];
+    t.after(() => { for (const ws of clients) ws.terminate(); });
+    const prefix = Buffer.from('before-churn');
+    const suffix = Buffer.from('after-churn');
+    const before = Buffer.concat([Buffer.from([0, 0]), prefix]);
+    const expected = Buffer.concat([before, suffix]);
+    const receivers = [];
+    for (let i = 0; i < 40; i++) {
+      const ws = new WebSocket(`ws://127.0.0.1:${panel.port}/ws`);
+      clients.push(ws);
+      const read = captureBytes(ws, 'message');
+      await timeout(once(ws, 'open'), 3000, 'established WS upgrade');
+      ws.send(Buffer.concat([vlessHeader(port), prefix]));
+      assert.deepEqual(await timeout(read(before.length), 3000, 'established WS echo'), before);
+      receivers.push(read);
+    }
+    const prior = (await health(panel.port)).memory_guard.test_pump_calls;
+    // These upgrades use the real admission path while 40 echo streams are
+    // already active. A 5-second guard interval separates timer work from
+    // admission work; allow a few timer ticks on a slow CI machine.
+    await timeout(Promise.all(Array.from({ length: 80 }, async () => {
+      const ws = new WebSocket(`ws://127.0.0.1:${panel.port}/ws`);
+      ws.on('error', () => {});
+      clients.push(ws);
+      await once(ws, 'open');
+      ws.terminate();
+    })), 10000, 'concurrent WS admissions');
+    const after = (await health(panel.port)).memory_guard.test_pump_calls;
+    assert.ok(after - prior < 800, `too many synchronous guard pumps: ${after - prior}`);
+    for (let i = 0; i < receivers.length; i++) clients[i].send(suffix);
+    const results = await timeout(Promise.all(receivers.map((read) => read(expected.length))), 5000, 'echo after churn');
+    for (const result of results) assert.deepEqual(result, expected);
   });
 
   await suite.test('hard pressure preserves established WS and XHTTP traffic while refusing new sessions', async (t) => {

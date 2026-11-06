@@ -22,5 +22,17 @@ memory.MemoryGuard = class TestMemoryGuard extends OriginalMemoryGuard {
         };
       }
     });
+    this.testPumpCalls = 0;
+  }
+
+  register(fn) {
+    if (process.env.PANEL_TEST_COUNT_GUARD_PUMPS !== '1' || typeof fn !== 'function') return super.register(fn);
+    return super.register((guard) => { this.testPumpCalls += 1; fn(guard); });
+  }
+
+  stats() {
+    const result = super.stats();
+    if (process.env.PANEL_TEST_COUNT_GUARD_PUMPS === '1') result.test_pump_calls = this.testPumpCalls || 0;
+    return result;
   }
 };

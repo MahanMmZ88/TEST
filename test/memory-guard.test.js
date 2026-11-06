@@ -83,9 +83,43 @@ test('admission samples immediately and rejects only new work under hard pressur
   assert.equal(guard.admit(), false);
   assert.equal(guard.stats().rejected_new_connections, 1);
   assert.equal(guard.stats().targets, 1);
-  assert.ok(liveCalls >= 2, 'existing transports stay registered');
+  assert.equal(liveCalls, 1, 'hard pressure immediately notifies existing transports');
   set(85);
   assert.equal(guard.admit(), true);
+  assert.equal(liveCalls, 2, 'recovery also immediately notifies existing transports');
+});
+
+test('steady-state admissions do not synchronously repump every existing connection', () => {
+  let used = 256 * MB;
+  let samples = 0;
+  let pumps = 0;
+  let sheds = 0;
+  const guard = new MemoryGuard({
+    limitMb: 1024,
+    readUsage: () => { samples += 1; return { used, limit: 1024 * MB, source: 'test' }; }
+  });
+  for (let i = 0; i < 500; i++) guard.register(() => { pumps += 1; });
+  guard.onHard(() => { sheds += 1; });
+  guard.tick();
+  pumps = 0;
+  samples = 0;
+
+  for (let i = 0; i < 1000; i++) assert.equal(guard.admit(), true);
+  assert.equal(samples, 1000, 'every admission still samples the latest memory');
+  assert.equal(pumps, 0, 'unchanged memory pressure must not repump all 500 flows per admission');
+  guard.tick();
+  assert.equal(pumps, 500, 'the normal periodic tick still services all transports');
+
+  used = 900 * MB;
+  assert.equal(guard.admit(), false, 'hard pressure rejects the next admission immediately');
+  assert.equal(pumps, 1000, 'hard-pressure transition immediately notifies established transports');
+  assert.equal(sheds, 1, 'hard-pressure transition immediately sheds disposable caches');
+  assert.equal(guard.admit(), false);
+  assert.equal(pumps, 1000, 'repeated admissions at the same pressure do not repump');
+  assert.equal(sheds, 1);
+  guard.tick();
+  assert.equal(pumps, 1500, 'the periodic tick still retries under pressure');
+  assert.equal(sheds, 2);
 });
 
 test('burst projection reserves headroom until fresh usage can be sampled', () => {
