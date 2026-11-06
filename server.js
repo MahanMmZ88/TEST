@@ -8,6 +8,7 @@ const dns = require('dns').promises;
 const path = require('path');
 const fs = require('fs');
 const v8 = require('v8');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const crypto = require('crypto');
 const express = require('express');
 const cookieParser = require('cookie-parser');
@@ -18,6 +19,26 @@ const { MemoryGuard } = require('./scripts/memory-guard');
 const app = express();
 app.set('trust proxy', true);
 
+// A bounded rolling event-loop histogram helps distinguish an overloaded Node
+// process from latency elsewhere in the network. It is not a network ping.
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
+function eventLoopDelaySnapshot() {
+  const samples = Number(eventLoopDelay.count || 0);
+  const ms = (ns) => Math.round((Number(ns) / 1e6) * 10) / 10;
+  return {
+    samples,
+    p95_ms: samples ? ms(eventLoopDelay.percentile(95)) : null,
+    p99_ms: samples ? ms(eventLoopDelay.percentile(99)) : null,
+    max_ms: samples ? ms(eventLoopDelay.max) : null
+  };
+}
+let previousEventLoopWindow = null;
+setInterval(() => {
+  previousEventLoopWindow = eventLoopDelaySnapshot();
+  eventLoopDelay.reset();
+}, 10000).unref();
+
 // Deplexo injects PORT from `run.port` in deplexo.yaml. An invalid saved PORT can
 // stay in the environment while routing still uses 3000, so always validate it.
 function resolvePort() {
@@ -27,7 +48,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'udp-stability-2026-11-06-a';
+const BUILD_ID = 'transport-fairness-2026-11-06-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
@@ -173,11 +194,18 @@ const MAX_UDP_PACKET_SIZE = 64 * 1024;
 const UDP_IDLE_TIMEOUT_MS = 60000;
 const SELF_PING_INTERVAL_MS = 5 * 60 * 1000;
 const MAX_XHTTP_POST_SIZE = lowMemCap(envNumber('MAX_XHTTP_POST_SIZE', 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), 1024 * 1024);
-const MAX_XHTTP_BUFFERED_POSTS = envNumber('MAX_XHTTP_BUFFERED_POSTS', LOW_MEMORY_MODE ? 8 : 32, 2, 64);
+// Allow modest reordering/bursts even on small hosts. The independent global
+// byte budget still caps memory; eight tiny packets could reject an otherwise
+// healthy flow while its destination was only briefly slow to connect.
+const MAX_XHTTP_BUFFERED_POSTS = envNumber('MAX_XHTTP_BUFFERED_POSTS', 32, 2, 64);
 const MAX_XHTTP_DOWNLINK_BUFFER = lowMemCap(envNumber('MAX_XHTTP_DOWNLINK_BUFFER', LOW_MEMORY_MODE ? 1024 * 1024 : 4 * 1024 * 1024, 256 * 1024, 16 * 1024 * 1024), LOW_XHTTP_LIMIT);
 // Global, not merely per-session: parallel/out-of-order POSTs from many
 // sessions must not accumulate an unbounded amount of memory.
 const MAX_XHTTP_QUEUED_BYTES = envNumber('MAX_XHTTP_QUEUED_BYTES', LOW_MEMORY_MODE ? 4 * 1024 * 1024 : 64 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024);
+// Byte limits alone do not bound HTTP/Promise/Map overhead for many tiny or
+// empty packets, especially when an upstream is stalled. Keep a global count
+// as well as the per-session count, with one reserved expected packet below.
+const MAX_XHTTP_QUEUED_PACKETS = envNumber('MAX_XHTTP_QUEUED_PACKETS', LOW_MEMORY_MODE ? 256 : 4096, 32, 65536);
 const XHTTP_SESSION_TIMEOUT_MS = 300000;
 const XHTTP_RESPONSE_HEADERS = {
   'content-type': 'application/octet-stream',
@@ -203,8 +231,8 @@ const DEVICE_RECENT_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_RECENT_
 const DEVICE_STALE_MS = Math.max(30000, Number(process.env.DEVICE_STALE_MS || 90000));
 // MDIE v3: Active Client is recent client-side activity/heartbeat, not raw open sockets.
 const DEVICE_ACTIVITY_WINDOW_MS = Math.max(3000, Number(process.env.DEVICE_ACTIVITY_WINDOW_MS || 7000));
-// Mahan Active Client Tracker v3: fast traffic/heartbeat based online counter.
-// Keep this >= 2x XHTTP hKeepAlivePeriod so XHTTP keepalive does not flicker.
+// Dashboard activity is based on application traffic, not HTTP/2 PINGs:
+// those terminate at a reverse proxy and do not reach this process.
 const ACTIVE_CLIENT_TTL_MS = Math.max(1500, Number(process.env.ACTIVE_CLIENT_TTL_MS || 6000));
 const ACTIVE_CLIENT_STABILIZE_MS = Math.max(0, Number(process.env.ACTIVE_CLIENT_STABILIZE_MS || 800));
 const ACTIVE_CLIENT_SPLIT_STABLE_MS = Math.max(2000, Number(process.env.ACTIVE_CLIENT_SPLIT_STABLE_MS || 8000));
@@ -239,6 +267,39 @@ const MAX_MUX_SESSIONS = envNumber('MAX_MUX_SESSIONS', LOW_MEMORY_MODE ? 32 : 0,
 const BOOSTER_BAD_ADDRESS_TTL_MS = Math.max(10000, Number(process.env.BOOSTER_BAD_ADDRESS_TTL_MS || 120000));
 // Aggregate overload diagnostics for this process; reset on restart.
 const udpDrops = { uplink_queue_full: 0, downlink_pressure: 0 };
+
+// Fixed, aggregate buckets only: no user IDs, addresses, destinations or
+// session IDs. These count transport lifecycles, not physical VPN clients.
+// A peer closure may be a normal client close OR a proxy/network interruption.
+function makeTransportCounters() {
+  return {
+    opened: 0,
+    closed: 0,
+    closed_by: { peer: 0, upstream: 0, timeout: 0, policy: 0, protocol: 0, error: 0, other: 0 }
+  };
+}
+const transportCounters = {
+  websocket: makeTransportCounters(),
+  xhttp: makeTransportCounters(),
+  xhttp_packet_503: 0,
+  xhttp_packet_413: 0
+};
+
+function countTransportClose(kind, reason) {
+  const counters = transportCounters[kind];
+  const why = String(reason || '');
+  let bucket = 'other';
+  if (why.includes('timeout')) bucket = 'timeout';
+  else if (['client limit exceeded', 'quota exceeded', 'expired', 'user disabled', 'user deleted', 'connections cleared'].includes(why)) bucket = 'policy';
+  else if (why.startsWith('bad ') || why === 'binary frames required') bucket = 'protocol';
+  else if (['remote closed', 'remote error', 'remote not available', 'udp closed', 'udp error', 'udp send or resolve failed'].includes(why)) bucket = 'upstream';
+  else if (['websocket closed', 'underlying socket closed', 'underlying socket ended', 'underlying socket error',
+    'downlink closed', 'downlink error', 'stream-up aborted', 'stream-up request error'].includes(why)) bucket = 'peer';
+  else if (why.includes('error') || why.includes('failed')) bucket = 'error';
+  counters.closed += 1;
+  counters.closed_by[bucket] += 1;
+}
+
 // The "smart booster" picks a profile per destination. Its speed/stable
 // presets allow multi-MiB queues and otherwise override low-memory settings.
 // Clamp the thresholds (they are limits, not preallocated buffer sizes).
@@ -2145,9 +2206,11 @@ function buildWsVlessLink(req, user) {
 function buildXhttpVlessLink(req, user, deviceToken = '') {
   const { host, port, security, isTls } = getPublicEndpoint(req);
   const tag = encodeURIComponent((user.remark || 'Mahan') + '-XHTTP');
-  // Lightweight XHTTP heartbeat only: no concurrency/reuse limits, no quicParams.
-  // hKeepAlivePeriod keeps idle XHTTP visible with a tiny client-side keepalive.
-  const xhttpExtra = encodeURIComponent(JSON.stringify({ xmux: { hKeepAlivePeriod: 2 } }));
+  // Match Xray's normal HTTP/2 idle PING interval. A two-second interval can
+  // trigger proxy ping-rate enforcement, and HTTP/2 PINGs terminate at the edge
+  // anyway: they do not update dashboard activity or keep an HTTP response alive.
+  // Keep this nonzero so other XMUX limits retain the existing configuration.
+  const xhttpExtra = encodeURIComponent(JSON.stringify({ xmux: { hKeepAlivePeriod: 45 } }));
   const xhttpPath = deviceToken ? `/xhttp/t/${encodeURIComponent(deviceToken)}` : '/xhttp';
   let link = `vless://${user.uuid}@${host}:${port}?encryption=none&security=${security}&type=xhttp&host=${encodeURIComponent(host)}&path=${encodeURIComponent(xhttpPath)}&mode=packet-up&extra=${xhttpExtra}`;
   if (isTls) link += `&sni=${encodeURIComponent(host)}&alpn=h2%2Chttp%2F1.1&fp=chrome`;
@@ -2198,48 +2261,77 @@ async function sendQrSvg(res, payload) {
   res.send(svg);
 }
 
-// Bound simultaneous packet-up bodies across sessions. Waiters keep their HTTP
-// request paused, letting TCP backpressure the client instead of allocating a
-// full body for every POST at once. This does not limit the streaming endpoint.
+// Bound simultaneous packet-up bodies globally and per session. Waiters keep
+// their HTTP request paused, letting TCP backpressure the client instead of
+// allocating a full body for every POST. This does not limit the streaming endpoint.
 const MAX_PACKET_READERS = LOW_MEMORY_MODE ? 4 : 32;
+const MAX_PACKET_READERS_PER_SESSION = LOW_MEMORY_MODE ? 2 : 8;
 const MAX_PACKET_WAITERS = LOW_MEMORY_MODE ? 64 : 512;
+const MAX_XHTTP_ADMISSION_WAITERS = LOW_MEMORY_MODE ? 64 : 512;
 let activePacketReaders = 0;
+let pendingXhttpAdmissionRequests = 0;
 const packetReaderWaiters = [];
+const activePacketReadersBySession = new Map();
 
-function acquirePacketReader(req) {
+function decrementSessionCount(map, sessionId) {
+  const count = map.get(sessionId) || 0;
+  if (count <= 1) map.delete(sessionId);
+  else map.set(sessionId, count - 1);
+}
+
+function drainPacketReaderWaiters() {
+  while (activePacketReaders < MAX_PACKET_READERS && packetReaderWaiters.length) {
+    // Do not let a queue of requests from one slow uploader block other
+    // sessions which can use the remaining reader slots.
+    const index = packetReaderWaiters.findIndex((entry) =>
+      (activePacketReadersBySession.get(entry.sessionId) || 0) < MAX_PACKET_READERS_PER_SESSION);
+    if (index < 0) return;
+    packetReaderWaiters.splice(index, 1)[0].grant();
+  }
+}
+
+function acquirePacketReader(req, sessionId) {
   return new Promise((resolve, reject) => {
+    if (req.destroyed || req.aborted) return reject(new Error('request aborted'));
     let waiting = false;
+    let entry;
     const cancel = () => {
       if (!waiting) return;
       waiting = false;
-      const index = packetReaderWaiters.indexOf(grant);
+      const index = packetReaderWaiters.indexOf(entry);
       if (index >= 0) packetReaderWaiters.splice(index, 1);
       req.removeListener('aborted', cancel);
       reject(new Error('request aborted'));
+      drainPacketReaderWaiters();
     };
     const grant = () => {
       waiting = false;
       req.removeListener('aborted', cancel);
       if (req.destroyed) return reject(new Error('request aborted'));
       activePacketReaders += 1;
+      activePacketReadersBySession.set(sessionId, (activePacketReadersBySession.get(sessionId) || 0) + 1);
       let released = false;
       resolve(() => {
         if (released) return;
         released = true;
         activePacketReaders -= 1;
-        while (activePacketReaders < MAX_PACKET_READERS && packetReaderWaiters.length) {
-          packetReaderWaiters.shift()();
-        }
+        decrementSessionCount(activePacketReadersBySession, sessionId);
+        drainPacketReaderWaiters();
       });
     };
-    if (activePacketReaders < MAX_PACKET_READERS) return grant();
+    // First service eligible existing waiters. If their sessions are at their
+    // per-session cap, a new session can still use a free reader immediately.
+    drainPacketReaderWaiters();
+    if (activePacketReaders < MAX_PACKET_READERS &&
+        (activePacketReadersBySession.get(sessionId) || 0) < MAX_PACKET_READERS_PER_SESSION) return grant();
     if (packetReaderWaiters.length >= MAX_PACKET_WAITERS) {
       const err = new Error('xhttp packet readers busy');
       err.statusCode = 503;
       return reject(err);
     }
     waiting = true;
-    packetReaderWaiters.push(grant);
+    entry = { sessionId, grant };
+    packetReaderWaiters.push(entry);
     req.once('aborted', cancel);
   });
 }
@@ -2285,9 +2377,11 @@ const xhttpSessions = new Map();
 const pendingXhttpAdmissions = new Map();
 let pendingMuxAdmissions = 0;
 let xhttpQueuedPacketBytes = 0;
+let xhttpQueuedPacketCount = 0;
 
 class XHttpSession {
   constructor(sessionId) {
+    transportCounters.xhttp.opened += 1;
     this.sessionId = sessionId;
     this.user = null;
     this.remote = null;
@@ -2445,12 +2539,14 @@ class XHttpSession {
     // Reserve one extra POST for the expected sequence so out-of-order packets
     // cannot fill the entire budget and deadlock the packet that drains them.
     const ceiling = MAX_XHTTP_QUEUED_BYTES + (seq === this.nextSeq ? MAX_XHTTP_POST_SIZE : 0);
-    if (xhttpQueuedPacketBytes + packet.length > ceiling) {
+    const packetCeiling = MAX_XHTTP_QUEUED_PACKETS + (seq === this.nextSeq ? 1 : 0);
+    if (xhttpQueuedPacketBytes + packet.length > ceiling || xhttpQueuedPacketCount + 1 > packetCeiling) {
       const err = new Error('xhttp packet backlog full');
       err.statusCode = 503;
       throw err;
     }
     xhttpQueuedPacketBytes += packet.length;
+    xhttpQueuedPacketCount += 1;
     this.refresh();
     this.touchData();
     debugActive('xhttp-packet', { sid: this.sessionId, seq, bytes: packet.length, endpointKey: this.unregisterConnection?.clientKey || this.clientKey || '' });
@@ -2475,6 +2571,7 @@ class XHttpSession {
               await this._processStreamChunk(packet);
             } finally {
               xhttpQueuedPacketBytes = Math.max(0, xhttpQueuedPacketBytes - packet.length);
+              xhttpQueuedPacketCount = Math.max(0, xhttpQueuedPacketCount - 1);
             }
           }
         })().finally(() => { this.packetDrain = null; });
@@ -2777,6 +2874,7 @@ class XHttpSession {
   close(reason = 'closed') {
     if (this.closed) return;
     this.closed = true;
+    countTransportClose('xhttp', reason);
     clearTimeout(this.cleanupTimer);
     clearTimeout(this.connectTimer);
     clearTimeout(this.udpIdleTimer);
@@ -2792,6 +2890,7 @@ class XHttpSession {
     }
     for (const packet of this.pendingPackets.values()) {
       xhttpQueuedPacketBytes = Math.max(0, xhttpQueuedPacketBytes - packet.length);
+      xhttpQueuedPacketCount = Math.max(0, xhttpQueuedPacketCount - 1);
     }
     this.pendingPackets.clear();
     this.streamInitBuffer = Buffer.alloc(0);
@@ -2804,11 +2903,29 @@ class XHttpSession {
   }
 }
 
+function xhttpAdmissionBusy() {
+  memoryGuard.recordAdmissionRejection();
+  const err = new Error('memory pressure: retry new session');
+  err.statusCode = 503;
+  return err;
+}
+
+function waitForXhttpAdmission(admission) {
+  // A pending session is shared by GET and POST. Bound the number of HTTP
+  // requests waiting on that shared promise too: otherwise one session ID can
+  // bypass the cap on distinct pending sessions and retain unlimited requests.
+  if (pendingXhttpAdmissionRequests >= MAX_XHTTP_ADMISSION_WAITERS) {
+    return Promise.reject(xhttpAdmissionBusy());
+  }
+  pendingXhttpAdmissionRequests += 1;
+  return admission.finally(() => { pendingXhttpAdmissionRequests -= 1; });
+}
+
 function getXHttpSession(sessionId) {
   const existing = xhttpSessions.get(sessionId);
   if (existing && !existing.closed) return Promise.resolve(existing);
   const pending = pendingXhttpAdmissions.get(sessionId);
-  if (pending) return pending;
+  if (pending) return waitForXhttpAdmission(pending);
   const create = () => {
     let session = xhttpSessions.get(sessionId);
     if (!session || session.closed) {
@@ -2818,20 +2935,15 @@ function getXHttpSession(sessionId) {
     return session;
   };
   if (memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) return Promise.resolve(create());
-  const busy = () => {
-    memoryGuard.recordAdmissionRejection();
-    const err = new Error('memory pressure: retry new session');
-    err.statusCode = 503;
-    return err;
-  };
-  if (!ADMISSION_WAIT_MS || pendingXhttpAdmissions.size >= MAX_PENDING_ADMISSIONS) return Promise.reject(busy());
+  if (!ADMISSION_WAIT_MS || pendingXhttpAdmissions.size >= MAX_PENDING_ADMISSIONS ||
+      pendingXhttpAdmissionRequests >= MAX_XHTTP_ADMISSION_WAITERS) return Promise.reject(xhttpAdmissionBusy());
   // GET and POST for the same XHTTP session share one pending admission, so a
   // transient burst waits instead of failing both halves of the connection.
   const deadline = Date.now() + ADMISSION_WAIT_MS;
   const admission = new Promise((resolve, reject) => {
     const retry = () => {
       if (memoryGuard.admit(ADMISSION_RESERVE_BYTES, false)) return resolve(create());
-      if (Date.now() >= deadline) return reject(busy());
+      if (Date.now() >= deadline) return reject(xhttpAdmissionBusy());
       setTimeout(retry, 100).unref();
     };
     setTimeout(retry, 100).unref();
@@ -2841,7 +2953,7 @@ function getXHttpSession(sessionId) {
     if (pendingXhttpAdmissions.get(sessionId) === admission) pendingXhttpAdmissions.delete(sessionId);
   };
   admission.then(forget, forget);
-  return admission;
+  return waitForXhttpAdmission(admission);
 }
 
 class MuxHandler {
@@ -3455,13 +3567,41 @@ app.get('/api/health', (req, res) => {
     detected_memory_limit_mb: CONSTRAINED_MEMORY_MB || null,
     low_memory_mode: LOW_MEMORY_MODE,
     node_heap: { used_mb: Math.round(heapUsed / (1024 * 1024)), limit_mb: Math.round(heapLimit / (1024 * 1024)) },
+    event_loop_delay: {
+      resolution_ms: 20,
+      window_ms: 10000,
+      current: eventLoopDelaySnapshot(),
+      previous: previousEventLoopWindow
+    },
     udp_drops: { ...udpDrops },
+    transports: {
+      websocket: {
+        ...transportCounters.websocket,
+        active: transportCounters.websocket.opened - transportCounters.websocket.closed
+      },
+      xhttp: {
+        ...transportCounters.xhttp,
+        active: transportCounters.xhttp.opened - transportCounters.xhttp.closed,
+        packet_readers_active: activePacketReaders,
+        packet_readers_limit: MAX_PACKET_READERS,
+        packet_readers_waiting: packetReaderWaiters.length,
+        packet_reader_waiters_limit: MAX_PACKET_WAITERS,
+        packet_readers_per_session_limit: MAX_PACKET_READERS_PER_SESSION,
+        packet_posts_503: transportCounters.xhttp_packet_503,
+        packet_posts_413: transportCounters.xhttp_packet_413
+      }
+    },
     memory_guard: {
       ...memoryGuard.stats(),
       pending_ws_upgrades: pendingWsUpgrades,
       pending_xhttp_sessions: pendingXhttpAdmissions.size,
+      pending_xhttp_requests: pendingXhttpAdmissionRequests,
+      pending_xhttp_requests_limit: MAX_XHTTP_ADMISSION_WAITERS,
       pending_mux_streams: pendingMuxAdmissions,
-      xhttp_packet_buffer_bytes: xhttpQueuedPacketBytes
+      xhttp_packet_buffer_bytes: xhttpQueuedPacketBytes,
+      xhttp_packet_buffer_limit_bytes: MAX_XHTTP_QUEUED_BYTES,
+      xhttp_packet_buffer_count: xhttpQueuedPacketCount,
+      xhttp_packet_buffer_limit_count: MAX_XHTTP_QUEUED_PACKETS
     }
   });
 });
@@ -3570,8 +3710,15 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
   let releaseReader;
   try {
     const session = await getXHttpSession(sessionId);
-    releaseReader = await acquirePacketReader(req);
+    releaseReader = await acquirePacketReader(req, sessionId);
     const body = await readRequestBody(req, MAX_XHTTP_POST_SIZE);
+    // This permit bounds simultaneous request-body reads, not how long an
+    // upstream DNS lookup/connect/write takes. Holding it until processPacket
+    // drains lets one slow destination monopolize every reader and stall
+    // unrelated XHTTP sessions. processPacket immediately reserves the body in
+    // the separately bounded global/session packet queues before it can await.
+    releaseReader();
+    releaseReader = null;
     if (!session.clientIp || session.clientIp === 'unknown') {
       session.clientIp = getClientIp(req);
       session.userAgent = String(req.headers['user-agent'] || session.userAgent || '');
@@ -3582,6 +3729,8 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
   } catch (err) {
     log('[XHTTP] POST failed:', err && err.message ? err.message : 'unknown');
     const status = err?.statusCode || (err?.message === 'request body too large' ? 413 : 500);
+    if (status === 503) transportCounters.xhttp_packet_503 += 1;
+    else if (status === 413) transportCounters.xhttp_packet_413 += 1;
     if (!res.headersSent) {
       if (status === 503) res.setHeader('Retry-After', '1');
       res.writeHead(status, XHTTP_RESPONSE_HEADERS);
@@ -4226,6 +4375,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws, req) => {
+  transportCounters.websocket.opened += 1;
   ws.binaryType = 'nodebuffer';
   // Kernel keepalive can detect a dead peer without WebSocket protocol pings or
   // artificially marking dashboard traffic as active.
@@ -4322,6 +4472,7 @@ wss.on('connection', (ws, req) => {
     if (closed) return;
     debugActive('ws-closeAll', { code, reason, endpointKey: unregisterConnection?.clientKey || '', userId: user?.id || '' });
     closed = true;
+    countTransportClose('websocket', reason);
     if (user && unregisterConnection?.clientKey && !hasConnectedEndpointExcept(user.id, unregisterConnection.clientKey, unregisterConnection.id)) {
       scheduleActiveClientOffline(user.id, unregisterConnection.clientKey, 1, true);
     }

@@ -11,7 +11,9 @@
     "build": "node scripts/ensure-deps.js && node --check server.js && node --check scripts/memory-guard.js",
     "check": "node --check server.js && node --check scripts/memory-guard.js",
     "test": "node --test test/*.test.js",
-    "test:cgroup": "node test/cgroup-stress.js"
+    "test:cgroup": "node test/cgroup-stress.js",
+    "test:cgroup:xhttp": "node test/cgroup-xhttp-stress.js",
+    "test:xray": "node test/xray-integration.js"
   },
   "engines": {
     "node": ">=20.3.0"
