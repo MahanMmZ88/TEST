@@ -42,6 +42,15 @@ dns.lookup = function testLookup(host, ...options) {
 };
 const names = new Set(['target.test', 'cdn.test', 'game.test']);
 net.createConnection = function testConnection(options, ...rest) {
+  if (options && typeof options === 'object' && options.host === 'slow-connect.test') {
+    // Model a destination whose DNS/TCP setup is delayed, without ever touching
+    // production target validation or depending on an external network.
+    const socket = new net.Socket({ highWaterMark: options.highWaterMark });
+    setTimeout(() => {
+      if (!socket.destroyed) socket.connect({ host: '127.0.0.1', port: options.port, family: 4 });
+    }, Number(process.env.PANEL_TEST_SLOW_CONNECT_MS || 800)).unref();
+    return socket;
+  }
   if (options && typeof options === 'object' && (names.has(options.host) || options.host === 'a'.repeat(255))) {
     options = { ...options, host: '127.0.0.1', family: 4, lookup: undefined };
   }

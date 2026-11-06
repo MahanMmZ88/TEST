@@ -63,7 +63,7 @@ function websocketUpgradeStatus(port) {
   });
 }
 
-async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, users = [], countGuardPumps = false, nodeOptions = '' } = {}) {
+async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, users = [], countGuardPumps = false, nodeOptions = '', blockLoop = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-memory-diagnostics-'));
   const dbPath = path.join(dir, 'db.json');
   const snapshot = path.join(dir, 'memory.json');
@@ -78,7 +78,9 @@ async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, user
   const port = await freePort();
   const child = spawn(process.execPath, [
     '--require', path.join(__dirname, 'helpers/mock-memory-guard.js'),
-    '--require', path.join(__dirname, 'helpers/loopback.js'), path.join(ROOT, 'server.js')
+    '--require', path.join(__dirname, 'helpers/loopback.js'),
+    ...(blockLoop ? ['--require', path.join(__dirname, 'helpers/block-event-loop.js')] : []),
+    path.join(ROOT, 'server.js')
   ], {
     cwd: ROOT,
     env: {
@@ -107,7 +109,7 @@ async function launchPanel(t, { usedMb = 300, limitMb = 1024, guard = true, user
   for (let i = 0; i < 100; i++) {
     if (child.exitCode !== null) throw new Error(`panel exited before startup: ${logs}`);
     try {
-      if ((await request(port, 'GET', '/health')).status === 200) return { port, setUsage };
+      if ((await request(port, 'GET', '/health')).status === 200) return { port, setUsage, child };
     } catch (_) {}
     await delay(50);
   }
@@ -206,7 +208,7 @@ test('memory diagnostics', async (suite) => {
     const panel = await launchPanel(t);
     const snapshot = await health(panel.port);
     const dashboard = await stats(panel.port, await login(panel.port));
-    assert.equal(snapshot.build, 'udp-stability-2026-11-06-a');
+    assert.equal(snapshot.build, 'transport-fairness-2026-11-06-a');
     assert.equal(snapshot.low_memory_mode, false);
     assert.equal(snapshot.memory_guard.used_mb, 300);
     assert.equal(snapshot.memory_guard.limit_mb, 1024);
@@ -214,6 +216,74 @@ test('memory diagnostics', async (suite) => {
     assert.equal(dashboard.ram_used, 300 * MB);
     assert.equal(dashboard.ram_total, 1024 * MB);
     assert.equal(dashboard.ram_usage, 29);
+  });
+
+  await suite.test('health reports an event-loop stall without pretending it is network latency', async (t) => {
+    if (process.platform === 'win32') return t.skip('POSIX signal required for the test-only stall');
+    const panel = await launchPanel(t, { blockLoop: true });
+    await delay(100);
+    panel.child.kill('SIGUSR2');
+    await delay(450);
+    const loop = (await health(panel.port)).event_loop_delay;
+    assert.equal(loop.resolution_ms, 20);
+    assert.equal(loop.window_ms, 10000);
+    assert.ok(loop.current.samples > 0);
+    assert.ok(loop.current.max_ms >= 200, `expected the synthetic stall, got ${JSON.stringify(loop)}`);
+    assert.ok(Number.isFinite(loop.current.p95_ms));
+    assert.ok(Number.isFinite(loop.current.p99_ms));
+  });
+
+  await suite.test('health exposes aggregate, non-identifying transport lifecycle and packet errors', async (t) => {
+    const panel = await launchPanel(t, { guard: false });
+    const before = await health(panel.port);
+    const ws = new WebSocket(`ws://127.0.0.1:${panel.port}/ws`);
+    ws.on('error', () => {});
+    await once(ws, 'open');
+    const closed = once(ws, 'close');
+    ws.send(Buffer.alloc(19)); // invalid UUID; the complete header is rejected
+    await timeout(closed, 3000, 'invalid WS close');
+    assert.equal((await request(panel.port, 'POST', '/xhttp/invalid/0', Buffer.alloc(19), {
+      'content-type': 'application/octet-stream', 'content-length': 19
+    })).status, 500);
+    const oversized = Buffer.alloc(4 * MB + 1);
+    assert.equal((await request(panel.port, 'POST', '/xhttp/oversized/0', oversized, {
+      'content-type': 'application/octet-stream', 'content-length': oversized.length
+    })).status, 413);
+    const after = await health(panel.port);
+    assert.equal(after.transports.websocket.opened - before.transports.websocket.opened, 1);
+    assert.equal(after.transports.websocket.closed_by.protocol - before.transports.websocket.closed_by.protocol, 1);
+    assert.equal(after.transports.websocket.active, 0);
+    assert.equal(after.transports.xhttp.closed_by.protocol - before.transports.xhttp.closed_by.protocol, 1);
+    assert.equal(after.transports.xhttp.packet_posts_413 - before.transports.xhttp.packet_posts_413, 1);
+    assert.equal(after.transports.xhttp.packet_readers_active, 0);
+    assert.equal(after.transports.xhttp.packet_readers_waiting, 0);
+    assert.doesNotMatch(JSON.stringify(after.transports), /invalid|oversized|target\.test|11111111/);
+  });
+
+  await suite.test('one pending XHTTP admission cannot retain unlimited HTTP requests', async (t) => {
+    const panel = await launchPanel(t, { usedMb: 105, limitMb: 128 });
+    const posts = Array.from({ length: 64 }, () =>
+      request(panel.port, 'POST', '/xhttp/shared-admission/1', Buffer.from('x'))
+        .catch((error) => ({ error })));
+    let snapshot;
+    for (let i = 0; i < 100; i++) {
+      snapshot = await health(panel.port);
+      if (snapshot.memory_guard.pending_xhttp_requests === 64) break;
+      await delay(20);
+    }
+    assert.equal(snapshot.memory_guard.pending_xhttp_sessions, 1);
+    assert.equal(snapshot.memory_guard.pending_xhttp_requests, 64);
+    assert.equal(snapshot.memory_guard.pending_xhttp_requests_limit, 64);
+    const overflow = await timeout(request(panel.port, 'POST', '/xhttp/shared-admission/1', Buffer.from('x')),
+      1000, 'admission request cap');
+    assert.equal(overflow.status, 503);
+    panel.setUsage(60);
+    const accepted = await Promise.all(posts);
+    assert.ok(accepted.every((result) => result.status === 200), JSON.stringify(accepted));
+    snapshot = await health(panel.port);
+    assert.equal(snapshot.memory_guard.pending_xhttp_sessions, 0);
+    assert.equal(snapshot.memory_guard.pending_xhttp_requests, 0);
+    assert.equal(snapshot.memory_guard.xhttp_packet_buffer_count, 1, 'duplicate sequences are not queued twice');
   });
 
   await suite.test('health exposes a lingering 128 MiB heap setting after a 1 GiB upgrade', async (t) => {
