@@ -20,13 +20,21 @@ dns.lookup = function testLookup(host, ...options) {
   if (/^v6-only-(ws|xhttp|mux)\.test$/i.test(String(host))) {
     return Promise.resolve([{ address: '2001:4860:4860::8888', family: 6 }]);
   }
+  // Distinct public-looking answers, redirected to separate UDP loopbacks
+  // below, exercise address affinity within a single stateful datagram flow.
+  if (/^affinity-(ws|xhttp|mux|mux-xhttp)\.test$/i.test(String(host))) {
+    return Promise.resolve([
+      { address: '198.18.0.9', family: 4 },
+      { address: '198.18.0.10', family: 4 }
+    ]);
+  }
   if (String(host).toLowerCase() === 'private-dns.test') {
     return Promise.resolve([{ address: '127.0.0.1', family: 4 }, { address: '::1', family: 6 }]);
   }
   if (String(host).toLowerCase() === 'mapped-ws.test') {
     return Promise.resolve([{ address: '::ffff:198.18.0.9', family: 6 }]);
   }
-  if (String(host).toLowerCase() === 'slow-udp.test') {
+  if (/^slow-udp(?:-bytes)?\.test$/i.test(String(host))) {
     return new Promise((resolve) => setTimeout(() => resolve([{ address: '198.18.0.9', family: 4 }]), 400));
   }
   if (String(host).toLowerCase() === 'never-dns.test') return new Promise(() => {});
@@ -44,6 +52,7 @@ dgram.createSocket = function testDatagramSocket(...args) {
   const send = socket.send;
   socket.send = function testSend(...params) {
     if (params[2] === '198.18.0.9') params[2] = '127.0.0.1';
+    if (params[2] === '198.18.0.10') params[2] = '127.0.0.2';
     if (params[2] === '2001:4860:4860::8888') params[2] = '::1';
     return send.apply(this, params);
   };

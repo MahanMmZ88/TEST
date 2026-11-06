@@ -212,7 +212,9 @@ class MemoryGuard {
   // cgroup. Existing connections are never closed by this admission check.
   admit(estimatedBytes = 0, countRejection = true) {
     if (!this.enabled) return true;
-    this.tick();
+    // Sampling and rejection remain immediate, but in a steady state there is
+    // no need to synchronously repump every live transport for each new flow.
+    this.tick(true);
     if (!this.hasLimit()) return true;
     const now = this.now();
     if (now >= this.projectionExpiresAt) {
@@ -248,11 +250,15 @@ class MemoryGuard {
     return this.level;
   }
 
-  tick() {
+  tick(changesOnly = false) {
     if (!this.enabled) return;
     this.ticks += 1;
+    const previous = this.level;
     this.sample();
     this.updateLevel();
+    // The regular timer always services transports and cache-shedding hooks.
+    // Admission-triggered samples notify them immediately only on transitions.
+    if (changesOnly && this.level === previous) return;
     if (this.isHard()) {
       for (const fn of this.shedHooks) {
         try { fn(this); } catch (_) {}

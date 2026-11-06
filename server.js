@@ -7,6 +7,7 @@ const os = require('os');
 const dns = require('dns').promises;
 const path = require('path');
 const fs = require('fs');
+const v8 = require('v8');
 const crypto = require('crypto');
 const express = require('express');
 const cookieParser = require('cookie-parser');
@@ -26,7 +27,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'stability-2026-10-27-a';
+const BUILD_ID = 'udp-stability-2026-11-06-a';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
@@ -236,8 +237,8 @@ const BOOSTER_DEST_MEMORY_MAX = lowMemCap(Math.max(128, Number(process.env.BOOST
 // Reject a new mux substream at the limit; never evict an existing one.
 const MAX_MUX_SESSIONS = envNumber('MAX_MUX_SESSIONS', LOW_MEMORY_MODE ? 32 : 0, 0, 4096);
 const BOOSTER_BAD_ADDRESS_TTL_MS = Math.max(10000, Number(process.env.BOOSTER_BAD_ADDRESS_TTL_MS || 120000));
-const BOOSTER_UDP_BURST_WINDOW_MS = Math.max(50, Number(process.env.BOOSTER_UDP_BURST_WINDOW_MS || 250));
-const BOOSTER_UDP_BURST_PACKETS = Math.max(8, Number(process.env.BOOSTER_UDP_BURST_PACKETS || 80));
+// Aggregate overload diagnostics for this process; reset on restart.
+const udpDrops = { uplink_queue_full: 0, downlink_pressure: 0 };
 // The "smart booster" picks a profile per destination. Its speed/stable
 // presets allow multi-MiB queues and otherwise override low-memory settings.
 // Clamp the thresholds (they are limits, not preallocated buffer sizes).
@@ -1822,7 +1823,9 @@ function createBoostedUdpTransport(host, port, profile, { onMessage, onError, on
       socket.on('message', (message) => { if (!closed) onMessage?.(message); });
       socket.on('error', (err) => { if (!closed) onError?.(err); });
       socket.on('close', () => { if (!closed) onClose?.(); });
-      return { socket, family };
+      // Pin the validated DNS answer for the lifetime of this UDP flow.
+      // Rotating addresses per datagram breaks stateful UDP protocols.
+      return { socket, address: resolved };
     });
     return ready;
   }
@@ -1831,7 +1834,9 @@ function createBoostedUdpTransport(host, port, profile, { onMessage, onError, on
     send(packet) {
       // DNS and OS sends are asynchronous. Bound retained datagrams while a
       // lookup/socket is slow; dropping UDP is preferable to unbounded memory.
-      if (closed || pendingPackets >= maxPendingPackets || pendingBytes + packet.length > maxPendingBytes) {
+      if (closed) return Promise.resolve(false);
+      if (pendingPackets >= maxPendingPackets || pendingBytes + packet.length > maxPendingBytes) {
+        udpDrops.uplink_queue_full += 1;
         return Promise.resolve(false);
       }
       // The parser may pass a view into a much larger WS/HTTP buffer. Copy the
@@ -1839,20 +1844,18 @@ function createBoostedUdpTransport(host, port, profile, { onMessage, onError, on
       const payload = Buffer.from(packet);
       pendingPackets += 1;
       pendingBytes += payload.length;
-      return ensureSocket().then(async (target) => {
+      return ensureSocket().then((target) => {
         if (!target || closed) return false;
-        const address = await resolveBoostedAddress(host, port, profile, target.family);
-        if (closed) return false;
         return new Promise((resolve, reject) => {
           try {
-            target.socket.send(payload, port, address, (err) => {
+            target.socket.send(payload, port, target.address, (err) => {
               if (err) {
-                err.udpAddress = address;
+                err.udpAddress = target.address;
                 reject(err);
               } else resolve(true);
             });
           } catch (err) {
-            err.udpAddress = address;
+            err.udpAddress = target.address;
             reject(err);
           }
         });
@@ -1867,30 +1870,6 @@ function createBoostedUdpTransport(host, port, profile, { onMessage, onError, on
       closeUdpSocket(socket);
     }
   };
-}
-
-function createUdpBurstState() {
-  return { windowStart: Date.now(), count: 0, dropped: 0, lastLog: 0 };
-}
-
-function shouldDropUdpForLatency(profile, state, bufferedBytes = 0, bufferLimit = 0) {
-  if (!SMART_BOOSTER_ENABLED || profile?.name !== 'latency') return false;
-  const now = Date.now();
-  const limit = Number(bufferLimit || profile.wsBackpressureLimit || 512 * 1024);
-  if (bufferedBytes > Math.max(64 * 1024, limit * 0.75)) return true;
-
-  if (!state) return false;
-  if (now - Number(state.windowStart || 0) > BOOSTER_UDP_BURST_WINDOW_MS) {
-    state.windowStart = now;
-    state.count = 0;
-  }
-  state.count += 1;
-  const allowed = BOOSTER_UDP_BURST_PACKETS;
-  if (state.count > allowed) {
-    state.dropped += 1;
-    return true;
-  }
-  return false;
 }
 
 function adaptXhttpDownlinkProfile(session, pressureBytes = 0) {
@@ -2323,8 +2302,6 @@ class XHttpSession {
     this.udpTargetHost = '';
     this.udpTargetPort = 0;
     this.udpState = { buffer: Buffer.alloc(0) };
-    this.udpBurstState = createUdpBurstState();
-    this.udpDownlinkBurstState = createUdpBurstState();
     this.udpIdleTimer = null;
     this.clientIp = 'unknown';
     this.clientKey = '';
@@ -2703,7 +2680,6 @@ class XHttpSession {
 
   sendUdpPacket(packet) {
     if (this.closed || !this.udpSocket || !this.udpTargetHost || !this.udpTargetPort) return;
-    if (shouldDropUdpForLatency(this.boosterProfile, this.udpBurstState, this.pendingDownlinkBytes || 0, this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER)) return;
     if (this.udpIdleTimer && this.udpIdleTimer.refresh) this.udpIdleTimer.refresh();
     updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
     this.udpSocket.send(packet).catch((err) => {
@@ -2717,11 +2693,12 @@ class XHttpSession {
   sendDownlink(chunk, meta = {}) {
     if (this.closed) return;
     if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
-    const limit = this.boosterProfile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
-    // Only datagrams can be dropped under pressure; dropping any TCP chunk
-    // corrupts the stream, even if the destination was classified as a game.
-    if (meta.udp && shouldDropUdpForLatency(this.boosterProfile, this.udpDownlinkBurstState, this.pendingDownlinkBytes, limit)) return;
-    if (meta.udp && (this.pendingDownlinkChunks.length > 0 || this.downlinkBufferedBytes() >= this.xhttpPressureLimit())) return;
+    // UDP may be discarded only under real downstream pressure; TCP bytes
+    // are always backpressured rather than dropped.
+    if (meta.udp && (this.pendingDownlinkChunks.length > 0 || this.downlinkBufferedBytes() >= this.xhttpPressureLimit())) {
+      udpDrops.downlink_pressure += 1;
+      return;
+    }
     if (LOW_MEMORY_MODE && memoryGuard.isHard() && !meta.udp) {
       this.hardPaceBytes += chunk.length;
       if (this.hardPaceBytes >= HARD_PACE_BYTES) {
@@ -2880,7 +2857,6 @@ class MuxHandler {
     this.onInputResume = onInputResume;
     this.buffer = Buffer.alloc(0);
     this.sessions = new Map();
-    this.udpBurstStates = new Map();
     this.closed = false;
     this.paused = false;
     this.blockedInputSocket = null;
@@ -3055,11 +3031,9 @@ class MuxHandler {
 
   openSession(sessionId, target) {
     this.closeSession(sessionId, false, true);
-    const category = detectDestinationCategory({ host: target.host, port: target.port, command: target.network === 'udp' ? 0x02 : 0x01 });
-    const session = { id: sessionId, target, category, remote: null, udp: null, connected: false, closed: false };
+    const session = { id: sessionId, target, remote: null, udp: null, connected: false, closed: false };
     this.sessions.set(sessionId, session);
     const isCurrentSession = () => !this.closed && !session.closed && this.sessions.get(sessionId) === session;
-    if (target.network === 'udp') this.udpBurstStates.set(sessionId, createUdpBurstState());
 
     if (target.network === 'udp') {
       session.udp = createBoostedUdpTransport(target.host, target.port, this.profile, {
@@ -3129,10 +3103,6 @@ class MuxHandler {
     if (!session || session.closed) return;
 
     if (session.target.network === 'udp') {
-      const burstState = this.udpBurstStates.get(sessionId) || createUdpBurstState();
-      this.udpBurstStates.set(sessionId, burstState);
-      const effectiveProfile = session.category === 'game' ? BOOSTER_PROFILE_LATENCY : this.profile;
-      if (shouldDropUdpForLatency(effectiveProfile, burstState, 0, effectiveProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT)) return;
       updateTraffic(this.user, data.length, 'uplink', this.touch);
       session.udp.send(data).catch((err) => {
         if (session.closed) return;
@@ -3179,7 +3149,6 @@ class MuxHandler {
     destroySocket(session.remote);
     closeUdpSocket(session.udp);
     this.sessions.delete(sessionId);
-    this.udpBurstStates.delete(sessionId);
     if (hasError && !silent) log(`[${this.label}] Session closed with error:`, String(sessionId));
   }
 
@@ -3473,6 +3442,8 @@ app.get('/health', healthResponse);
 app.get('/healthz', healthResponse);
 
 app.get('/api/health', (req, res) => {
+  const heapUsed = process.memoryUsage().heapUsed;
+  const heapLimit = v8.getHeapStatistics().heap_size_limit;
   res.set('cache-control', 'no-store').json({
     ok: true,
     build: BUILD_ID,
@@ -3483,6 +3454,8 @@ app.get('/api/health', (req, res) => {
     memory_limit_mb: EFFECTIVE_MEMORY_LIMIT_MB || null,
     detected_memory_limit_mb: CONSTRAINED_MEMORY_MB || null,
     low_memory_mode: LOW_MEMORY_MODE,
+    node_heap: { used_mb: Math.round(heapUsed / (1024 * 1024)), limit_mb: Math.round(heapLimit / (1024 * 1024)) },
+    udp_drops: { ...udpDrops },
     memory_guard: {
       ...memoryGuard.stats(),
       pending_ws_upgrades: pendingWsUpgrades,
@@ -4276,8 +4249,6 @@ wss.on('connection', (ws, req) => {
   let udpTargetPort = 0;
   let udpIdleTimer = null;
   const udpState = { buffer: Buffer.alloc(0) };
-  const udpBurstState = createUdpBurstState();
-  const udpDownlinkBurstState = createUdpBurstState();
   const pendingClientChunks = [];
   let remoteWriteBlocked = false;
   let clientInputPaused = false;
@@ -4445,10 +4416,11 @@ wss.on('connection', (ws, req) => {
 
   function sendToWs(chunk, meta = {}) {
     if (closed || ws.readyState !== ws.OPEN) return false;
-    const baseLimit = boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT;
-    if (meta.udp && shouldDropUdpForLatency(boosterProfile, udpDownlinkBurstState, ws.bufferedAmount, baseLimit)) return false;
-    // UDP datagrams may be discarded; TCP stream bytes may not.
-    if (meta.udp && (downlinkQueue.length > 0 || ws.bufferedAmount >= wsPressureLimit())) return false;
+    // UDP datagrams may be discarded under real pressure; TCP bytes may not.
+    if (meta.udp && (downlinkQueue.length > 0 || ws.bufferedAmount >= wsPressureLimit())) {
+      udpDrops.downlink_pressure += 1;
+      return false;
+    }
     if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
     if (LOW_MEMORY_MODE && memoryGuard.isHard() && !meta.udp) {
       hardPaceBytes += chunk.length;
@@ -4500,7 +4472,6 @@ wss.on('connection', (ws, req) => {
 
   function sendUdpPacket(packet) {
     if (closed || !udpSocket || !udpTargetHost || !udpTargetPort) return;
-    if (shouldDropUdpForLatency(boosterProfile, udpBurstState, ws.bufferedAmount, boosterProfile.wsBackpressureLimit || WS_BACKPRESSURE_LIMIT)) return;
     if (udpIdleTimer && udpIdleTimer.refresh) udpIdleTimer.refresh();
     updateTraffic(user, packet.length, 'uplink', () => unregisterConnection?.touchData?.());
     udpSocket.send(packet).catch((err) => {
