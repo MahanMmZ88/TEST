@@ -2,18 +2,20 @@
   "name": "mahan-panel-vless-ws-node",
   "version": "2.3.0",
   "private": true,
-  "description": "Mahan Panel with internal VLESS over WebSocket engine, no xray-core",
+  "description": "Mahan Panel with internal VLESS WS/XHTTP and optional pinned-Xray REALITY ingress",
   "main": "server.js",
   "scripts": {
     "prestart": "node scripts/ensure-deps.js",
     "start": "node server.js",
     "dev": "node server.js",
-    "build": "node scripts/ensure-deps.js && node --check server.js && node --check scripts/memory-guard.js",
-    "check": "node --check server.js && node --check scripts/memory-guard.js",
+    "build": "node scripts/ensure-deps.js && node --check server.js && node --check scripts/memory-guard.js && node --check scripts/reality-bridge.js",
+    "check": "node --check server.js && node --check scripts/memory-guard.js && node --check scripts/reality-bridge.js",
     "test": "node --test test/*.test.js",
     "test:cgroup": "node test/cgroup-stress.js",
     "test:cgroup:xhttp": "node test/cgroup-xhttp-stress.js",
-    "test:xray": "node test/xray-integration.js"
+    "test:cgroup:reality": "node test/cgroup-reality-stress.js",
+    "test:xray": "node test/xray-integration.js",
+    "test:xray:reality": "node test/xray-reality-integration.js"
   },
   "engines": {
     "node": ">=20.3.0"

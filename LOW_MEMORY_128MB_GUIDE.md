@@ -1,6 +1,10 @@
 # اجرای کم‌حافظه: برنامهٔ ۱۲۸ MiB
 
-نسخهٔ `2.3.0` · شناسهٔ بیلد `transport-fairness-2026-11-06-a`
+نسخهٔ `2.3.0` · شناسهٔ بیلد `optional-reality-r1`
+
+مسیر اختیاری REALITY در محدودیت ۱۲۸ MiB فعال نمی‌شود؛ WS/XHTTP همچنان مستقل کار
+می‌کنند. برای پیش‌نیازها و خطر از دست رفتن IP مبدأ در پراکسی،
+[راهنمای REALITY اختیاری](REALITY_OPTIONAL_GUIDE.md) را ببینید.
 
 ## چه چیزی ممکن است؟
 
@@ -125,7 +129,7 @@ UDP به‌دلیل پرشدن عمدی صف، برنامه ۶۰۰ بسته را
 
 ```bash
 curl -s https://YOUR-HOST/health
-# ok - transport-fairness-2026-11-06-a
+# ok - optional-reality-r1
 curl -s https://YOUR-HOST/api/health
 ```
 
