@@ -208,7 +208,7 @@ test('memory diagnostics', async (suite) => {
     const panel = await launchPanel(t);
     const snapshot = await health(panel.port);
     const dashboard = await stats(panel.port, await login(panel.port));
-    assert.equal(snapshot.build, 'transport-fairness-2026-11-06-a');
+    assert.equal(snapshot.build, 'optional-reality-r1');
     assert.equal(snapshot.low_memory_mode, false);
     assert.equal(snapshot.memory_guard.used_mb, 300);
     assert.equal(snapshot.memory_guard.limit_mb, 1024);

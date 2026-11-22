@@ -164,8 +164,8 @@
         .empty-state svg { width:54px; height:54px; stroke:var(--gold); opacity:.75; margin-bottom:16px; }
         .empty-state h3 { color:#fff; margin-bottom:8px; }
         .fab-add { display:none; position:fixed; right:18px; bottom:18px; z-index:160; width:56px; height:56px; border-radius:20px; border:0; background:linear-gradient(135deg,var(--gold),#b2891d); color:#000; font-size:30px; font-weight:900; box-shadow:0 18px 34px rgba(212,175,55,.24); }
-        .qr-tabs { display:flex; gap:8px; padding:6px; border-radius:16px; background:rgba(0,0,0,.25); border:1px solid rgba(255,255,255,.07); margin-bottom:18px; }
-        .qr-tab { flex:1; border:0; border-radius:12px; padding:11px; cursor:pointer; color:#aaa; background:transparent; font-weight:900; letter-spacing:.8px; transition:.2s; }
+        .qr-tabs { display:flex; flex-wrap:wrap; gap:8px; padding:6px; border-radius:16px; background:rgba(0,0,0,.25); border:1px solid rgba(255,255,255,.07); margin-bottom:18px; }
+        .qr-tab { flex:1; min-width:96px; border:0; border-radius:12px; padding:11px; cursor:pointer; color:#aaa; background:transparent; font-weight:900; letter-spacing:.8px; transition:.2s; }
         .qr-tab.active { color:#000; background:linear-gradient(135deg,var(--gold),var(--gold2)); }
         .qr-single { display:flex; flex-direction:column; align-items:center; gap:14px; }
         .qr-single .qr-box img { width:210px; height:210px; }
@@ -520,7 +520,8 @@
             </div>
         </div>
         <div class="settings-pane" id="settingsPaneSystem">
-            <div class="detail-grid"><div class="detail-card"><div class="k">Panel</div><div class="v">Mahan Panel v2</div></div><div class="detail-card"><div class="k">Transports</div><div class="v">WS · XHTTP · UDP · MUX</div></div><div class="detail-card"><div class="k">WS Path</div><div class="v">/ws</div></div><div class="detail-card"><div class="k">XHTTP Path</div><div class="v">/xhttp</div></div></div>
+            <div class="detail-grid"><div class="detail-card"><div class="k">Panel</div><div class="v">Mahan Panel v2</div></div><div class="detail-card"><div class="k">Transports</div><div class="v">WS · XHTTP · UDP · MUX</div></div><div class="detail-card"><div class="k">WS Path</div><div class="v">/ws</div></div><div class="detail-card"><div class="k">XHTTP Path</div><div class="v">/xhttp</div></div><div class="detail-card"><div class="k">REALITY (optional)</div><div class="v" id="realityStatus">Checking…</div></div></div>
+            <p style="color:#aaa;line-height:1.6;margin-top:14px;font-size:12px">REALITY requires a raw TCP port and verified client IPs. It does not hide the service or outgoing traffic from the hosting provider.</p>
         </div>
         <div class="settings-pane" id="settingsPaneDanger">
             <p style="color:#fca5a5;line-height:1.7;margin-bottom:16px">Danger zone actions affect all clients on this deployment.</p>
@@ -536,11 +537,13 @@
         <div class="qr-tabs">
             <button class="qr-tab active" id="qrTabXhttp" onclick="setQrTab('xhttp')">XHTTP</button>
             <button class="qr-tab" id="qrTabWs" onclick="setQrTab('ws')">WebSocket</button>
+            <button class="qr-tab" id="qrTabReality" onclick="setQrTab('reality')" hidden>REALITY</button>
             <button class="qr-tab" id="qrTabSub" onclick="setQrTab('sub')">Subscription</button>
         </div>
         <div class="qr-single">
             <div class="qr-box"><img id="qrMainImg" alt="QR Code"></div>
             <button class="action-btn copy" id="qrCopyBtn" style="justify-content:center;padding:12px 18px" onclick="copyQrLink(currentQrType)">Copy XHTTP</button>
+            <p id="qrRealityInfo" style="color:#aaa;font-size:12px;text-align:center" hidden>Raw TCP + REALITY. Do not enable Vision/flow.</p>
         </div>
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeQrModal()">Close</button>
@@ -606,6 +609,8 @@
     var currentUsers = [];
     var currentQrUserId = '';
     var currentQrType = 'xhttp';
+    var currentRealityLink = '';
+    var qrRequestGeneration = 0;
     var activityLog = [];
     var currentClientFilter = 'all';
     var pendingRestoreBackup = null;
@@ -1191,8 +1196,21 @@
         fetchInbounds(); fetchStats();
     }
 
+    async function refreshRealityStatus() {
+        var el = document.getElementById('realityStatus');
+        el.textContent = 'Checking…';
+        try {
+            var res = await fetch('/api/health', { cache: 'no-store' });
+            if (!res.ok) throw new Error('health unavailable');
+            var health = await res.json();
+            var reality = health.transports && health.transports.reality;
+            el.textContent = reality ? reality.status + (reality.reason ? ' (' + reality.reason + ')' : '') : 'unavailable';
+        } catch (e) { el.textContent = 'unavailable'; }
+    }
+
     function openSettingsModal() {
         setSettingsTab('account');
+        refreshRealityStatus();
         var m = document.getElementById('settingsModal');
         document.getElementById('currentPasswordInput').value = '';
         document.getElementById('newPasswordInput').value = '';
@@ -1228,30 +1246,52 @@
         }
     }
 
+    async function loadRealityQr(id, generation) {
+        try {
+            var res = await fetch('/api/users/' + encodeURIComponent(id) + '/config/reality', { cache: 'no-store' });
+            if (!res.ok) return;
+            var data = await res.json();
+            // A late response for a previous modal must never expose another
+            // user's config in the newly opened one.
+            if (generation !== qrRequestGeneration || currentQrUserId !== id || !data.link) return;
+            currentRealityLink = data.link;
+            document.getElementById('qrTabReality').hidden = false;
+        } catch (e) { /* WS and XHTTP remain available if the optional lookup fails. */ }
+    }
+
     function openQrModal(id) {
         var user = currentUsers.find(function(u) { return u.id === id; });
         if (!user) return showToast('User not found. Please refresh the panel.', 'error');
         currentQrUserId = id;
+        currentRealityLink = '';
+        document.getElementById('qrTabReality').hidden = true;
+        var generation = ++qrRequestGeneration;
         document.getElementById('qrModalTitle').textContent = 'QR Codes - ' + (user.remark || 'Client');
         setQrTab('xhttp');
         var m = document.getElementById('qrModal');
         m.style.display = 'flex';
         setTimeout(function() { m.classList.add('show'); }, 10);
+        loadRealityQr(id, generation);
     }
 
     function setQrTab(type) {
+        if (type === 'reality' && !currentRealityLink) return;
         currentQrType = type;
-        ['xhttp', 'ws', 'sub'].forEach(function(t) {
-            var id = t === 'xhttp' ? 'qrTabXhttp' : (t === 'ws' ? 'qrTabWs' : 'qrTabSub');
-            var el = document.getElementById(id);
+        var tabs = { xhttp: 'qrTabXhttp', ws: 'qrTabWs', reality: 'qrTabReality', sub: 'qrTabSub' };
+        Object.keys(tabs).forEach(function(t) {
+            var el = document.getElementById(tabs[t]);
             if (el) el.classList.toggle('active', t === type);
         });
-        var label = type === 'xhttp' ? 'XHTTP' : (type === 'ws' ? 'WebSocket' : 'Subscription');
+        var label = type === 'xhttp' ? 'XHTTP' : (type === 'ws' ? 'WebSocket' : (type === 'reality' ? 'REALITY' : 'Subscription'));
         document.getElementById('qrCopyBtn').textContent = 'Copy ' + label;
-        document.getElementById('qrMainImg').src = '/api/users/' + currentQrUserId + '/qr/' + type + '?ts=' + Date.now();
+        document.getElementById('qrRealityInfo').hidden = type !== 'reality';
+        document.getElementById('qrMainImg').src = '/api/users/' + encodeURIComponent(currentQrUserId) + '/qr/' + type + '?ts=' + Date.now();
     }
 
     function closeQrModal() {
+        ++qrRequestGeneration;
+        currentRealityLink = '';
+        document.getElementById('qrTabReality').hidden = true;
         var m = document.getElementById('qrModal');
         m.classList.remove('show');
         setTimeout(function() { m.style.display = 'none'; }, 300);
@@ -1262,6 +1302,7 @@
         if (!user) return;
         if (type === 'xhttp') return copyLink(buildXhttpConfig(user));
         if (type === 'ws') return copyLink(buildWsConfig(user));
+        if (type === 'reality' && currentRealityLink) return copyLink(currentRealityLink);
         if (type === 'sub') return copyLink(window.location.protocol + '//' + pageHost + '/sub/' + user.sub_id);
     }
 

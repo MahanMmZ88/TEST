@@ -1,0 +1,37 @@
+# Optional Linux/amd64 image with a pinned Xray binary. REALITY is still OFF
+# until REALITY_ENABLED=1 and all required environment variables are set.
+# Build with: docker build -f Dockerfile.reality -t mahan-reality .
+FROM alpine:3.21 AS xray-binary
+ARG TARGETARCH
+RUN test "${TARGETARCH:-amd64}" = "amd64" \
+ && apk add --no-cache ca-certificates curl unzip \
+ && curl -fL --retry 3 -o /tmp/xray.zip \
+      https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip \
+ && echo '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae  /tmp/xray.zip' | sha256sum -c - \
+ && unzip -p /tmp/xray.zip xray > /xray \
+ && unzip -p /tmp/xray.zip LICENSE > /xray-LICENSE \
+ && echo '8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed  /xray' | sha256sum -c - \
+ && chmod 0755 /xray
+
+FROM node:22-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY server.js ./
+COPY db.json ./
+COPY public ./public
+COPY scripts ./scripts
+COPY --from=xray-binary /xray /usr/local/bin/xray
+COPY --from=xray-binary /xray-LICENSE /usr/local/share/licenses/xray/LICENSE
+# Corresponding source: https://github.com/XTLS/Xray-core/tree/v26.3.27
+RUN mkdir -p /data && chown node:node /data
+ENV NODE_ENV=production \
+    PORT=3000 \
+    DB_PATH=/data/db.json \
+    XRAY_BIN=/usr/local/bin/xray
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-3000}/health" || exit 1
+STOPSIGNAL SIGTERM
+CMD ["node", "server.js"]

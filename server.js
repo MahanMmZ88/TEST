@@ -15,6 +15,7 @@ const cookieParser = require('cookie-parser');
 const QRCode = require('qrcode');
 const { WebSocketServer } = require('ws');
 const { MemoryGuard } = require('./scripts/memory-guard');
+const { RealityBridge } = require('./scripts/reality-bridge');
 
 const app = express();
 app.set('trust proxy', true);
@@ -48,7 +49,7 @@ function resolvePort() {
   return 3000;
 }
 const PORT = resolvePort();
-const BUILD_ID = 'transport-fairness-2026-11-06-a';
+const BUILD_ID = 'optional-reality-r1';
 const WS_PATH = '/ws';
 const XHTTP_PATH = '/xhttp';
 
@@ -87,6 +88,12 @@ const memoryGuard = new MemoryGuard({
   }
 });
 memoryGuard.sample();
+// Disabled unless explicitly configured; starting or failing this optional
+// listener never replaces the existing HTTP, WebSocket or XHTTP listener.
+const realityBridge = new RealityBridge({
+  httpPort: PORT, guard: memoryGuard, memoryLimitMb: EFFECTIVE_MEMORY_LIMIT_MB,
+  onTunnel: attachRealityTunnel, log
+});
 // A newly opened TCP tunnel can charge several MiB of kernel socket buffers
 // after the WS handshake. Temporarily project that cost so a simultaneous
 // burst cannot all pass the gate before cgroup usage catches up.
@@ -281,6 +288,7 @@ function makeTransportCounters() {
 const transportCounters = {
   websocket: makeTransportCounters(),
   xhttp: makeTransportCounters(),
+  reality: makeTransportCounters(),
   xhttp_packet_503: 0,
   xhttp_packet_413: 0
 };
@@ -1939,10 +1947,10 @@ function adaptXhttpDownlinkProfile(session, pressureBytes = 0) {
   const limit = profile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
   if (pressureBytes > limit * 0.7 && profile.name === 'speed') {
     session.boosterProfile = BOOSTER_PROFILE_STABLE;
-    log('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} speed->stable pressure=${formatBytes(pressureBytes)}`);
+    if (session.kind === 'xhttp') log('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} speed->stable pressure=${formatBytes(pressureBytes)}`);
   } else if (pressureBytes > limit * 0.9 && profile.name === 'stable') {
     session.boosterProfile = BOOSTER_PROFILE_BALANCED;
-    log('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} stable->balanced pressure=${formatBytes(pressureBytes)}`);
+    if (session.kind === 'xhttp') log('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} stable->balanced pressure=${formatBytes(pressureBytes)}`);
   }
 }
 
@@ -2223,7 +2231,10 @@ function buildVlessLink(req, user) {
 }
 
 function buildSubscriptionLinks(req, user) {
-  return [buildWsVlessLink(req, user), buildXhttpVlessLink(req, user)];
+  const links = [buildWsVlessLink(req, user), buildXhttpVlessLink(req, user)];
+  const realityLink = realityBridge.link(user);
+  if (realityLink) links.push(realityLink);
+  return links;
 }
 
 function getPublicBaseUrl(req) {
@@ -2240,6 +2251,7 @@ function buildSubUrl(req, user) {
 function getQrPayload(req, user, type) {
   if (type === 'ws') return buildWsVlessLink(req, user);
   if (type === 'xhttp') return buildXhttpVlessLink(req, user);
+  if (type === 'reality') return realityBridge.link(user);
   if (type === 'sub') return buildSubUrl(req, user);
   return '';
 }
@@ -2380,8 +2392,9 @@ let xhttpQueuedPacketBytes = 0;
 let xhttpQueuedPacketCount = 0;
 
 class XHttpSession {
-  constructor(sessionId) {
-    transportCounters.xhttp.opened += 1;
+  constructor(sessionId, kind = 'xhttp') {
+    this.kind = kind === 'reality' ? 'reality' : 'xhttp';
+    transportCounters[this.kind].opened += 1;
     this.sessionId = sessionId;
     this.user = null;
     this.remote = null;
@@ -2615,6 +2628,11 @@ class XHttpSession {
 
     let request;
     try {
+      // The internal engine does not implement Vision/addon framing. Do not
+      // silently treat such an optional REALITY request as ordinary raw VLESS.
+      if (this.kind === 'reality' && firstPacket.length >= 18 && firstPacket[17] !== 0) {
+        throw new Error('VLESS addons are not supported on REALITY');
+      }
       request = parseVlessRequest(firstPacket, { allowUdp: true, allowMux: true });
     } catch (err) {
       if (!(options.allowIncomplete && err.code === 'VLESS_INCOMPLETE')) this.close('bad vless request');
@@ -2624,7 +2642,7 @@ class XHttpSession {
     this.user = request.user;
     this.version = request.version;
     this.boosterProfile = chooseBoosterProfile(request, 'xhttp');
-    const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, 'xhttp', request);
+    const deviceMeta = getConnectionDeviceMeta({ headers: { 'user-agent': this.userAgent } }, this.clientIp, this.kind, request);
     const candidate = findBestDeviceCandidate(this.user.id, deviceMeta);
     this.clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
     if (!canAcceptUserSession(this.user, this.clientKey)) {
@@ -2632,11 +2650,15 @@ class XHttpSession {
       throw new Error('client limit exceeded');
     }
     this.unregisterConnection = registerConnection(this.user.id, (reason) => this.close(reason), {
-      ip: this.clientIp, clientKey: this.clientKey, kind: 'xhttp', deviceMeta,
+      ip: this.clientIp, clientKey: this.clientKey, kind: this.kind, deviceMeta,
       isOpen: () => !this.closed
     });
     this.clientKey = this.unregisterConnection.clientKey || this.clientKey;
-    log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)} device=${this.clientKey}`);
+    // Do not add per-user or destination logs for the optional raw transport.
+    // This does not conceal destinations from the host or existing admin APIs.
+    if (this.kind === 'xhttp') {
+      log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)} device=${this.clientKey}`);
+    }
 
     if (request.command === 0x03) {
       this.muxMode = true;
@@ -2644,7 +2666,8 @@ class XHttpSession {
       this.flushDownlink();
       this.muxHandler = new MuxHandler({
         user: this.user,
-        label: 'XHTTP MUX',
+        label: this.kind === 'reality' ? 'REALITY MUX' : 'XHTTP MUX',
+        quietDetails: this.kind === 'reality',
         profile: this.boosterProfile,
         touch: () => this.touchData(),
         send: (chunk, meta) => this.sendDownlink(chunk, meta),
@@ -2668,12 +2691,12 @@ class XHttpSession {
           try {
             this.sendDownlink(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
           } catch (err) {
-            log('[XHTTP UDP] Encode failed:', err.message);
+            if (this.kind === 'xhttp') log('[XHTTP UDP] Encode failed:', err.message);
             this.close('udp encode failed');
           }
         },
         onError: (err) => {
-          log('[XHTTP UDP] Error:', err && err.message ? err.message : 'unknown');
+          if (this.kind === 'xhttp') log('[XHTTP UDP] Error:', err && err.message ? err.message : 'unknown');
           this.close('udp error');
         },
         onClose: () => this.close('udp closed')
@@ -2717,7 +2740,7 @@ class XHttpSession {
       });
 
       this.remote.once('error', (err) => {
-        log('[XHTTP Remote] Error:', `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
+        if (this.kind === 'xhttp') log('[XHTTP Remote] Error:', `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
         fail(err);
         this.close('remote error');
       });
@@ -2749,7 +2772,7 @@ class XHttpSession {
         await this.muxHandler?.feed(chunk);
         if (this.closed) throw new Error('session closed');
       } catch (err) {
-        log('[XHTTP MUX] Bad frame:', err.message);
+        if (this.kind === 'xhttp') log('[XHTTP MUX] Bad frame:', err.message);
         this.close('bad mux frame');
         throw err;
       }
@@ -2760,7 +2783,7 @@ class XHttpSession {
       try {
         drainUdpPackets(this.udpState, chunk, (packet) => this.sendUdpPacket(packet));
       } catch (err) {
-        log('[XHTTP UDP] Bad packet:', err.message);
+        if (this.kind === 'xhttp') log('[XHTTP UDP] Bad packet:', err.message);
         this.close('bad udp packet');
         throw err;
       }
@@ -2781,7 +2804,7 @@ class XHttpSession {
     updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
     this.udpSocket.send(packet).catch((err) => {
       if (this.closed) return;
-      log('[XHTTP UDP] Send/resolve failed:', err && err.message ? err.message : 'unknown');
+      if (this.kind === 'xhttp') log('[XHTTP UDP] Send/resolve failed:', err && err.message ? err.message : 'unknown');
       markBoosterConnectFailure(this.udpTargetHost, this.udpTargetPort, err?.udpAddress || '', err);
       this.close('udp send or resolve failed');
     });
@@ -2874,7 +2897,7 @@ class XHttpSession {
   close(reason = 'closed') {
     if (this.closed) return;
     this.closed = true;
-    countTransportClose('xhttp', reason);
+    countTransportClose(this.kind, reason);
     clearTimeout(this.cleanupTimer);
     clearTimeout(this.connectTimer);
     clearTimeout(this.udpIdleTimer);
@@ -2896,11 +2919,40 @@ class XHttpSession {
     this.streamInitBuffer = Buffer.alloc(0);
     this.pendingDownlinkChunks = [];
     this.pendingDownlinkBytes = 0;
-    xhttpSessions.delete(this.sessionId);
-    if (reason && reason !== 'remote closed' && reason !== 'downlink closed') {
+    if (this.kind === 'xhttp') xhttpSessions.delete(this.sessionId);
+    if (this.kind === 'xhttp' && reason && reason !== 'remote closed' && reason !== 'downlink closed') {
       log('[XHTTP] Session closed:', `${this.sessionId} ${reason}`);
     }
   }
+}
+
+// The optional REALITY sidecar terminates only the outer security layer. Its
+// raw VLESS bytes go through the same authenticated, quota- and device-aware
+// engine as XHTTP; no direct Xray exit to user destinations is configured.
+function attachRealityTunnel(socket, clientIp, initial) {
+  const session = new XHttpSession(crypto.randomBytes(8).toString('hex'), 'reality');
+  session.clientIp = clientIp;
+  session.downlinkRes = socket;
+  try { socket.setKeepAlive(true, 30000); socket.setNoDelay(true); } catch (_) {}
+  const initTimer = setTimeout(() => {
+    if (!session.closed && !session.user) session.close('request timeout');
+  }, CONNECT_TIMEOUT_MS);
+  initTimer.unref?.();
+  socket.on('drain', () => session.pumpDownlink());
+  socket.once('close', () => { clearTimeout(initTimer); session.close('underlying socket closed'); });
+  socket.once('error', () => session.close('underlying socket error'));
+
+  const receive = (chunk) => {
+    if (session.closed) return;
+    socket.pause();
+    session.processStreamChunk(chunk).then(() => {
+      if (session.user) clearTimeout(initTimer);
+      if (!session.closed && !socket.destroyed) socket.resume();
+    }, () => session.close('bad vless request'));
+  };
+  socket.on('data', receive);
+  if (initial && initial.length) receive(initial);
+  else socket.resume();
 }
 
 function xhttpAdmissionBusy() {
@@ -2958,13 +3010,14 @@ function getXHttpSession(sessionId) {
 
 class MuxHandler {
   constructor({ user, send, close, touch = null, label = 'MUX', profile = BOOSTER_PROFILE_BALANCED,
-    onInputPause = null, onInputResume = null }) {
+    onInputPause = null, onInputResume = null, quietDetails = false }) {
     this.user = user;
     this.profile = profile || BOOSTER_PROFILE_BALANCED;
     this.send = send;
     this.closeTransport = close;
     this.touch = touch;
     this.label = label;
+    this.quietDetails = quietDetails;
     this.onInputPause = onInputPause;
     this.onInputResume = onInputResume;
     this.buffer = Buffer.alloc(0);
@@ -2998,7 +3051,7 @@ class MuxHandler {
     try {
       this.parseInput();
     } catch (err) {
-      log(`[${this.label}] Bad frame:`, err.message);
+      if (!this.quietDetails) log(`[${this.label}] Bad frame:`, err.message);
       this.closeTransport('bad mux frame');
       this.close();
       return;
@@ -3107,7 +3160,7 @@ class MuxHandler {
         }
         this.continueInput();
       } catch (err) {
-        log(`[${this.label}] Admission failed:`, err.message);
+        if (!this.quietDetails) log(`[${this.label}] Admission failed:`, err.message);
         this.closeTransport('mux admission failed');
         this.close();
       }
@@ -3156,7 +3209,7 @@ class MuxHandler {
         },
         onError: (err) => {
           if (!isCurrentSession()) return;
-          log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
+          if (!this.quietDetails) log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
           this.sendEnd(sessionId, true);
           this.closeSession(sessionId, true);
         },
@@ -3191,7 +3244,7 @@ class MuxHandler {
     });
     session.remote.once('error', (err) => {
       if (!isCurrentSession()) return;
-      log(`[${this.label}] TCP error:`, `${target.host}:${target.port} ${err && err.message ? err.message : ''}`);
+      if (!this.quietDetails) log(`[${this.label}] TCP error:`, `${target.host}:${target.port} ${err && err.message ? err.message : ''}`);
       this.sendEnd(sessionId, true);
       this.closeSession(sessionId, true);
     });
@@ -3218,7 +3271,7 @@ class MuxHandler {
       updateTraffic(this.user, data.length, 'uplink', this.touch);
       session.udp.send(data).catch((err) => {
         if (session.closed) return;
-        log(`[${this.label}] UDP send/resolve failed:`, err && err.message ? err.message : 'unknown');
+        if (!this.quietDetails) log(`[${this.label}] UDP send/resolve failed:`, err && err.message ? err.message : 'unknown');
         markBoosterConnectFailure(session.target.host, session.target.port, err?.udpAddress || '', err);
         this.sendEnd(sessionId, true);
         this.closeSession(sessionId, true);
@@ -3261,7 +3314,7 @@ class MuxHandler {
     destroySocket(session.remote);
     closeUdpSocket(session.udp);
     this.sessions.delete(sessionId);
-    if (hasError && !silent) log(`[${this.label}] Session closed with error:`, String(sessionId));
+    if (hasError && !silent && !this.quietDetails) log(`[${this.label}] Session closed with error:`, String(sessionId));
   }
 
   close() {
@@ -3589,6 +3642,11 @@ app.get('/api/health', (req, res) => {
         packet_readers_per_session_limit: MAX_PACKET_READERS_PER_SESSION,
         packet_posts_503: transportCounters.xhttp_packet_503,
         packet_posts_413: transportCounters.xhttp_packet_413
+      },
+      reality: {
+        ...transportCounters.reality,
+        active: transportCounters.reality.opened - transportCounters.reality.closed,
+        ...realityBridge.health()
       }
     },
     memory_guard: {
@@ -4040,6 +4098,18 @@ app.post('/api/users/:id/reset', requireAuth, (req, res) => {
   res.json({ success: true });
 });
 
+// Return the server-generated link rather than rebuilding REALITY parameters
+// in the dashboard. A link is available only while the optional ingress is
+// ready; this endpoint never returns the private key.
+app.get('/api/users/:id/config/reality', requireAuth, (req, res) => {
+  res.set('cache-control', 'no-store');
+  const user = DB.users.find((u) => u.id === req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const link = realityBridge.link(user);
+  if (!link) return res.status(503).json({ error: 'REALITY unavailable' });
+  return res.json({ link });
+});
+
 app.get('/api/users/:id/qr/:type', requireAuth, async (req, res) => {
   try {
     const user = DB.users.find((u) => u.id === req.params.id);
@@ -4132,7 +4202,8 @@ app.get('/sub/:sub_id', (req, res) => {
 
   // Smart subscription routing:
   // - Human browsers get the visual subscription page with separate copy buttons.
-  // - VPN clients/subscription updaters get base64 text containing both WS and XHTTP configs.
+  // - VPN clients/subscription updaters get base64 WS and XHTTP configs plus
+  //   the optional REALITY link only while that listener is ready.
   // - ?raw=1 always returns base64 subscription.
   // - ?html=1 always returns the visual page.
   const clientKeywords = [
@@ -4172,6 +4243,8 @@ app.get('/sub/:sub_id', (req, res) => {
   const remarkSafe = safeName(user.remark);
   const wsLinkJSON = JSON.stringify(wsLink);
   const xhttpLinkJSON = JSON.stringify(xhttpLink);
+  const realityLink = subscriptionLinks[2] || '';
+  const realityLinkJSON = JSON.stringify(realityLink);
   const allLinksJSON = JSON.stringify(subscriptionLinks.join('\n'));
 
   const subUrlJSON = JSON.stringify(buildSubUrl(req, user));
@@ -4260,7 +4333,7 @@ app.get('/sub/:sub_id', (req, res) => {
         <div>
           <div class="brand-title">MAHAN PANEL</div>
           <h1>${remarkSafe}</h1>
-          <div class="chips"><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span><span class="chip">UDP</span><span class="chip">MUX</span></div>
+          <div class="chips"><span class="chip gold">XHTTP</span><span class="chip gold">WebSocket</span>${realityLink ? '<span class="chip gold">REALITY</span>' : ''}<span class="chip">UDP</span><span class="chip">MUX</span></div>
         </div>
         <div class="status-box"><div id="statusPill" class="status-pill ${expired ? 'expired' : ''}">${statusText}</div></div>
       </div>
@@ -4274,18 +4347,18 @@ app.get('/sub/:sub_id', (req, res) => {
             <div class="stat"><div class="label">Upload</div><div class="value" id="uploadValue">${uplinkFormatted}</div></div>
             <div class="stat"><div class="label">Download</div><div class="value" id="downloadValue">${downlinkFormatted}</div></div>
           </div>
-          <div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
+          <div class="info"><div class="row"><span>Status</span><b id="statusBadge" class="badge ${expired ? 'expired' : 'active'}">${expired ? 'Expired' : 'Active'}</b></div><div class="row"><span>Protocol</span><b>VLESS over XHTTP + WS${realityLink ? ' + REALITY' : ''}</b></div><div class="row"><span>Expiration</span><b id="expiryValue">${expiryStr}</b></div><div class="row"><span>Last Seen</span><b id="lastSeenValue">${lastSeenStr}</b></div></div>
         </section>
         <section class="panel">
-          <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button><button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div>
+          <div class="qr-tabs"><button class="qr-tab active" id="tab-xhttp" onclick="setQrTab('xhttp')">XHTTP</button><button class="qr-tab" id="tab-ws" onclick="setQrTab('ws')">WebSocket</button>${realityLink ? `<button class="qr-tab" id="tab-reality" onclick="setQrTab('reality')">REALITY</button>` : ''}<button class="qr-tab" id="tab-sub" onclick="setQrTab('sub')">Subscription</button></div>
           <div class="qr-stage"><div class="transport-info" id="transportInfo">Transport: XHTTP · Path: /xhttp · UDP/MUX supported</div><button class="btn primary" id="copyActiveBtn" onclick="copyActiveConfig()">Copy XHTTP Config</button><button class="btn dark" id="showQrBtn" onclick="showFullQr(ACTIVE_QR)">Show QR</button></div>
           <button class="btn primary" onclick="copyAll()">Copy All Configs</button>
-          <p class="guide">VPN clients receive both configs automatically. Browser users see this page.</p>
+          <p class="guide">VPN clients receive the available configs automatically. Browser users see this page.</p>
         </section>
       </div>
     </section>
   </main><div class="qr-full" id="qrFull" onclick="hideFullQr(event)"><div class="qr-full-card"><h2 id="qrFullTitle" style="margin-bottom:16px;color:#d4af37">QR Code</h2><div class="qr"><img id="qrFullImg" alt="Full QR"></div><button class="btn primary" onclick="downloadQr()">Download QR</button><button class="btn dark" onclick="document.getElementById('qrFull').style.display='none'">Close</button></div></div>
-  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:SUB_URL)}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':'Subscription URL');document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':'Smart subscription URL · Includes XHTTP and WebSocket')}function showFullQr(t){setQrTab(t);document.getElementById('qrFullTitle').textContent=(t==='xhttp'?'XHTTP':(t==='ws'?'WebSocket':'Subscription'))+' QR';document.getElementById('qrFullImg').src=QR_BASE+'/'+t+'?ts='+Date.now();document.getElementById('qrFull').style.display='flex'}function hideFullQr(e){if(e.target.id==='qrFull')e.currentTarget.style.display='none'}function downloadQr(){var src=(document.getElementById('qrFull').style.display==='flex'?document.getElementById('qrFullImg').src:(QR_BASE+'/'+ACTIVE_QR));var c=document.createElement('canvas');c.width=900;c.height=900;var x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);var i=new Image();i.onload=function(){x.drawImage(i,40,40,820,820);var a=document.createElement('a');a.href=c.toDataURL('image/jpeg',0.92);a.download='qr-'+ACTIVE_QR+'.jpg';a.click()};i.src=src}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent_label||((d.percent||0)+'%');var deg=d.unlimited&&!d.is_danger?360:(Number(d.percent)||0)*3.6;if(d.is_danger)deg=360;var color=d.is_danger?'#ef4444':(d.unlimited?'#22c55e':'var(--gold)');document.getElementById('usageRing').style.background='conic-gradient('+color+' 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':(d.unlimited?'greenfill':''));var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+d.status_class;var p=document.getElementById('statusPill');p.textContent=d.status;p.className='status-pill '+(d.status==='ACTIVE'?'':'expired');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
+  <script>var WS_LINK=${wsLinkJSON};var XHTTP_LINK=${xhttpLinkJSON};var REALITY_LINK=${realityLinkJSON};var ALL_LINKS=${allLinksJSON};var SUB_URL=${subUrlJSON};var QR_BASE='${qrBase}';var ACTIVE_QR='xhttp';function copyText(t){navigator.clipboard.writeText(t).then(function(){showToast('Copied')}).catch(function(){prompt('Copy:',t)})}function showToast(t){var e=document.createElement('div');e.className='toast';e.textContent=t;document.body.appendChild(e);setTimeout(function(){e.remove()},2200)}function activePayload(){return ACTIVE_QR==='xhttp'?XHTTP_LINK:(ACTIVE_QR==='ws'?WS_LINK:(ACTIVE_QR==='reality'?REALITY_LINK:SUB_URL))}function copyActiveConfig(){copyText(activePayload())}function copyAll(){copyText(ALL_LINKS)}function setQrTab(t){ACTIVE_QR=t;['xhttp','ws','sub'].concat(REALITY_LINK?['reality']:[]).forEach(function(x){document.getElementById('tab-'+x).classList.toggle('active',x===t)});var label=t==='xhttp'?'XHTTP Config':(t==='ws'?'WebSocket Config':(t==='reality'?'REALITY Config':'Subscription URL'));document.getElementById('copyActiveBtn').textContent='Copy '+label;document.getElementById('transportInfo').textContent=t==='xhttp'?'Transport: XHTTP · Path: /xhttp · UDP/MUX supported':(t==='ws'?'Transport: WebSocket · Path: /ws · UDP/MUX supported':(t==='reality'?'Transport: raw TCP + REALITY · no Vision':'Smart subscription URL · Includes available transports'))}function showFullQr(t){setQrTab(t);document.getElementById('qrFullTitle').textContent=(t==='xhttp'?'XHTTP':(t==='ws'?'WebSocket':(t==='reality'?'REALITY':'Subscription'))) + ' QR';document.getElementById('qrFullImg').src=QR_BASE+'/'+t+'?ts='+Date.now();document.getElementById('qrFull').style.display='flex'}function hideFullQr(e){if(e.target.id==='qrFull')e.currentTarget.style.display='none'}function downloadQr(){var src=(document.getElementById('qrFull').style.display==='flex'?document.getElementById('qrFullImg').src:(QR_BASE+'/'+ACTIVE_QR));var c=document.createElement('canvas');c.width=900;c.height=900;var x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);var i=new Image();i.onload=function(){x.drawImage(i,40,40,820,820);var a=document.createElement('a');a.href=c.toDataURL('image/jpeg',0.92);a.download='qr-'+ACTIVE_QR+'.jpg';a.click()};i.src=src}function applySubSnapshot(d){if(!d)return;document.getElementById('usedValue').textContent=d.used_formatted;document.getElementById('remainingValue').textContent=d.remaining_formatted;document.getElementById('uploadValue').textContent=d.uplink_formatted;document.getElementById('downloadValue').textContent=d.downlink_formatted;document.getElementById('ringValue').textContent=d.percent_label||((d.percent||0)+'%');var deg=d.unlimited&&!d.is_danger?360:(Number(d.percent)||0)*3.6;if(d.is_danger)deg=360;var color=d.is_danger?'#ef4444':(d.unlimited?'#22c55e':'var(--gold)');document.getElementById('usageRing').style.background='conic-gradient('+color+' 0 '+deg+'deg, rgba(255,255,255,.09) '+deg+'deg 360deg)';var f=document.getElementById('trafficFill');f.style.width=d.progress_width+'%';f.className='fill '+(d.is_danger?'danger':(d.unlimited?'greenfill':''));var b=document.getElementById('statusBadge');b.textContent=d.status;b.className='badge '+d.status_class;var p=document.getElementById('statusPill');p.textContent=d.status;p.className='status-pill '+(d.status==='ACTIVE'?'':'expired');document.getElementById('expiryValue').textContent=d.expiry;document.getElementById('lastSeenValue').textContent=d.last_seen}try{var es=new EventSource(location.pathname.replace(/\\/$/,'')+'/events');es.addEventListener('snapshot',function(e){applySubSnapshot(JSON.parse(e.data))});es.addEventListener('deleted',function(){document.body.innerHTML='<div style="color:white;text-align:center;padding:40px">Subscription deleted</div>'})}catch(e){}</script></body></html>`);
 });
 
 app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
@@ -4959,6 +5032,7 @@ function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   memoryGuard.stop();
+  realityBridge.stop();
   log('[INFO] Received', signal, '- draining connections');
 
   try { flushTrafficBuffers(); saveDBNow(); }
@@ -5002,6 +5076,7 @@ server.listen(PORT, '0.0.0.0', () => {
   log('[INFO] Mahan Panel VLESS-WS/XHTTP active on 0.0.0.0:' + String(PORT));
   log('[INFO] WS path:', WS_PATH);
   log('[INFO] XHTTP path:', XHTTP_PATH);
+  if (realityBridge.requested) void realityBridge.start();
   log('[INFO] Default admin:', 'admin / admin');
   log('[INFO] Storage:', storageMode(DB_PATH), '-', DB_PATH);
   if (EFFECTIVE_MEMORY_LIMIT_MB) log('[INFO] Effective memory limit (MB):', String(EFFECTIVE_MEMORY_LIMIT_MB));
