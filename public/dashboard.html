@@ -522,6 +522,12 @@
         <div class="settings-pane" id="settingsPaneSystem">
             <div class="detail-grid"><div class="detail-card"><div class="k">Panel</div><div class="v">Mahan Panel v2</div></div><div class="detail-card"><div class="k">Transports</div><div class="v">WS · XHTTP · UDP · MUX</div></div><div class="detail-card"><div class="k">WS Path</div><div class="v">/ws</div></div><div class="detail-card"><div class="k">XHTTP Path</div><div class="v">/xhttp</div></div><div class="detail-card"><div class="k">REALITY (optional)</div><div class="v" id="realityStatus">Checking…</div></div></div>
             <p style="color:#aaa;line-height:1.6;margin-top:14px;font-size:12px">REALITY requires a raw TCP port and verified client IPs. It does not hide the service or outgoing traffic from the hosting provider.</p>
+            <div class="backup-card" style="margin-top:14px">
+                <h4>Optional self-ping</h4>
+                <p id="keepaliveStatus" aria-live="polite">Checking…</p>
+                <p>Pausing can let an idle service sleep. The change affects one process only and resets on restart; requests may reach different replicas. It does not conceal the workload.</p>
+                <button class="btn-gold" id="keepaliveToggle" onclick="toggleKeepalive()" disabled>Checking…</button>
+            </div>
         </div>
         <div class="settings-pane" id="settingsPaneDanger">
             <p style="color:#fca5a5;line-height:1.7;margin-bottom:16px">Danger zone actions affect all clients on this deployment.</p>
@@ -558,7 +564,7 @@
         <p id="confirmMessage" style="color:#aaa; line-height:1.7; margin-bottom:22px;">Are you sure?</p>
         <div class="modal-actions">
             <button class="btn-cancel" onclick="closeConfirmModal(false)">Cancel</button>
-            <button class="action-btn delete" style="padding:12px 22px; justify-content:center" onclick="closeConfirmModal(true)">Delete</button>
+            <button class="action-btn delete" id="confirmActionButton" style="padding:12px 22px; justify-content:center" onclick="closeConfirmModal(true)">Delete</button>
         </div>
     </div>
 </div>
@@ -1039,9 +1045,10 @@
     }
 
     var confirmResolver = null;
-    function askConfirm(title, message) {
+    function askConfirm(title, message, actionLabel) {
         document.getElementById('confirmTitle').textContent = title || 'Confirm Action';
         document.getElementById('confirmMessage').textContent = message || 'Are you sure?';
+        document.getElementById('confirmActionButton').textContent = actionLabel || 'Delete';
         var m = document.getElementById('confirmModal');
         m.style.display = 'flex';
         setTimeout(function() { m.classList.add('show'); }, 10);
@@ -1095,6 +1102,7 @@
             document.getElementById('settingsTab' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
             document.getElementById('settingsPane' + t.charAt(0).toUpperCase() + t.slice(1)).classList.toggle('active', t === tab);
         });
+        if (tab === 'system') refreshKeepaliveStatus();
     }
 
     function exportBackup() {
@@ -1194,6 +1202,74 @@
         showToast('All clients deleted');
         addActivity('All clients deleted');
         fetchInbounds(); fetchStats();
+    }
+
+    var keepaliveState = null;
+    var keepaliveRequestVersion = 0;
+    var keepaliveTogglePending = false;
+
+    function applyKeepaliveStatus(data) {
+        if (!data || typeof data.enabled !== 'boolean') throw new Error('invalid self-ping status');
+        keepaliveState = data.enabled;
+        var count = Number.isFinite(data.total_pings) ? data.total_pings : 0;
+        var source = data.source === 'none' ? 'waiting for URL' :
+            (data.source === 'KEEPALIVE_URL env' ? 'configured URL' : 'auto-detected URL');
+        document.getElementById('keepaliveStatus').textContent =
+            (data.enabled ? 'Enabled' : 'Paused') + ' · ' + count + ' attempts · ' + source;
+        var button = document.getElementById('keepaliveToggle');
+        button.textContent = data.enabled ? 'Pause self-ping' : 'Resume self-ping';
+        button.disabled = false;
+    }
+
+    async function refreshKeepaliveStatus() {
+        var version = ++keepaliveRequestVersion;
+        var button = document.getElementById('keepaliveToggle');
+        button.disabled = true;
+        document.getElementById('keepaliveStatus').textContent = 'Checking…';
+        try {
+            var res = await fetch('/api/keepalive', { cache: 'no-store' });
+            if (!res.ok) throw new Error('self-ping status unavailable');
+            var data = await res.json();
+            if (version === keepaliveRequestVersion) applyKeepaliveStatus(data);
+        } catch (e) {
+            if (version !== keepaliveRequestVersion) return;
+            keepaliveState = null;
+            document.getElementById('keepaliveStatus').textContent = 'Unavailable';
+            button.textContent = 'Unavailable';
+        }
+    }
+
+    async function toggleKeepalive() {
+        if (keepaliveTogglePending || typeof keepaliveState !== 'boolean') return;
+        keepaliveTogglePending = true;
+        var seenVersion = keepaliveRequestVersion;
+        try {
+            if (keepaliveState) {
+                var ok = await askConfirm('Pause self-ping?',
+                    'The host may put an idle service to sleep. This change is temporary and resets on restart.', 'Pause');
+                if (!ok) return;
+            }
+            // Do not act on a status superseded while the confirmation was open.
+            if (seenVersion !== keepaliveRequestVersion) return;
+            var enabled = !keepaliveState;
+            var version = ++keepaliveRequestVersion;
+            var button = document.getElementById('keepaliveToggle');
+            button.disabled = true;
+            var res = await fetch('/api/keepalive', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabled }), cache: 'no-store'
+            });
+            if (!res.ok) throw new Error('self-ping update failed');
+            var data = await res.json();
+            if (version !== keepaliveRequestVersion) return;
+            applyKeepaliveStatus(data);
+            showToast(enabled ? 'Self-ping resumed temporarily' : 'Self-ping paused temporarily');
+        } catch (e) {
+            showToast('Self-ping update failed', 'error');
+            await refreshKeepaliveStatus();
+        } finally {
+            keepaliveTogglePending = false;
+        }
     }
 
     async function refreshRealityStatus() {

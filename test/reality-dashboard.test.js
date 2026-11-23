@@ -124,3 +124,54 @@ test('late REALITY config for another user or a closed modal is discarded', asyn
   await flush();
   assert.equal(ui.element('qrTabReality').hidden, true);
 });
+
+test('self-ping control requires confirmation to pause and keeps changes explicit', async () => {
+  const calls = [];
+  let enabled = true;
+  const ui = dashboard(async (url, options = {}) => {
+    if (url !== '/api/keepalive') return response({}, false);
+    calls.push({ url, options });
+    if (options.method === 'POST') enabled = JSON.parse(options.body).enabled;
+    return response({ enabled, total_pings: 3, source: 'KEEPALIVE_URL env' });
+  });
+  await ui.context.refreshKeepaliveStatus();
+  assert.match(ui.element('keepaliveStatus').textContent, /^Enabled · 3 attempts/);
+  assert.equal(ui.element('keepaliveToggle').textContent, 'Pause self-ping');
+  const cancelled = ui.context.toggleKeepalive();
+  assert.match(ui.element('confirmMessage').textContent, /sleep/);
+  assert.equal(ui.element('confirmActionButton').textContent, 'Pause');
+  ui.context.closeConfirmModal(false);
+  await cancelled;
+  assert.equal(calls.filter((x) => x.options.method === 'POST').length, 0);
+  const paused = ui.context.toggleKeepalive();
+  ui.context.closeConfirmModal(true);
+  await paused;
+  assert.equal(JSON.parse(calls.find((x) => x.options.method === 'POST').options.body).enabled, false);
+  assert.match(ui.element('keepaliveStatus').textContent, /^Paused/);
+  assert.equal(ui.element('keepaliveToggle').textContent, 'Resume self-ping');
+  await ui.context.toggleKeepalive();
+  assert.equal(JSON.parse(calls.filter((x) => x.options.method === 'POST')[1].options.body).enabled, true);
+  assert.equal(ui.element('keepaliveToggle').textContent, 'Pause self-ping');
+});
+
+test('a late self-ping status cannot replace newer data or confirm a stale action', async () => {
+  const old = deferred();
+  let getCount = 0, posts = 0;
+  const ui = dashboard((url, options = {}) => {
+    if (url !== '/api/keepalive') return Promise.resolve(response({}, false));
+    if (options.method === 'POST') { posts++; return Promise.resolve(response({ enabled: false })); }
+    if (++getCount === 1) return old.promise;
+    return Promise.resolve(response({ enabled: true, total_pings: 2, source: 'none' }));
+  });
+  const first = ui.context.refreshKeepaliveStatus();
+  await ui.context.refreshKeepaliveStatus();
+  old.resolve(response({ enabled: false, total_pings: 1, source: 'none' }));
+  await first;
+  assert.match(ui.element('keepaliveStatus').textContent, /^Enabled · 2/);
+  const confirm = ui.context.toggleKeepalive();
+  await ui.context.refreshKeepaliveStatus();
+  ui.context.closeConfirmModal(true);
+  await confirm;
+  assert.equal(posts, 0);
+  assert.equal(ui.element('keepaliveToggle').disabled, false);
+});
