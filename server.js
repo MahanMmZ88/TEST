@@ -18,7 +18,14 @@ const { MemoryGuard } = require('./scripts/memory-guard');
 const { RealityBridge } = require('./scripts/reality-bridge');
 
 const app = express();
+app.disable('x-powered-by');
 app.set('trust proxy', true);
+
+// These settings reduce information exposed in ordinary HTTP responses and
+// operational logs. They cannot conceal the process or network flows from the
+// host. Detailed health stays public by default for existing monitoring.
+const PUBLIC_HEALTH_MINIMAL = process.env.PUBLIC_HEALTH_MINIMAL === '1';
+const LOG_SENSITIVE_DETAILS = process.env.LOG_SENSITIVE_DETAILS === '1';
 
 // A bounded rolling event-loop histogram helps distinguish an overloaded Node
 // process from latency elsewhere in the network. It is not a network ping.
@@ -387,18 +394,27 @@ const pendingDownlinkBytes = new Map(); // user.id -> download/downlink bytes wa
 const pendingLastSeen = new Map(); // user.id -> latest timestamp waiting for batched commit
 let selfPingHealthUrl = '';
 let lastSelfPingUrlLog = '';
-// Mahan Keep-Alive Engine: prevent PaaS auto-sleep (Bonto/Glitch/Render/Koyeb).
-// KEEPALIVE_URL env var is the primary way to set the public URL on first boot.
-// If not set, the URL is auto-detected from the first incoming request (rememberPublicSelfUrl).
-// KEEPALIVE_INTERVAL_MS controls ping frequency (default 4 minutes, well under 30-min sleep threshold).
+// Optional self-ping for hosts that sleep. The deployment default is preserved:
+// enabled unless KEEPALIVE_ENABLED=0. The admin can temporarily pause/resume it
+// without restarting this process; a restart restores the configured default.
 const KEEPALIVE_URL = String(process.env.KEEPALIVE_URL || '').trim();
-// Deplexo free tier is always-on, so self-pinging is optional there. Set
-// KEEPALIVE_ENABLED=0 to stop the extra requests (and their transfer usage).
-const KEEPALIVE_ENABLED = process.env.KEEPALIVE_ENABLED !== '0';
-const KEEPALIVE_INTERVAL_MS = Math.max(60000, Number(process.env.KEEPALIVE_INTERVAL_MS || 4 * 60 * 1000));
+const KEEPALIVE_INITIAL_ENABLED = process.env.KEEPALIVE_ENABLED !== '0';
+const KEEPALIVE_AUTO_DETECT = process.env.KEEPALIVE_AUTO_DETECT !== '0';
+// NaN or a value above Node's timer limit becomes a 1ms timer. Validate both
+// ends so a malformed setting cannot accidentally flood the host with pings.
+const KEEPALIVE_INTERVAL_MS = envNumber('KEEPALIVE_INTERVAL_MS', 4 * 60 * 1000, 60000, 2147483647);
+const DEFAULT_KEEPALIVE_USER_AGENT = 'Mahan-Panel-Keepalive/2.0';
+const configuredKeepaliveAgent = String(process.env.KEEPALIVE_USER_AGENT || '').trim();
+const KEEPALIVE_USER_AGENT = configuredKeepaliveAgent && configuredKeepaliveAgent.length <= 128 && /^[\x20-\x7e]+$/.test(configuredKeepaliveAgent)
+  ? configuredKeepaliveAgent : DEFAULT_KEEPALIVE_USER_AGENT;
+if (configuredKeepaliveAgent && KEEPALIVE_USER_AGENT !== configuredKeepaliveAgent) {
+  log('[KEEPALIVE] Invalid user agent; using the default');
+}
+let keepaliveEnabled = KEEPALIVE_INITIAL_ENABLED;
 let keepalivePingCount = 0;
 let keepaliveLastSuccessAt = 0;
 let keepaliveLastError = '';
+const keepaliveRequests = new Set();
 const activeSessions = new Set();
 const loginAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
 const activeConnections = new Map(); // user.id -> Map(connectionId, { ip, clientKey, kind, closeFn, lastSeen })
@@ -415,7 +431,10 @@ app.use(express.json({ limit: '256kb' }));
 app.use(cookieParser());
 
 function rememberPublicSelfUrl(req) {
-  if (!KEEPALIVE_ENABLED) return;
+  // An explicit URL always wins. Auto-detection uses request headers and is
+  // therefore untrusted; operators can disable it and configure an explicit
+  // KEEPALIVE_URL instead. Existing installations retain their old default.
+  if (!keepaliveEnabled || KEEPALIVE_URL || !KEEPALIVE_AUTO_DETECT) return;
   const host = String(req.headers.host || '').trim();
   if (!host) return;
 
@@ -426,7 +445,7 @@ function rememberPublicSelfUrl(req) {
   const nextUrl = `${proto}://${host}/health`;
   if (selfPingHealthUrl !== nextUrl) {
     selfPingHealthUrl = nextUrl;
-    log('[KEEPALIVE] Public URL auto-detected:', nextUrl);
+    logSensitive('[KEEPALIVE] Public URL auto-detected:', nextUrl);
   }
 }
 
@@ -440,6 +459,21 @@ app.use(express.static(path.join(__dirname, 'public')));
 function log(message, extra = '') {
   const suffix = extra ? ` ${extra}` : '';
   console.log(`[${new Date().toISOString()}] ${message}${suffix}`);
+}
+
+function logSensitive(message, detail = '') {
+  log(message, LOG_SENSITIVE_DETAILS ? detail : '');
+}
+
+function logTransportError(message, err, detailed = '') {
+  if (LOG_SENSITIVE_DETAILS) {
+    log(message, detailed || (err && err.message ? err.message : 'unknown'));
+    return;
+  }
+  // Error messages can contain a destination or untrusted input. Keep a
+  // bounded system error code when available, but never echo the raw message.
+  const code = typeof err?.code === 'string' ? err.code : '';
+  log(message, /^[A-Z][A-Z0-9_]{0,39}$/.test(code) ? code : 'details omitted');
 }
 
 // Drop only disposable caches under pressure; never close a live stream to
@@ -739,7 +773,7 @@ function flushTrafficBuffers() {
 
     if (user.is_active === 1 && isUserExpired(user)) {
       user.is_active = 0;
-      log('[QUOTA] Limit reached:', `${user.remark} total=${formatBytes(user.used_bytes)}`);
+      logSensitive('[QUOTA] Limit reached:', `${user.remark} total=${formatBytes(user.used_bytes)}`);
       closeUserConnections(user.id, 'quota exceeded');
       changed = true;
     }
@@ -1947,10 +1981,10 @@ function adaptXhttpDownlinkProfile(session, pressureBytes = 0) {
   const limit = profile.xhttpDownlinkBufferLimit || MAX_XHTTP_DOWNLINK_BUFFER;
   if (pressureBytes > limit * 0.7 && profile.name === 'speed') {
     session.boosterProfile = BOOSTER_PROFILE_STABLE;
-    if (session.kind === 'xhttp') log('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} speed->stable pressure=${formatBytes(pressureBytes)}`);
+    if (session.kind === 'xhttp') logSensitive('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} speed->stable pressure=${formatBytes(pressureBytes)}`);
   } else if (pressureBytes > limit * 0.9 && profile.name === 'stable') {
     session.boosterProfile = BOOSTER_PROFILE_BALANCED;
-    if (session.kind === 'xhttp') log('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} stable->balanced pressure=${formatBytes(pressureBytes)}`);
+    if (session.kind === 'xhttp') logSensitive('[BOOSTER] XHTTP adapted:', `sid=${session.sessionId} stable->balanced pressure=${formatBytes(pressureBytes)}`);
   }
 }
 
@@ -2656,7 +2690,7 @@ class XHttpSession {
     this.clientKey = this.unregisterConnection.clientKey || this.clientKey;
     // Do not add per-user or destination logs for the optional raw transport.
     // This does not conceal destinations from the host or existing admin APIs.
-    if (this.kind === 'xhttp') {
+    if (this.kind === 'xhttp' && LOG_SENSITIVE_DETAILS) {
       log('[XHTTP] Connect:', `${this.user.remark} -> ${request.host}:${request.port} sid=${this.sessionId} ${describeBoosterProfile(this.boosterProfile)} device=${this.clientKey}`);
     }
 
@@ -2691,12 +2725,12 @@ class XHttpSession {
           try {
             this.sendDownlink(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
           } catch (err) {
-            if (this.kind === 'xhttp') log('[XHTTP UDP] Encode failed:', err.message);
+            if (this.kind === 'xhttp') logTransportError('[XHTTP UDP] Encode failed:', err);
             this.close('udp encode failed');
           }
         },
         onError: (err) => {
-          if (this.kind === 'xhttp') log('[XHTTP UDP] Error:', err && err.message ? err.message : 'unknown');
+          if (this.kind === 'xhttp') logTransportError('[XHTTP UDP] Error:', err);
           this.close('udp error');
         },
         onClose: () => this.close('udp closed')
@@ -2740,7 +2774,7 @@ class XHttpSession {
       });
 
       this.remote.once('error', (err) => {
-        if (this.kind === 'xhttp') log('[XHTTP Remote] Error:', `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
+        if (this.kind === 'xhttp') logTransportError('[XHTTP Remote] Error:', err, `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
         fail(err);
         this.close('remote error');
       });
@@ -2772,7 +2806,7 @@ class XHttpSession {
         await this.muxHandler?.feed(chunk);
         if (this.closed) throw new Error('session closed');
       } catch (err) {
-        if (this.kind === 'xhttp') log('[XHTTP MUX] Bad frame:', err.message);
+        if (this.kind === 'xhttp') logTransportError('[XHTTP MUX] Bad frame:', err);
         this.close('bad mux frame');
         throw err;
       }
@@ -2783,7 +2817,7 @@ class XHttpSession {
       try {
         drainUdpPackets(this.udpState, chunk, (packet) => this.sendUdpPacket(packet));
       } catch (err) {
-        if (this.kind === 'xhttp') log('[XHTTP UDP] Bad packet:', err.message);
+        if (this.kind === 'xhttp') logTransportError('[XHTTP UDP] Bad packet:', err);
         this.close('bad udp packet');
         throw err;
       }
@@ -2804,7 +2838,7 @@ class XHttpSession {
     updateTraffic(this.user, packet.length, 'uplink', () => this.touchData());
     this.udpSocket.send(packet).catch((err) => {
       if (this.closed) return;
-      if (this.kind === 'xhttp') log('[XHTTP UDP] Send/resolve failed:', err && err.message ? err.message : 'unknown');
+      if (this.kind === 'xhttp') logTransportError('[XHTTP UDP] Send/resolve failed:', err);
       markBoosterConnectFailure(this.udpTargetHost, this.udpTargetPort, err?.udpAddress || '', err);
       this.close('udp send or resolve failed');
     });
@@ -2921,7 +2955,7 @@ class XHttpSession {
     this.pendingDownlinkBytes = 0;
     if (this.kind === 'xhttp') xhttpSessions.delete(this.sessionId);
     if (this.kind === 'xhttp' && reason && reason !== 'remote closed' && reason !== 'downlink closed') {
-      log('[XHTTP] Session closed:', `${this.sessionId} ${reason}`);
+      logSensitive('[XHTTP] Session closed:', `${this.sessionId} ${reason}`);
     }
   }
 }
@@ -3051,7 +3085,7 @@ class MuxHandler {
     try {
       this.parseInput();
     } catch (err) {
-      if (!this.quietDetails) log(`[${this.label}] Bad frame:`, err.message);
+      if (!this.quietDetails) logTransportError(`[${this.label}] Bad frame:`, err);
       this.closeTransport('bad mux frame');
       this.close();
       return;
@@ -3160,7 +3194,7 @@ class MuxHandler {
         }
         this.continueInput();
       } catch (err) {
-        if (!this.quietDetails) log(`[${this.label}] Admission failed:`, err.message);
+        if (!this.quietDetails) logTransportError(`[${this.label}] Admission failed:`, err);
         this.closeTransport('mux admission failed');
         this.close();
       }
@@ -3209,7 +3243,7 @@ class MuxHandler {
         },
         onError: (err) => {
           if (!isCurrentSession()) return;
-          if (!this.quietDetails) log(`[${this.label}] UDP error:`, err && err.message ? err.message : 'unknown');
+          if (!this.quietDetails) logTransportError(`[${this.label}] UDP error:`, err);
           this.sendEnd(sessionId, true);
           this.closeSession(sessionId, true);
         },
@@ -3244,7 +3278,7 @@ class MuxHandler {
     });
     session.remote.once('error', (err) => {
       if (!isCurrentSession()) return;
-      if (!this.quietDetails) log(`[${this.label}] TCP error:`, `${target.host}:${target.port} ${err && err.message ? err.message : ''}`);
+      if (!this.quietDetails) logTransportError(`[${this.label}] TCP error:`, err, `${target.host}:${target.port} ${err && err.message ? err.message : ''}`);
       this.sendEnd(sessionId, true);
       this.closeSession(sessionId, true);
     });
@@ -3271,7 +3305,7 @@ class MuxHandler {
       updateTraffic(this.user, data.length, 'uplink', this.touch);
       session.udp.send(data).catch((err) => {
         if (session.closed) return;
-        if (!this.quietDetails) log(`[${this.label}] UDP send/resolve failed:`, err && err.message ? err.message : 'unknown');
+        if (!this.quietDetails) logTransportError(`[${this.label}] UDP send/resolve failed:`, err);
         markBoosterConnectFailure(session.target.host, session.target.port, err?.udpAddress || '', err);
         this.sendEnd(sessionId, true);
         this.closeSession(sessionId, true);
@@ -3314,7 +3348,7 @@ class MuxHandler {
     destroySocket(session.remote);
     closeUdpSocket(session.udp);
     this.sessions.delete(sessionId);
-    if (hasError && !silent && !this.quietDetails) log(`[${this.label}] Session closed with error:`, String(sessionId));
+    if (hasError && !silent && !this.quietDetails) logSensitive(`[${this.label}] Session closed with error:`, String(sessionId));
   }
 
   close() {
@@ -3601,12 +3635,18 @@ function scheduleRealtimeBroadcast() {
 // Deplexo's startup/health probe accepts both /health and /healthz on starters.
 // Keep them unauthenticated, cheap and uncached; never touch the database here.
 function healthResponse(req, res) {
-  res.set('cache-control', 'no-store').type('text/plain').send(`ok - ${BUILD_ID}\n`);
+  res.set('cache-control', 'no-store').type('text/plain')
+    .send(PUBLIC_HEALTH_MINIMAL ? 'ok\n' : `ok - ${BUILD_ID}\n`);
 }
 app.get('/health', healthResponse);
 app.get('/healthz', healthResponse);
 
 app.get('/api/health', (req, res) => {
+  if (PUBLIC_HEALTH_MINIMAL) {
+    res.vary('Cookie').set('cache-control', 'no-store');
+    const token = req.cookies.admin_session;
+    if (!token || !activeSessions.has(token)) return res.json({ ok: true });
+  }
   const heapUsed = process.memoryUsage().heapUsed;
   const heapLimit = v8.getHeapStatistics().heap_size_limit;
   res.set('cache-control', 'no-store').json({
@@ -3664,17 +3704,44 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-app.get('/api/keepalive', requireAuth, (req, res) => {
-  res.json({
-    enabled: KEEPALIVE_ENABLED,
+function keepaliveSnapshot() {
+  return {
+    enabled: keepaliveEnabled,
+    configured_enabled: KEEPALIVE_INITIAL_ENABLED,
+    auto_detect: KEEPALIVE_AUTO_DETECT,
     url: KEEPALIVE_URL || selfPingHealthUrl || '(not set)',
     source: KEEPALIVE_URL ? 'KEEPALIVE_URL env' : (selfPingHealthUrl ? 'auto-detected' : 'none'),
     interval_ms: KEEPALIVE_INTERVAL_MS,
     interval_sec: Math.round(KEEPALIVE_INTERVAL_MS / 1000),
     total_pings: keepalivePingCount,
+    in_flight: keepaliveRequests.size,
     last_success_at: keepaliveLastSuccessAt ? new Date(keepaliveLastSuccessAt).toISOString() : 'never',
     last_error: keepaliveLastError || null
-  });
+  };
+}
+
+app.get('/api/keepalive', requireAuth, (req, res) => {
+  res.set('cache-control', 'no-store').json(keepaliveSnapshot());
+});
+
+// This changes only this process's optional self-ping, never client sockets.
+// The environment default is restored on restart; other replicas are unchanged.
+// A host may suspend a quiet service when pings are paused; the admin decides.
+app.post('/api/keepalive', requireAuth, (req, res) => {
+  if (typeof req.body?.enabled !== 'boolean') {
+    return res.status(400).json({ error: 'enabled must be a boolean' });
+  }
+  const next = req.body.enabled;
+  if (next !== keepaliveEnabled) {
+    keepaliveEnabled = next;
+    if (next) {
+      rememberPublicSelfUrl(req);
+    } else {
+      for (const controller of keepaliveRequests) controller.abort();
+    }
+    log('[KEEPALIVE] Temporarily ' + (next ? 'resumed' : 'paused') + ' by admin');
+  }
+  return res.set('cache-control', 'no-store').json({ ...keepaliveSnapshot(), temporary: true });
 });
 
 app.options(`${XHTTP_PATH}/*`, (req, res) => {
@@ -3735,7 +3802,7 @@ app.post([`${XHTTP_PATH}/:sessionId`, `${XHTTP_PATH}/:sessionId/`], async (req, 
       if (!failed) req.resume();
     }).catch((err) => {
       failed = true;
-      log('[XHTTP stream-up] failed:', err && err.message ? err.message : 'unknown');
+      logTransportError('[XHTTP stream-up] failed:', err);
       session.close('stream-up failed');
       try { res.end(); } catch (_) {}
     });
@@ -3785,7 +3852,7 @@ app.post([`${XHTTP_PATH}/:sessionId/:seq`, `${XHTTP_PATH}/:sessionId/:seq/`], as
     res.writeHead(200, XHTTP_RESPONSE_HEADERS);
     res.end();
   } catch (err) {
-    log('[XHTTP] POST failed:', err && err.message ? err.message : 'unknown');
+    logTransportError('[XHTTP] POST failed:', err);
     const status = err?.statusCode || (err?.message === 'request body too large' ? 413 : 500);
     if (status === 503) transportCounters.xhttp_packet_503 += 1;
     else if (status === 413) transportCounters.xhttp_packet_413 += 1;
@@ -4048,7 +4115,7 @@ app.post('/api/users', requireAuth, (req, res) => {
   DB.users.unshift(user);
   scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
-  log('[User] Created:', `${user.remark} ${user.uuid}`);
+  logSensitive('[User] Created:', user.remark);
   res.json({ success: true, user });
 });
 
@@ -4064,7 +4131,7 @@ app.delete('/api/users/:id', requireAuth, (req, res) => {
     closeUserConnections(req.params.id, 'user deleted');
     scheduleRealtimeBroadcast();
     scheduleSaveDB(false);
-    log('[User] Deleted:', user ? user.remark : req.params.id);
+    logSensitive('[User] Deleted:', user ? user.remark : req.params.id);
     return res.json({ success: true });
   }
   return res.status(404).json({ error: 'User not found' });
@@ -4159,7 +4226,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
 
   scheduleRealtimeBroadcast();
   scheduleSaveDB(false);
-  log('[User] Edited:', `${user.remark} ${user.uuid}`);
+  logSensitive('[User] Edited:', user.remark);
   res.json({ success: true, user });
 });
 
@@ -4596,7 +4663,7 @@ wss.on('connection', (ws, req) => {
   function writeWsChunk(item) {
     ws.send(item.chunk, { binary: true }, (err) => {
       if (err) {
-        log('[WS] Send failed:', err.message);
+        logTransportError('[WS] Send failed:', err);
         closeAll(1011, 'websocket send failed');
         return;
       }
@@ -4700,7 +4767,7 @@ wss.on('connection', (ws, req) => {
     updateTraffic(user, packet.length, 'uplink', () => unregisterConnection?.touchData?.());
     udpSocket.send(packet).catch((err) => {
       if (closed) return;
-      log('[UDP] Send/resolve failed:', err && err.message ? err.message : 'unknown');
+      logTransportError('[UDP] Send/resolve failed:', err);
       markBoosterConnectFailure(udpTargetHost, udpTargetPort, err?.udpAddress || '', err);
       closeAll(1011, 'udp send or resolve failed');
     });
@@ -4720,7 +4787,7 @@ wss.on('connection', (ws, req) => {
           firstPacketBuffer = Buffer.from(initial);
           return;
         }
-        log('[VLESS] Bad request:', err.message);
+        logTransportError('[VLESS] Bad request:', err);
         closeAll(1008, 'bad vless request');
         return;
       }
@@ -4737,7 +4804,7 @@ wss.on('connection', (ws, req) => {
       const candidate = findBestDeviceCandidate(user.id, deviceMeta);
       const clientKey = deviceMeta.endpointKey || candidate?.device?.id || '';
       if (!canAcceptUserSession(user, clientKey)) {
-        log('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
+        logSensitive('[LIMIT] Client limit exceeded:', `${user.remark} ip=${clientIp}`);
         closeAll(1008, 'client limit exceeded');
         return;
       }
@@ -4746,7 +4813,7 @@ wss.on('connection', (ws, req) => {
         isOpen: () => !closed && ws.readyState === ws.OPEN && !req.socket.destroyed
       });
       ws._mahan = { userId: user.id, clientKey: unregisterConnection.clientKey || clientKey, connectionId: unregisterConnection.id, closeAll, createdAt: Date.now(), lastPongAt: Date.now(), missedPongs: 0, dashboardOffline: false };
-      log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)} device=${unregisterConnection.clientKey || clientKey}`);
+      if (LOG_SENSITIVE_DETAILS) log('[VLESS] Connect:', `${user.remark} -> ${request.host}:${request.port} ${describeBoosterProfile(boosterProfile)} device=${unregisterConnection.clientKey || clientKey}`);
 
       if (request.command === 0x03) {
         muxMode = true;
@@ -4773,7 +4840,7 @@ wss.on('connection', (ws, req) => {
           if (request.payload.length) muxHandler.feed(request.payload);
           while (pendingClientChunks.length) muxHandler.feed(pendingClientChunks.shift());
         } catch (err) {
-          log('[MUX] Bad frame:', err.message);
+          logTransportError('[MUX] Bad frame:', err);
           closeAll(1008, 'bad mux frame');
         }
         return;
@@ -4794,12 +4861,12 @@ wss.on('connection', (ws, req) => {
             try {
               sendToWs(encodeUdpPacket(msg), { udp: true, accountDownlink: true, bytes: msg.length });
             } catch (err) {
-              log('[UDP] Encode failed:', err.message);
+              logTransportError('[UDP] Encode failed:', err);
               closeAll(1011, 'udp encode failed');
             }
           },
           onError: (err) => {
-            log('[UDP] Error:', err && err.message ? err.message : 'unknown');
+            logTransportError('[UDP] Error:', err);
             closeAll(1011, 'udp error');
           },
           onClose: () => closeAll(1000, 'udp closed')
@@ -4811,7 +4878,7 @@ wss.on('connection', (ws, req) => {
           drainUdpPackets(udpState, request.payload, sendUdpPacket);
           while (pendingClientChunks.length) drainUdpPackets(udpState, pendingClientChunks.shift(), sendUdpPacket);
         } catch (err) {
-          log('[UDP] Bad packet:', err.message);
+          logTransportError('[UDP] Bad packet:', err);
           closeAll(1008, 'bad udp packet');
         }
         return;
@@ -4839,7 +4906,7 @@ wss.on('connection', (ws, req) => {
       });
 
       remote.once('error', (err) => {
-        log('[Remote] Error:', `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
+        logTransportError('[Remote] Error:', err, `${request.host}:${request.port} ${err && err.message ? err.message : ''}`);
         closeAll(1011, 'remote error');
       });
 
@@ -4872,7 +4939,7 @@ wss.on('connection', (ws, req) => {
       try {
         muxHandler?.feed(chunk);
       } catch (err) {
-        log('[MUX] Bad frame:', err.message);
+        logTransportError('[MUX] Bad frame:', err);
         closeAll(1008, 'bad mux frame');
       }
       return;
@@ -4882,7 +4949,7 @@ wss.on('connection', (ws, req) => {
       try {
         drainUdpPackets(udpState, chunk, sendUdpPacket);
       } catch (err) {
-        log('[UDP] Bad packet:', err.message);
+        logTransportError('[UDP] Bad packet:', err);
         closeAll(1008, 'bad udp packet');
       }
       return;
@@ -4920,7 +4987,7 @@ wss.on('connection', (ws, req) => {
   });
   ws.on('close', () => closeAll(1000, 'websocket closed'));
   ws.on('error', (err) => {
-    log('[WS] Error:', err && err.message ? err.message : 'unknown');
+    logTransportError('[WS] Error:', err);
     closeAll(1011, 'websocket error');
   });
   try {
@@ -4931,7 +4998,7 @@ wss.on('connection', (ws, req) => {
 
   const earlyData = decodeEarlyDataFromProtocolHeader(req.headers['sec-websocket-protocol']);
   if (earlyData) {
-    log('[WS] Early data:', `${earlyData.length} bytes`);
+    if (LOG_SENSITIVE_DETAILS) log('[WS] Early data:', `${earlyData.length} bytes`);
     // Early data precedes every WebSocket message, including messages already
     // buffered by the upgrade. Process it before returning to the event loop.
     handleClientData(earlyData);
@@ -4983,45 +5050,62 @@ setInterval(() => {
       closeUserConnections(user.id, 'expired');
       scheduleRealtimeBroadcast();
       scheduleSaveDB(false);
-      log('[User] Expired:', user.remark);
+      logSensitive('[User] Expired:', user.remark);
     }
   }
 }, 30000);
 
 setInterval(() => {
-  if (!KEEPALIVE_ENABLED) return;
+  if (!keepaliveEnabled) return;
+  let controller;
   try {
-    // KEEPALIVE_URL env var takes priority; fall back to auto-detected URL.
     const url = KEEPALIVE_URL ? `${KEEPALIVE_URL.replace(/\/+$/, '')}/health` : selfPingHealthUrl;
     if (!url) {
-      // No URL known yet. Log once every ~5 minutes to help debugging.
-      if (keepalivePingCount === 0) log('[KEEPALIVE] Waiting for public URL (set KEEPALIVE_URL env or send a request)');
+      if (keepalivePingCount === 0) {
+        log('[KEEPALIVE] Waiting for URL' + (KEEPALIVE_AUTO_DETECT ? ' (set KEEPALIVE_URL or send a request)' : ' (set KEEPALIVE_URL)'));
+      }
       return;
     }
 
     if (lastSelfPingUrlLog !== url) {
       lastSelfPingUrlLog = url;
-      log('[KEEPALIVE] Self-ping target:', url, `(interval ${Math.round(KEEPALIVE_INTERVAL_MS / 1000)}s)`);
+      logSensitive('[KEEPALIVE] Self-ping target:', url);
     }
 
-    keepalivePingCount += 1;
+    const pingNumber = ++keepalivePingCount;
     const startedAt = Date.now();
+    controller = new AbortController();
+    keepaliveRequests.add(controller);
 
     fetch(url, {
       method: 'GET',
       cache: 'no-store',
-      headers: { 'user-agent': 'Mahan-Panel-Keepalive/2.0' }
+      headers: { 'user-agent': KEEPALIVE_USER_AGENT },
+      signal: controller.signal
     }).then((res) => {
+      // Do not retain an untrusted or unexpectedly large response body.
+      try { res.body?.cancel().catch(() => {}); } catch (_) {}
+      if (controller.signal.aborted) return;
+      if (!res.ok) {
+        keepaliveLastError = `HTTP ${res.status}`;
+        log('[KEEPALIVE] Self-ping failed:', keepaliveLastError);
+        return;
+      }
       keepaliveLastSuccessAt = Date.now();
       keepaliveLastError = '';
-      if (keepalivePingCount <= 3 || keepalivePingCount % 15 === 0) {
-        log('[KEEPALIVE] Ping OK:', `${res.status} ${Math.round(Date.now() - startedAt)}ms (ping #${keepalivePingCount})`);
+      if (pingNumber <= 3 || pingNumber % 15 === 0) {
+        log('[KEEPALIVE] Ping OK:', `${res.status} ${Math.round(Date.now() - startedAt)}ms (ping #${pingNumber})`);
       }
     }).catch((err) => {
+      // A deliberate pause is not a network failure.
+      if (controller.signal.aborted) return;
       keepaliveLastError = err && err.message ? err.message : 'unknown';
-      log('[KEEPALIVE] Self-ping failed:', keepaliveLastError);
-    });
-  } catch (_) {}
+      logTransportError('[KEEPALIVE] Self-ping failed:', err);
+    }).finally(() => keepaliveRequests.delete(controller));
+  } catch (err) {
+    if (controller) keepaliveRequests.delete(controller);
+    logTransportError('[KEEPALIVE] Self-ping failed:', err);
+  }
 }, KEEPALIVE_INTERVAL_MS);
 
 // Deplexo stops the previous container before starting its replacement, so a
@@ -5033,6 +5117,7 @@ function shutdown(signal) {
   shuttingDown = true;
   memoryGuard.stop();
   realityBridge.stop();
+  for (const controller of keepaliveRequests) controller.abort();
   log('[INFO] Received', signal, '- draining connections');
 
   try { flushTrafficBuffers(); saveDBNow(); }
@@ -5077,7 +5162,6 @@ server.listen(PORT, '0.0.0.0', () => {
   log('[INFO] WS path:', WS_PATH);
   log('[INFO] XHTTP path:', XHTTP_PATH);
   if (realityBridge.requested) void realityBridge.start();
-  log('[INFO] Default admin:', 'admin / admin');
   log('[INFO] Storage:', storageMode(DB_PATH), '-', DB_PATH);
   if (EFFECTIVE_MEMORY_LIMIT_MB) log('[INFO] Effective memory limit (MB):', String(EFFECTIVE_MEMORY_LIMIT_MB));
   log('[INFO] Memory guard:', JSON.stringify(memoryGuard.stats()));
@@ -5086,13 +5170,14 @@ server.listen(PORT, '0.0.0.0', () => {
     log('[WARN] cgroup usage unavailable; RSS excludes other processes and kernel memory');
   }
   // Keep-alive startup info
-  if (!KEEPALIVE_ENABLED) {
-    log('[KEEPALIVE] Disabled via KEEPALIVE_ENABLED=0 (Deplexo containers are always-on)');
+  if (!keepaliveEnabled) {
+    log('[KEEPALIVE] Disabled via KEEPALIVE_ENABLED=0');
   } else if (KEEPALIVE_URL) {
-    log('[KEEPALIVE] Explicit URL from env:', KEEPALIVE_URL, `(ping every ${Math.round(KEEPALIVE_INTERVAL_MS / 1000)}s)`);
-    // Seed the URL immediately so pings start from boot, before any request arrives
+    logSensitive('[KEEPALIVE] Explicit URL from env:', KEEPALIVE_URL);
     selfPingHealthUrl = `${KEEPALIVE_URL.replace(/\/+$/, '')}/health`;
+  } else if (KEEPALIVE_AUTO_DETECT) {
+    log('[KEEPALIVE] No KEEPALIVE_URL set; URL will auto-detect from requests');
   } else {
-    log('[KEEPALIVE] No KEEPALIVE_URL set — URL will auto-detect from first request (set KEEPALIVE_URL for instant keep-alive from boot)');
+    log('[KEEPALIVE] Auto-detection disabled; set KEEPALIVE_URL for self-pings');
   }
 });
