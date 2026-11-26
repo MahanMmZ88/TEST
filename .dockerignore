@@ -13,3 +13,5 @@ Dockerfile
 .dockerignore
 coverage
 *.tmp
+release-output/
+.release-secrets/

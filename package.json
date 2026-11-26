@@ -9,13 +9,14 @@
     "start": "node server.js",
     "dev": "node server.js",
     "build": "node scripts/ensure-deps.js && node --check server.js && node --check scripts/memory-guard.js && node --check scripts/reality-bridge.js",
-    "check": "node --check server.js && node --check scripts/memory-guard.js && node --check scripts/reality-bridge.js",
+    "check": "node --check server.js && node --check scripts/memory-guard.js && node --check scripts/reality-bridge.js && node --check scripts/build-protected-release.js && node --check scripts/release-bootstrap.cjs",
     "test": "node --test test/*.test.js",
     "test:cgroup": "node test/cgroup-stress.js",
     "test:cgroup:xhttp": "node test/cgroup-xhttp-stress.js",
     "test:cgroup:reality": "node test/cgroup-reality-stress.js",
     "test:xray": "node test/xray-integration.js",
-    "test:xray:reality": "node test/xray-reality-integration.js"
+    "test:xray:reality": "node test/xray-reality-integration.js",
+    "package:protected": "node scripts/build-protected-release.js"
   },
   "engines": {
     "node": ">=20.3.0"
