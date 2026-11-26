@@ -5,3 +5,5 @@ db.json
 .env
 .env.local
 .DS_Store
+release-output/
+.release-secrets/
